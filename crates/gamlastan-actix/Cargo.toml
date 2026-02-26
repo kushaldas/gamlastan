@@ -1,0 +1,16 @@
+[package]
+name = "gamlastan-actix"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "SAML 2.0 actix-web integration - extractors, responders, SP/IdP handlers"
+
+[dependencies]
+gamlastan = { workspace = true }
+actix-web = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+actix-rt = "2"

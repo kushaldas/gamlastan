@@ -1,7 +1,7 @@
 [workspace]
 members = [
-    "crates/swsaml",
-    "crates/swsaml-actix",
+    "crates/gamlastan",
+    "crates/gamlastan-actix",
     "spid-sp-test",
     "example-idp",
 ]
@@ -15,8 +15,8 @@ rust-version = "1.75"
 
 [workspace.dependencies]
 # Internal crates
-swsaml = { version = "0.1.0", path = "crates/swsaml" }
-swsaml-actix = { version = "0.1.0", path = "crates/swsaml-actix" }
+gamlastan = { version = "0.1.0", path = "crates/gamlastan" }
+gamlastan-actix = { version = "0.1.0", path = "crates/gamlastan-actix" }
 
 # XML parsing
 uppsala = { path = "../uppsala" }

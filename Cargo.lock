@@ -1149,11 +1149,11 @@ dependencies = [
  "chrono",
  "env_logger",
  "flate2",
+ "gamlastan",
+ "gamlastan-actix",
  "log",
  "rustls",
  "rustls-pemfile",
- "swsaml",
- "swsaml-actix",
  "tokio",
 ]
 
@@ -1259,6 +1259,37 @@ dependencies = [
  "futures-task",
  "pin-project-lite",
  "slab",
+]
+
+[[package]]
+name = "gamlastan"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "bergshamra",
+ "bergshamra-c14n",
+ "bergshamra-core",
+ "bergshamra-crypto",
+ "bergshamra-dsig",
+ "bergshamra-enc",
+ "bergshamra-keys",
+ "bytes",
+ "chrono",
+ "flate2",
+ "rand 0.8.5",
+ "thiserror",
+ "uppsala 0.3.0",
+]
+
+[[package]]
+name = "gamlastan-actix"
+version = "0.1.0"
+dependencies = [
+ "actix-rt",
+ "actix-web",
+ "chrono",
+ "gamlastan",
+ "thiserror",
 ]
 
 [[package]]
@@ -2779,13 +2810,13 @@ dependencies = [
  "base64",
  "chrono",
  "env_logger",
+ "gamlastan",
+ "gamlastan-actix",
  "log",
  "reqwest",
  "rustls",
  "rustls-pemfile",
  "serde",
- "swsaml",
- "swsaml-actix",
  "tokio",
 ]
 
@@ -2832,37 +2863,6 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
-
-[[package]]
-name = "swsaml"
-version = "0.1.0"
-dependencies = [
- "base64",
- "bergshamra",
- "bergshamra-c14n",
- "bergshamra-core",
- "bergshamra-crypto",
- "bergshamra-dsig",
- "bergshamra-enc",
- "bergshamra-keys",
- "bytes",
- "chrono",
- "flate2",
- "rand 0.8.5",
- "thiserror",
- "uppsala 0.3.0",
-]
-
-[[package]]
-name = "swsaml-actix"
-version = "0.1.0"
-dependencies = [
- "actix-rt",
- "actix-web",
- "chrono",
- "swsaml",
- "thiserror",
-]
 
 [[package]]
 name = "syn"

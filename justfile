@@ -1,4 +1,4 @@
-# swsaml - SAML 2.0 library for Rust
+# gamlastan - SAML 2.0 library for Rust
 
 
 # Default recipe: build and test
@@ -44,30 +44,13 @@ doc-open:
 clean:
     cargo clean
 
-# Run a specific crate's tests
-test-core:
-    cargo test -p swsaml-core
+# Run gamlastan library tests
+test-gamlastan:
+    cargo test -p gamlastan
 
-test-xml:
-    cargo test -p swsaml-xml
-
-test-crypto:
-    cargo test -p swsaml-crypto
-
-test-metadata:
-    cargo test -p swsaml-metadata
-
-test-bindings:
-    cargo test -p swsaml-bindings
-
-test-security:
-    cargo test -p swsaml-security
-
-test-profiles:
-    cargo test -p swsaml-profiles
-
+# Run gamlastan-actix tests
 test-actix:
-    cargo test -p swsaml-actix
+    cargo test -p gamlastan-actix
 
 # Run tests matching a pattern
 test-filter PATTERN:
