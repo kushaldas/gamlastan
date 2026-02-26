@@ -1,0 +1,18 @@
+[package]
+name = "swsaml-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Crypto abstraction traits for SAML 2.0 - backed by bergshamra"
+
+[dependencies]
+swsaml-core = { workspace = true }
+bergshamra = { workspace = true }
+bergshamra-core = { workspace = true }
+bergshamra-dsig = { workspace = true }
+bergshamra-enc = { workspace = true }
+bergshamra-c14n = { workspace = true }
+bergshamra-crypto = { workspace = true }
+bergshamra-keys = { workspace = true }
+thiserror = { workspace = true }

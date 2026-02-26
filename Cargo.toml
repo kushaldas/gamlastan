@@ -1,0 +1,76 @@
+[workspace]
+members = [
+    "crates/swsaml-core",
+    "crates/swsaml-xml",
+    "crates/swsaml-crypto",
+    "crates/swsaml-metadata",
+    "crates/swsaml-bindings",
+    "crates/swsaml-security",
+    "crates/swsaml-profiles",
+    "crates/swsaml-actix",
+    "spid-sp-test",
+    "example-idp",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "BSD-2-Clause"
+rust-version = "1.75"
+
+[workspace.dependencies]
+# Internal crates
+swsaml-core = { version = "0.1.0", path = "crates/swsaml-core" }
+swsaml-xml = { version = "0.1.0", path = "crates/swsaml-xml" }
+swsaml-crypto = { version = "0.1.0", path = "crates/swsaml-crypto" }
+swsaml-metadata = { version = "0.1.0", path = "crates/swsaml-metadata" }
+swsaml-bindings = { version = "0.1.0", path = "crates/swsaml-bindings" }
+swsaml-security = { version = "0.1.0", path = "crates/swsaml-security" }
+swsaml-profiles = { version = "0.1.0", path = "crates/swsaml-profiles" }
+swsaml-actix = { version = "0.1.0", path = "crates/swsaml-actix" }
+
+# XML parsing
+uppsala = { path = "../uppsala" }
+
+# XML security
+bergshamra = { path = "../bergshamra/crates/bergshamra" }
+bergshamra-core = { path = "../bergshamra/crates/bergshamra-core" }
+bergshamra-dsig = { path = "../bergshamra/crates/bergshamra-dsig" }
+bergshamra-enc = { path = "../bergshamra/crates/bergshamra-enc" }
+bergshamra-c14n = { path = "../bergshamra/crates/bergshamra-c14n" }
+bergshamra-crypto = { path = "../bergshamra/crates/bergshamra-crypto" }
+bergshamra-keys = { path = "../bergshamra/crates/bergshamra-keys" }
+
+# Date/time
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+
+# Byte buffers
+bytes = "1"
+
+# Error handling
+thiserror = "2"
+
+# Encoding
+base64 = "0.22"
+flate2 = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+
+# Web framework
+actix-web = { version = "4", features = ["rustls-0_23"] }
+
+# TLS
+rustls = "0.23"
+rustls-pemfile = "2"
+
+# Logging
+env_logger = "0.11"
+log = "0.4"
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+# Tokio
+tokio = { version = "1", features = ["full"] }

@@ -1,0 +1,13 @@
+[package]
+name = "swsaml-security"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "SAML 2.0 security validation - assertion validation, replay prevention, clock skew"
+
+[dependencies]
+swsaml-core = { workspace = true }
+swsaml-crypto = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }

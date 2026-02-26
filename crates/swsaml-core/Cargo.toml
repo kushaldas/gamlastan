@@ -1,0 +1,13 @@
+[package]
+name = "swsaml-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Core SAML 2.0 types, constants, and identifiers"
+
+[dependencies]
+chrono = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+rand = "0.8"
