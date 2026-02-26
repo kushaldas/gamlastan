@@ -7,13 +7,7 @@ rust-version.workspace = true
 description = "SAML 2.0 actix-web integration - extractors, responders, SP/IdP handlers"
 
 [dependencies]
-swsaml-core = { workspace = true }
-swsaml-xml = { workspace = true }
-swsaml-crypto = { workspace = true }
-swsaml-metadata = { workspace = true }
-swsaml-bindings = { workspace = true }
-swsaml-security = { workspace = true }
-swsaml-profiles = { workspace = true }
+swsaml = { workspace = true }
 actix-web = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }

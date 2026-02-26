@@ -5,9 +5,9 @@
 
 use actix_web::http::header;
 use actix_web::HttpResponse;
-use swsaml_bindings::HttpResponseBuilder;
+use swsaml::bindings::HttpResponseBuilder;
 
-/// Actix-web response builder implementing `swsaml_bindings::HttpResponseBuilder`.
+/// Actix-web response builder implementing `swsaml::bindings::HttpResponseBuilder`.
 ///
 /// All methods are stateless constructors producing `actix_web::HttpResponse`.
 pub struct ActixResponseBuilder;

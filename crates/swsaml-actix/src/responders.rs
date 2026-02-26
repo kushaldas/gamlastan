@@ -6,7 +6,7 @@
 use actix_web::http::header;
 use actix_web::{HttpRequest, HttpResponse, Responder};
 
-use swsaml_xml::serialize::SamlSerialize;
+use swsaml::xml::serialize::SamlSerialize;
 
 /// A SAML metadata XML response.
 ///
@@ -95,7 +95,7 @@ impl<T: SamlSerialize> Responder for SamlXml<T> {
 
 /// Helper to serialize a SAML message and wrap it in a SOAP envelope for response.
 pub fn soap_wrap_response(saml_xml: &str) -> SoapXml {
-    let envelope = swsaml_bindings::soap::soap_envelope_wrap(saml_xml, None);
+    let envelope = swsaml::bindings::soap::soap_envelope_wrap(saml_xml, None);
     SoapXml(envelope.into_bytes())
 }
 

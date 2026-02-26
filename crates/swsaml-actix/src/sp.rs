@@ -12,15 +12,15 @@
 use actix_web::{web, HttpRequest, HttpResponse};
 use chrono::Utc;
 
-use swsaml_bindings::relay_state::RelayState;
-use swsaml_bindings::redirect::RedirectEncodeParams;
-use swsaml_core::assertion::name_id::NameId;
-use swsaml_core::protocol::response::Response as SamlResponse;
-use swsaml_profiles::logout;
-use swsaml_profiles::sso::sp as sp_profile;
-use swsaml_profiles::sso::web_browser::{AuthnRequestOptions, AuthnResult};
-use swsaml_xml::serialize::SamlSerialize;
-use swsaml_xml::uppsala;
+use swsaml::bindings::redirect::RedirectEncodeParams;
+use swsaml::bindings::relay_state::RelayState;
+use swsaml::core::assertion::name_id::NameId;
+use swsaml::core::protocol::response::Response as SamlResponse;
+use swsaml::profiles::logout;
+use swsaml::profiles::sso::sp as sp_profile;
+use swsaml::profiles::sso::web_browser::{AuthnRequestOptions, AuthnResult};
+use swsaml::xml::serialize::SamlSerialize;
+use swsaml::xml::uppsala;
 
 use crate::config::SpConfig;
 use crate::error::SamlActixError;
@@ -81,8 +81,8 @@ async fn sp_login(
 ) -> Result<HttpResponse, SamlActixError> {
     let query_string = req.query_string();
     let relay_state_value = extract_query_param(query_string, "RelayState");
-    let binding_pref = extract_query_param(query_string, "binding")
-        .unwrap_or_else(|| "redirect".to_string());
+    let binding_pref =
+        extract_query_param(query_string, "binding").unwrap_or_else(|| "redirect".to_string());
 
     // Find IdP SSO endpoint
     let idp_descriptors = config.idp_metadata.idp_sso_descriptors();
@@ -91,15 +91,16 @@ async fn sp_login(
         .ok_or_else(|| SamlActixError::Configuration("no IdP SSO descriptor in metadata".into()))?;
 
     let binding_uri = if binding_pref == "post" {
-        swsaml_profiles::sso::web_browser::bindings::HTTP_POST
+        swsaml::profiles::sso::web_browser::bindings::HTTP_POST
     } else {
-        swsaml_profiles::sso::web_browser::bindings::HTTP_REDIRECT
+        swsaml::profiles::sso::web_browser::bindings::HTTP_REDIRECT
     };
 
-    let sso_endpoint = sp_profile::find_sso_endpoint(idp_desc, binding_uri)
-        .ok_or_else(|| SamlActixError::Configuration(
-            format!("no SSO endpoint for binding {binding_uri} in IdP metadata"),
-        ))?;
+    let sso_endpoint = sp_profile::find_sso_endpoint(idp_desc, binding_uri).ok_or_else(|| {
+        SamlActixError::Configuration(format!(
+            "no SSO endpoint for binding {binding_uri} in IdP metadata"
+        ))
+    })?;
 
     // Create AuthnRequest
     let options = AuthnRequestOptions {
@@ -127,7 +128,7 @@ async fn sp_login(
         .and_then(|rs| RelayState::new(rs).ok());
 
     if binding_pref == "post" {
-        let html = swsaml_bindings::post::post_encode(
+        let html = swsaml::bindings::post::post_encode(
             authn_request_xml.as_bytes(),
             true,
             &sso_endpoint.location,
@@ -135,7 +136,7 @@ async fn sp_login(
         );
         Ok(crate::response_adapter::post_binding_response(&html))
     } else {
-        let redirect_url = swsaml_bindings::redirect::redirect_encode(&RedirectEncodeParams {
+        let redirect_url = swsaml::bindings::redirect::redirect_encode(&RedirectEncodeParams {
             saml_xml: authn_request_xml.as_bytes(),
             is_request: true,
             destination: &sso_endpoint.location,
@@ -144,7 +145,9 @@ async fn sp_login(
         })
         .map_err(|e| SamlActixError::Internal(format!("redirect encode failed: {e}")))?;
 
-        Ok(crate::response_adapter::redirect_binding_response(&redirect_url))
+        Ok(crate::response_adapter::redirect_binding_response(
+            &redirect_url,
+        ))
     }
 }
 
@@ -160,10 +163,11 @@ async fn sp_acs(
 ) -> Result<HttpResponse, SamlActixError> {
     // Parse the SAML XML into a Response
     let xml_str = msg.saml_xml_str()?;
-    let doc = uppsala::parse(xml_str)
-        .map_err(|e: uppsala::XmlError| SamlActixError::Xml(swsaml_xml::error::XmlError::ParseError(e)))?;
-    let response_ref = swsaml_xml::deserialize::parse_saml::<
-        swsaml_core::protocol::response::ResponseRef<'_>,
+    let doc = uppsala::parse(xml_str).map_err(|e: uppsala::XmlError| {
+        SamlActixError::Xml(swsaml::xml::error::XmlError::ParseError(e))
+    })?;
+    let response_ref = swsaml::xml::deserialize::parse_saml::<
+        swsaml::core::protocol::response::ResponseRef<'_>,
     >(&doc)?;
     let response: SamlResponse = response_ref.to_owned();
 
@@ -210,8 +214,9 @@ async fn sp_logout(
     config: web::Data<SpConfig>,
 ) -> Result<HttpResponse, SamlActixError> {
     let query_string = req.query_string();
-    let name_id_value = extract_query_param(query_string, "NameID")
-        .ok_or_else(|| SamlActixError::Configuration("NameID query parameter required for logout".into()))?;
+    let name_id_value = extract_query_param(query_string, "NameID").ok_or_else(|| {
+        SamlActixError::Configuration("NameID query parameter required for logout".into())
+    })?;
     let session_index = extract_query_param(query_string, "SessionIndex");
 
     // Find IdP SLO endpoint
@@ -222,7 +227,7 @@ async fn sp_logout(
 
     let slo_endpoint = logout::find_slo_endpoint(
         &idp_desc.sso_base,
-        swsaml_profiles::sso::web_browser::bindings::HTTP_REDIRECT,
+        swsaml::profiles::sso::web_browser::bindings::HTTP_REDIRECT,
     )
     .ok_or_else(|| SamlActixError::Configuration("no SLO endpoint in IdP metadata".into()))?;
 
@@ -250,7 +255,7 @@ async fn sp_logout(
         .to_xml_string()
         .map_err(|e| SamlActixError::Internal(format!("failed to serialize LogoutRequest: {e}")))?;
 
-    let redirect_url = swsaml_bindings::redirect::redirect_encode(&RedirectEncodeParams {
+    let redirect_url = swsaml::bindings::redirect::redirect_encode(&RedirectEncodeParams {
         saml_xml: xml.as_bytes(),
         is_request: true,
         destination: &slo_endpoint.location,
@@ -259,7 +264,9 @@ async fn sp_logout(
     })
     .map_err(|e| SamlActixError::Internal(format!("redirect encode failed: {e}")))?;
 
-    Ok(crate::response_adapter::redirect_binding_response(&redirect_url))
+    Ok(crate::response_adapter::redirect_binding_response(
+        &redirect_url,
+    ))
 }
 
 /// SP Single Logout Service handler: process incoming LogoutRequest or LogoutResponse from IdP.
@@ -268,8 +275,9 @@ async fn sp_slo(
     config: web::Data<SpConfig>,
 ) -> Result<HttpResponse, SamlActixError> {
     let xml_str = msg.saml_xml_str()?;
-    let doc = uppsala::parse(xml_str)
-        .map_err(|e: uppsala::XmlError| SamlActixError::Xml(swsaml_xml::error::XmlError::ParseError(e)))?;
+    let doc = uppsala::parse(xml_str).map_err(|e: uppsala::XmlError| {
+        SamlActixError::Xml(swsaml::xml::error::XmlError::ParseError(e))
+    })?;
 
     let root = doc
         .document_element()
@@ -281,8 +289,8 @@ async fn sp_slo(
     match root_elem.name.local_name.as_ref() {
         "LogoutRequest" => {
             // Validate the incoming LogoutRequest
-            let req_ref = swsaml_xml::deserialize::parse_saml::<
-                swsaml_core::protocol::logout::LogoutRequestRef<'_>,
+            let req_ref = swsaml::xml::deserialize::parse_saml::<
+                swsaml::core::protocol::logout::LogoutRequestRef<'_>,
             >(&doc)?;
             let logout_req = req_ref.to_owned();
 
@@ -292,11 +300,8 @@ async fn sp_slo(
 
             // Create success response
             let in_response_to = &logout_req.id;
-            let response = logout::create_logout_response_success(
-                &config.entity_id,
-                in_response_to,
-                None,
-            );
+            let response =
+                logout::create_logout_response_success(&config.entity_id, in_response_to, None);
 
             let response_xml = response.to_xml_string().map_err(|e| {
                 SamlActixError::Internal(format!("failed to serialize LogoutResponse: {e}"))
@@ -307,10 +312,10 @@ async fn sp_slo(
             if let Some(idp_desc) = idp_descriptors.first() {
                 if let Some(slo_ep) = logout::find_slo_endpoint(
                     &idp_desc.sso_base,
-                    swsaml_profiles::sso::web_browser::bindings::HTTP_REDIRECT,
+                    swsaml::profiles::sso::web_browser::bindings::HTTP_REDIRECT,
                 ) {
                     let redirect_url =
-                        swsaml_bindings::redirect::redirect_encode(&RedirectEncodeParams {
+                        swsaml::bindings::redirect::redirect_encode(&RedirectEncodeParams {
                             saml_xml: response_xml.as_bytes(),
                             is_request: false,
                             destination: &slo_ep.location,
@@ -321,7 +326,9 @@ async fn sp_slo(
                             SamlActixError::Internal(format!("redirect encode failed: {e}"))
                         })?;
 
-                    return Ok(crate::response_adapter::redirect_binding_response(&redirect_url));
+                    return Ok(crate::response_adapter::redirect_binding_response(
+                        &redirect_url,
+                    ));
                 }
             }
 
@@ -341,27 +348,25 @@ async fn sp_slo(
 
 /// SP metadata handler: generate and return the SP's SAML metadata.
 async fn sp_metadata(config: web::Data<SpConfig>) -> Result<MetadataXml, SamlActixError> {
-    use swsaml_metadata::types::endpoint::{Endpoint, IndexedEndpoint};
-    use swsaml_metadata::types::entity_descriptor::{EntityDescriptor, EntityRoles};
-    use swsaml_metadata::types::role_descriptor::{RoleDescriptorBase, SsoDescriptorBase};
-    use swsaml_metadata::types::sp::SpSsoDescriptor;
+    use swsaml::metadata::types::endpoint::{Endpoint, IndexedEndpoint};
+    use swsaml::metadata::types::entity_descriptor::{EntityDescriptor, EntityRoles};
+    use swsaml::metadata::types::role_descriptor::{RoleDescriptorBase, SsoDescriptorBase};
+    use swsaml::metadata::types::sp::SpSsoDescriptor;
 
     let sp_sso = SpSsoDescriptor {
         sso_base: SsoDescriptorBase {
-            base: RoleDescriptorBase::new(vec![
-                "urn:oasis:names:tc:SAML:2.0:protocol".to_string(),
-            ]),
+            base: RoleDescriptorBase::new(vec!["urn:oasis:names:tc:SAML:2.0:protocol".to_string()]),
             artifact_resolution_services: vec![],
             single_logout_services: if config.slo_url.is_empty() {
                 vec![]
             } else {
                 vec![
                     Endpoint::new(
-                        swsaml_profiles::sso::web_browser::bindings::HTTP_REDIRECT,
+                        swsaml::profiles::sso::web_browser::bindings::HTTP_REDIRECT,
                         &config.slo_url,
                     ),
                     Endpoint::new(
-                        swsaml_profiles::sso::web_browser::bindings::HTTP_POST,
+                        swsaml::profiles::sso::web_browser::bindings::HTTP_POST,
                         &config.slo_url,
                     ),
                 ]
@@ -377,7 +382,7 @@ async fn sp_metadata(config: web::Data<SpConfig>) -> Result<MetadataXml, SamlAct
         want_assertions_signed: Some(config.want_assertions_signed),
         assertion_consumer_services: vec![IndexedEndpoint::new_default(
             Endpoint::new(
-                swsaml_profiles::sso::web_browser::bindings::HTTP_POST,
+                swsaml::profiles::sso::web_browser::bindings::HTTP_POST,
                 &config.acs_url,
             ),
             0,
@@ -418,7 +423,7 @@ fn extract_query_param(query: &str, name: &str) -> Option<String> {
         if let Some(value) = pair.strip_prefix(&prefix) {
             // URL-decode the value
             return Some(
-                swsaml_bindings::encoding::url_decode(value).unwrap_or_else(|_| value.to_string()),
+                swsaml::bindings::encoding::url_decode(value).unwrap_or_else(|_| value.to_string()),
             );
         }
     }

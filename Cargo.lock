@@ -394,7 +394,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bergshamra"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64",
  "bergshamra-c14n",
@@ -412,7 +412,7 @@ dependencies = [
 
 [[package]]
 name = "bergshamra-c14n"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bergshamra-core",
  "bergshamra-xml",
@@ -421,14 +421,14 @@ dependencies = [
 
 [[package]]
 name = "bergshamra-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "bergshamra-crypto"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -466,7 +466,7 @@ dependencies = [
 
 [[package]]
 name = "bergshamra-dsig"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64",
  "bergshamra-c14n",
@@ -488,7 +488,7 @@ dependencies = [
 
 [[package]]
 name = "bergshamra-enc"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64",
  "bergshamra-c14n",
@@ -506,7 +506,7 @@ dependencies = [
 
 [[package]]
 name = "bergshamra-keys"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64",
  "bergshamra-core",
@@ -543,7 +543,7 @@ dependencies = [
 
 [[package]]
 name = "bergshamra-pkcs12"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aes",
  "bergshamra-core",
@@ -559,7 +559,7 @@ dependencies = [
 
 [[package]]
 name = "bergshamra-transforms"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64",
  "bergshamra-c14n",
@@ -572,7 +572,7 @@ dependencies = [
 
 [[package]]
 name = "bergshamra-xml"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bergshamra-core",
  "uppsala 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -1152,13 +1152,8 @@ dependencies = [
  "log",
  "rustls",
  "rustls-pemfile",
+ "swsaml",
  "swsaml-actix",
- "swsaml-bindings",
- "swsaml-core",
- "swsaml-crypto",
- "swsaml-metadata",
- "swsaml-profiles",
- "swsaml-xml",
  "tokio",
 ]
 
@@ -2789,14 +2784,8 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "serde",
+ "swsaml",
  "swsaml-actix",
- "swsaml-bindings",
- "swsaml-core",
- "swsaml-crypto",
- "swsaml-metadata",
- "swsaml-profiles",
- "swsaml-security",
- "swsaml-xml",
  "tokio",
 ]
 
@@ -2845,49 +2834,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
-name = "swsaml-actix"
-version = "0.1.0"
-dependencies = [
- "actix-rt",
- "actix-web",
- "chrono",
- "swsaml-bindings",
- "swsaml-core",
- "swsaml-crypto",
- "swsaml-metadata",
- "swsaml-profiles",
- "swsaml-security",
- "swsaml-xml",
- "thiserror",
-]
-
-[[package]]
-name = "swsaml-bindings"
+name = "swsaml"
 version = "0.1.0"
 dependencies = [
  "base64",
- "flate2",
- "swsaml-core",
- "swsaml-crypto",
- "swsaml-xml",
- "thiserror",
- "uppsala 0.3.0",
-]
-
-[[package]]
-name = "swsaml-core"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "chrono",
- "rand 0.8.5",
- "thiserror",
-]
-
-[[package]]
-name = "swsaml-crypto"
-version = "0.1.0"
-dependencies = [
  "bergshamra",
  "bergshamra-c14n",
  "bergshamra-core",
@@ -2895,55 +2845,23 @@ dependencies = [
  "bergshamra-dsig",
  "bergshamra-enc",
  "bergshamra-keys",
- "swsaml-core",
- "thiserror",
-]
-
-[[package]]
-name = "swsaml-metadata"
-version = "0.1.0"
-dependencies = [
+ "bytes",
  "chrono",
- "swsaml-core",
- "swsaml-crypto",
- "swsaml-xml",
+ "flate2",
+ "rand 0.8.5",
  "thiserror",
  "uppsala 0.3.0",
 ]
 
 [[package]]
-name = "swsaml-profiles"
+name = "swsaml-actix"
 version = "0.1.0"
 dependencies = [
- "base64",
+ "actix-rt",
+ "actix-web",
  "chrono",
- "swsaml-bindings",
- "swsaml-core",
- "swsaml-crypto",
- "swsaml-metadata",
- "swsaml-security",
- "swsaml-xml",
+ "swsaml",
  "thiserror",
-]
-
-[[package]]
-name = "swsaml-security"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "swsaml-core",
- "swsaml-crypto",
- "thiserror",
-]
-
-[[package]]
-name = "swsaml-xml"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "swsaml-core",
- "thiserror",
- "uppsala 0.3.0",
 ]
 
 [[package]]

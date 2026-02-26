@@ -12,8 +12,8 @@ use std::borrow::Cow;
 use std::future::Future;
 use std::pin::Pin;
 
-use swsaml_bindings::HttpRequest as SamlHttpRequest;
-use swsaml_bindings::DecodedMessage;
+use swsaml::bindings::DecodedMessage;
+use swsaml::bindings::HttpRequest as SamlHttpRequest;
 
 use crate::error::SamlActixError;
 use crate::request_adapter::ActixHttpRequest;
@@ -125,7 +125,7 @@ fn extract_saml_message(req: &HttpRequest, body: &[u8]) -> Result<SamlMessage, S
 
 /// Check if this is a PAOS request (ECP profile).
 fn is_paos_request(req: &ActixHttpRequest<'_>) -> bool {
-    use swsaml_bindings::HttpRequest as _;
+    use swsaml::bindings::HttpRequest as _;
     let has_paos_accept = req
         .header("Accept")
         .is_some_and(|h| h.contains("application/vnd.paos+xml"));
@@ -139,7 +139,7 @@ fn is_paos_request(req: &ActixHttpRequest<'_>) -> bool {
 ///
 /// Checks for HTTP Redirect (SAMLRequest/SAMLResponse) or Artifact (SAMLart).
 fn extract_from_get(req: &ActixHttpRequest<'_>) -> Result<SamlMessage, SamlActixError> {
-    use swsaml_bindings::HttpRequest as _;
+    use swsaml::bindings::HttpRequest as _;
 
     // Check for Artifact binding first (SAMLart param)
     if let Some(artifact) = req.query_param("SAMLart") {
@@ -157,7 +157,7 @@ fn extract_from_get(req: &ActixHttpRequest<'_>) -> Result<SamlMessage, SamlActix
     let has_saml_response = req.query_param("SAMLResponse").is_some();
 
     if has_saml_request || has_saml_response {
-        let decoded = swsaml_bindings::redirect::redirect_decode(req)?;
+        let decoded = swsaml::bindings::redirect::redirect_decode(req)?;
         let redirect_sig = match (decoded.sig_alg, decoded.signature, decoded.signature_input) {
             (Some(alg), Some(sig), Some(input)) => Some(RedirectSignatureData {
                 sig_alg: alg,
@@ -182,13 +182,13 @@ fn extract_from_get(req: &ActixHttpRequest<'_>) -> Result<SamlMessage, SamlActix
 ///
 /// Checks for HTTP POST (form-encoded), Artifact (SAMLart form param), or SOAP (text/xml body).
 fn extract_from_post(req: &ActixHttpRequest<'_>) -> Result<SamlMessage, SamlActixError> {
-    use swsaml_bindings::HttpRequest as _;
+    use swsaml::bindings::HttpRequest as _;
 
     let content_type = req.header("content-type").unwrap_or("");
 
     // SOAP binding: text/xml content type
     if content_type.starts_with("text/xml") || content_type.starts_with("application/xml") {
-        let decoded = swsaml_bindings::soap::soap_decode(req)?;
+        let decoded = swsaml::bindings::soap::soap_decode(req)?;
         return Ok(SamlMessage {
             saml_xml: decoded.body_xml.into_bytes(),
             relay_state: None, // SOAP doesn't use RelayState
@@ -214,7 +214,7 @@ fn extract_from_post(req: &ActixHttpRequest<'_>) -> Result<SamlMessage, SamlActi
     let has_saml_response = req.form_param("SAMLResponse").is_some();
 
     if has_saml_request || has_saml_response {
-        let decoded = swsaml_bindings::post::post_decode(req)?;
+        let decoded = swsaml::bindings::post::post_decode(req)?;
         return Ok(SamlMessage {
             saml_xml: decoded.saml_xml,
             relay_state: decoded.relay_state,
@@ -229,7 +229,7 @@ fn extract_from_post(req: &ActixHttpRequest<'_>) -> Result<SamlMessage, SamlActi
 
 /// Extract PAOS message (reverse SOAP for ECP).
 fn extract_paos(req: &ActixHttpRequest<'_>) -> Result<SamlMessage, SamlActixError> {
-    use swsaml_bindings::HttpRequest as _;
+    use swsaml::bindings::HttpRequest as _;
 
     let body = req.body();
     if body.is_empty() {
@@ -237,7 +237,7 @@ fn extract_paos(req: &ActixHttpRequest<'_>) -> Result<SamlMessage, SamlActixErro
     }
 
     // PAOS uses SOAP envelope format
-    let decoded = swsaml_bindings::soap::soap_decode(req)?;
+    let decoded = swsaml::bindings::soap::soap_decode(req)?;
     Ok(SamlMessage {
         saml_xml: decoded.body_xml.into_bytes(),
         relay_state: None,

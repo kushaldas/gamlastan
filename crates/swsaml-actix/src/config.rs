@@ -4,9 +4,9 @@
 
 use std::sync::Arc;
 
-use swsaml_metadata::types::entity_descriptor::EntityDescriptor;
-use swsaml_security::config::SecurityConfig;
-use swsaml_security::replay::{InMemoryReplayCache, ReplayCache};
+use swsaml::metadata::types::entity_descriptor::EntityDescriptor;
+use swsaml::security::config::SecurityConfig;
+use swsaml::security::replay::{InMemoryReplayCache, ReplayCache};
 
 /// Service Provider configuration for SAML integration.
 ///
@@ -188,7 +188,7 @@ impl IdpConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use swsaml_metadata::types::entity_descriptor::{EntityDescriptor, EntityRoles};
+    use swsaml::metadata::types::entity_descriptor::{EntityDescriptor, EntityRoles};
 
     fn make_dummy_entity_descriptor() -> EntityDescriptor {
         EntityDescriptor {

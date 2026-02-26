@@ -12,15 +12,15 @@ pub enum SamlActixError {
 
     /// Failed to decode SAML message from binding.
     #[error("binding decode error: {0}")]
-    BindingDecode(#[from] swsaml_bindings::BindingError),
+    BindingDecode(#[from] swsaml::bindings::BindingError),
 
     /// Profile-level error (SSO, SLO, etc.).
     #[error("profile error: {0}")]
-    Profile(#[from] swsaml_profiles::ProfileError),
+    Profile(#[from] swsaml::profiles::ProfileError),
 
     /// Security validation error.
     #[error("security error: {0}")]
-    Security(#[from] swsaml_security::error::SecurityError),
+    Security(#[from] swsaml::security::error::SecurityError),
 
     /// Missing or invalid configuration.
     #[error("configuration error: {0}")]
@@ -36,7 +36,7 @@ pub enum SamlActixError {
 
     /// XML deserialization error.
     #[error("XML error: {0}")]
-    Xml(#[from] swsaml_xml::error::XmlError),
+    Xml(#[from] swsaml::xml::error::XmlError),
 
     /// Internal error.
     #[error("internal error: {0}")]

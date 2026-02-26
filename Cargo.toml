@@ -1,12 +1,6 @@
 [workspace]
 members = [
-    "crates/swsaml-core",
-    "crates/swsaml-xml",
-    "crates/swsaml-crypto",
-    "crates/swsaml-metadata",
-    "crates/swsaml-bindings",
-    "crates/swsaml-security",
-    "crates/swsaml-profiles",
+    "crates/swsaml",
     "crates/swsaml-actix",
     "spid-sp-test",
     "example-idp",
@@ -21,13 +15,7 @@ rust-version = "1.75"
 
 [workspace.dependencies]
 # Internal crates
-swsaml-core = { version = "0.1.0", path = "crates/swsaml-core" }
-swsaml-xml = { version = "0.1.0", path = "crates/swsaml-xml" }
-swsaml-crypto = { version = "0.1.0", path = "crates/swsaml-crypto" }
-swsaml-metadata = { version = "0.1.0", path = "crates/swsaml-metadata" }
-swsaml-bindings = { version = "0.1.0", path = "crates/swsaml-bindings" }
-swsaml-security = { version = "0.1.0", path = "crates/swsaml-security" }
-swsaml-profiles = { version = "0.1.0", path = "crates/swsaml-profiles" }
+swsaml = { version = "0.1.0", path = "crates/swsaml" }
 swsaml-actix = { version = "0.1.0", path = "crates/swsaml-actix" }
 
 # XML parsing

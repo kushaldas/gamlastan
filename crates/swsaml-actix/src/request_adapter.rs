@@ -8,9 +8,9 @@
 // their own URL decoding internally. Returning pre-decoded values would cause
 // double-decoding.
 
-use swsaml_bindings::HttpRequest;
+use swsaml::bindings::HttpRequest;
 
-/// Wrapper around actix-web's HttpRequest that implements swsaml_bindings::HttpRequest.
+/// Wrapper around actix-web's HttpRequest that implements swsaml::bindings::HttpRequest.
 ///
 /// The body and form data must be pre-extracted before constructing this adapter
 /// because actix-web consumes the body stream.

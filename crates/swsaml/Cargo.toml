@@ -1,0 +1,36 @@
+[package]
+name = "swsaml"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "SAML 2.0 library - types, XML, crypto, metadata, bindings, security, profiles"
+
+[dependencies]
+# XML parsing
+uppsala = { workspace = true }
+
+# XML security
+bergshamra = { workspace = true }
+bergshamra-core = { workspace = true }
+bergshamra-dsig = { workspace = true }
+bergshamra-enc = { workspace = true }
+bergshamra-c14n = { workspace = true }
+bergshamra-crypto = { workspace = true }
+bergshamra-keys = { workspace = true }
+
+# Date/time
+chrono = { workspace = true }
+
+# Byte buffers
+bytes = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Encoding
+base64 = { workspace = true }
+flate2 = { workspace = true }
+
+# RNG (pinned to 0.8 as in swsaml-core)
+rand = "0.8"

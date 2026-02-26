@@ -34,8 +34,7 @@ pub struct SamlSession {
 ///
 /// Given a request, returns `Some(SamlSession)` if the user has a valid session,
 /// or `None` to trigger a redirect to the login endpoint.
-pub type SessionLookup =
-    dyn Fn(&ServiceRequest) -> Option<SamlSession> + Send + Sync + 'static;
+pub type SessionLookup = dyn Fn(&ServiceRequest) -> Option<SamlSession> + Send + Sync + 'static;
 
 /// SAML authentication middleware factory.
 ///
@@ -193,12 +192,12 @@ mod tests {
     fn test_saml_session_debug() {
         let session = SamlSession {
             name_id: "user@example.com".to_string(),
-            name_id_format: Some("urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress".to_string()),
+            name_id_format: Some(
+                "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress".to_string(),
+            ),
             session_index: Some("_session_123".to_string()),
             session_not_on_or_after: None,
-            attributes: vec![
-                ("email".to_string(), vec!["user@example.com".to_string()]),
-            ],
+            attributes: vec![("email".to_string(), vec!["user@example.com".to_string()])],
         };
         let debug = format!("{session:?}");
         assert!(debug.contains("user@example.com"));
