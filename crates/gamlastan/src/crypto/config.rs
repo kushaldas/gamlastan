@@ -30,8 +30,8 @@ pub struct CryptoConfig {
     /// Default: true.
     pub reject_ds_object: bool,
 
-    /// Minimum HMAC output length (in bits) to prevent truncation attacks.
-    /// Default: 0 (use bergshamra default).
+    /// Minimum HMAC output length (in bits) to prevent truncation attacks
+    /// (CVE-2009-0217). Default: 128 bits.
     pub hmac_min_output_length: usize,
 }
 
@@ -45,7 +45,7 @@ impl Default for CryptoConfig {
                 .to_string(),
             preferred_key_wrap_algorithm: "http://www.w3.org/2001/04/xmlenc#kw-aes256".to_string(),
             reject_ds_object: true,
-            hmac_min_output_length: 0,
+            hmac_min_output_length: 128,
         }
     }
 }

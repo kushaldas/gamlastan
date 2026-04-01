@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "SAML 2.0 library - types, XML, crypto, metadata, bindings, security, profiles"
+readme = "README.md"
+repository = "https://github.com/kushaldas/gamlastan"
+homepage = "https://github.com/kushaldas/gamlastan"
+keywords = ["saml", "saml2", "sso", "identity", "xml-security"]
+categories = ["authentication", "web-programming"]
 
 [dependencies]
 # XML parsing

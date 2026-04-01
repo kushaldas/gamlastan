@@ -35,6 +35,9 @@ pub struct SamlVerifier {
     /// Skip X.509 time checks (NotBefore/NotAfter) during verification.
     /// Useful when the IdP certificate has expired but is still functionally valid.
     skip_time_checks: bool,
+    /// Minimum HMAC output length in bits to prevent HMAC truncation attacks
+    /// (CVE-2009-0217). Default: 128 bits.
+    hmac_min_out_len: usize,
 }
 
 impl SamlVerifier {
@@ -48,6 +51,7 @@ impl SamlVerifier {
             trusted_keys_only: true,
             strict_verification: true,
             skip_time_checks: false,
+            hmac_min_out_len: 128,
         }
     }
 
@@ -59,6 +63,7 @@ impl SamlVerifier {
             trusted_keys_only: true,
             strict_verification: true,
             skip_time_checks: false,
+            hmac_min_out_len: 128,
         }
     }
 
@@ -92,6 +97,18 @@ impl SamlVerifier {
         self.strict_verification = strict;
     }
 
+    /// Set the minimum HMAC output length in bits (CVE-2009-0217 protection).
+    ///
+    /// When a non-zero value is set, HMAC signatures with output length shorter
+    /// than this value (in bits) will be rejected. This prevents HMAC truncation
+    /// attacks where an attacker reduces the HMAC output to a trivially brute-
+    /// forceable size.
+    ///
+    /// Default: 128 bits. Set to 0 to disable (not recommended).
+    pub fn set_hmac_min_out_len(&mut self, bits: usize) {
+        self.hmac_min_out_len = bits;
+    }
+
     /// Verify a signed SAML message (assertion, response, metadata).
     ///
     /// Per E91: checks for and rejects `<ds:Object>` elements in the signature
@@ -106,6 +123,7 @@ impl SamlVerifier {
         ctx.trusted_keys_only = self.trusted_keys_only;
         ctx.strict_verification = self.strict_verification;
         ctx.skip_time_checks = self.skip_time_checks;
+        ctx.hmac_min_out_len = self.hmac_min_out_len;
         let result = verify(&ctx, signed_xml)?;
         Ok(result)
     }

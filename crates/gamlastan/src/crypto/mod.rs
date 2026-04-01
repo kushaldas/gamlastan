@@ -39,7 +39,7 @@ pub use verifier::SamlVerifier;
 
 // Re-export bergshamra types needed by consumers.
 pub use bergshamra_c14n::{self, C14nMode};
-pub use bergshamra_dsig::{VerifiedReference, VerifyResult};
+pub use bergshamra_dsig::{VerifiedKeyInfo, VerifiedReference, VerifyResult};
 pub use bergshamra_keys::{build_x509_key_info, build_x509_key_info_from_der};
 pub use bergshamra_keys::{Key, KeyData, KeyUsage, KeysManager};
 
