@@ -19,16 +19,16 @@ gamlastan = { version = "0.1.0", path = "crates/gamlastan" }
 gamlastan-actix = { version = "0.1.0", path = "crates/gamlastan-actix" }
 
 # XML parsing
-uppsala = { path = "../uppsala" }
+uppsala = "0.3.0"
 
 # XML security
-bergshamra = { path = "../bergshamra/crates/bergshamra" }
-bergshamra-core = { path = "../bergshamra/crates/bergshamra-core" }
-bergshamra-dsig = { path = "../bergshamra/crates/bergshamra-dsig" }
-bergshamra-enc = { path = "../bergshamra/crates/bergshamra-enc" }
-bergshamra-c14n = { path = "../bergshamra/crates/bergshamra-c14n" }
-bergshamra-crypto = { path = "../bergshamra/crates/bergshamra-crypto" }
-bergshamra-keys = { path = "../bergshamra/crates/bergshamra-keys" }
+bergshamra = "0.3.1"
+bergshamra-core = "0.3.1"
+bergshamra-dsig = "0.3.1"
+bergshamra-enc = "0.3.1"
+bergshamra-c14n = "0.3.1"
+bergshamra-crypto = "0.3.1"
+bergshamra-keys = "0.3.1"
 
 # Date/time
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }

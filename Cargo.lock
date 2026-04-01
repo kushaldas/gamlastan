@@ -394,7 +394,9 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bergshamra"
-version = "0.2.1"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "639c29815925a5ff2fb11dc6f439faa264852991e49045a1369bdce3e53f330c"
 dependencies = [
  "base64",
  "bergshamra-c14n",
@@ -407,28 +409,34 @@ dependencies = [
  "bergshamra-xml",
  "clap",
  "rand 0.8.5",
- "uppsala 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "uppsala",
 ]
 
 [[package]]
 name = "bergshamra-c14n"
-version = "0.2.1"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "827ebdf4f369f70c5c4401e30d381147c7fdc9ff00e540f85a1c41c89fcc21ed"
 dependencies = [
  "bergshamra-core",
  "bergshamra-xml",
- "uppsala 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "uppsala",
 ]
 
 [[package]]
 name = "bergshamra-core"
-version = "0.2.1"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b204c2ccef3c8d51ecb685de865e9fdbb76af11792435cccd4b697a2fb12818"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "bergshamra-crypto"
-version = "0.2.1"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "683d8e2300454122717ab0d5d540f59aafcfaefc7b10ae9b62f65f1a446e214c"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -466,7 +474,9 @@ dependencies = [
 
 [[package]]
 name = "bergshamra-dsig"
-version = "0.2.1"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05a528ca5bb00770a8c0e5ad347603abc8bec9f7d2d0eb36cc164963e6896180"
 dependencies = [
  "base64",
  "bergshamra-c14n",
@@ -482,13 +492,15 @@ dependencies = [
  "p384",
  "p521",
  "rsa",
- "uppsala 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "uppsala",
  "x509-cert",
 ]
 
 [[package]]
 name = "bergshamra-enc"
-version = "0.2.1"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d688af28d31730037363a5459cd9c9763095ee1464a9795a52b3907944006cf"
 dependencies = [
  "base64",
  "bergshamra-c14n",
@@ -501,12 +513,14 @@ dependencies = [
  "p384",
  "p521",
  "rand 0.8.5",
- "uppsala 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "uppsala",
 ]
 
 [[package]]
 name = "bergshamra-keys"
-version = "0.2.1"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98e9fc659292660af63ef4f1e407449e591bc85da84c3cff86f6ff52625b3d8f"
 dependencies = [
  "base64",
  "bergshamra-core",
@@ -536,14 +550,16 @@ dependencies = [
  "signature 2.2.0",
  "slh-dsa",
  "spki 0.7.3",
- "uppsala 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "uppsala",
  "x25519-dalek",
  "x509-cert",
 ]
 
 [[package]]
 name = "bergshamra-pkcs12"
-version = "0.2.1"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1877c79eb896cba65d8fa1c1099da26da6e14fb1d4a7a851f12dfefca4ce083"
 dependencies = [
  "aes",
  "bergshamra-core",
@@ -559,7 +575,9 @@ dependencies = [
 
 [[package]]
 name = "bergshamra-transforms"
-version = "0.2.1"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "396d95a7b243f7f2e479b2119591c3547c85f61613012a126f984b9a7eae8f2a"
 dependencies = [
  "base64",
  "bergshamra-c14n",
@@ -567,15 +585,17 @@ dependencies = [
  "bergshamra-crypto",
  "bergshamra-keys",
  "bergshamra-xml",
- "uppsala 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "uppsala",
 ]
 
 [[package]]
 name = "bergshamra-xml"
-version = "0.2.1"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "728be7c1ce772d87807d1727b3b32726b5850f20a004e962b7d3ccff26cb01ba"
 dependencies = [
  "bergshamra-core",
- "uppsala 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "uppsala",
 ]
 
 [[package]]
@@ -1278,7 +1298,7 @@ dependencies = [
  "flate2",
  "rand 0.8.5",
  "thiserror",
- "uppsala 0.3.0",
+ "uppsala",
 ]
 
 [[package]]
@@ -3165,10 +3185,6 @@ name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
-
-[[package]]
-name = "uppsala"
-version = "0.3.0"
 
 [[package]]
 name = "uppsala"

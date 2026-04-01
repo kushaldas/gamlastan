@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "SAML 2.0 actix-web integration - extractors, responders, SP/IdP handlers"
+readme = "README.md"
+repository = "https://github.com/kushaldas/gamlastan"
+homepage = "https://github.com/kushaldas/gamlastan"
+keywords = ["saml", "actix-web", "sso", "identity"]
+categories = ["authentication", "web-programming"]
 
 [dependencies]
 gamlastan = { workspace = true }
