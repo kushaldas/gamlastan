@@ -2,9 +2,12 @@
 //
 // Provides SpConfig and IdpConfig for registering SAML endpoints.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
+use gamlastan::bindings::traits::ArtifactStore;
 use gamlastan::metadata::types::entity_descriptor::EntityDescriptor;
+use gamlastan::profiles::session::SessionStore;
 use gamlastan::security::config::SecurityConfig;
 use gamlastan::security::replay::{InMemoryReplayCache, ReplayCache};
 
@@ -52,6 +55,69 @@ pub struct SpConfig {
 
     /// Protocol binding to request for the response.
     pub protocol_binding: Option<String>,
+
+    /// Request ID tracker for InResponseTo verification.
+    /// Stores sent AuthnRequest IDs so responses can be correlated.
+    pub request_id_tracker: Arc<dyn RequestIdTracker>,
+}
+
+/// Tracks outgoing AuthnRequest IDs for InResponseTo verification.
+///
+/// When the SP sends an AuthnRequest, the request ID is stored.
+/// When a Response arrives, the InResponseTo is checked against stored IDs.
+pub trait RequestIdTracker: Send + Sync {
+    /// Record a sent AuthnRequest ID with its creation timestamp.
+    fn store(&self, request_id: &str);
+    /// Check if a request ID was sent and consume it (one-time use).
+    /// Returns true if the ID was found and removed.
+    fn consume(&self, request_id: &str) -> bool;
+}
+
+/// In-memory request ID tracker with automatic expiry.
+pub struct InMemoryRequestIdTracker {
+    /// Map of request_id -> insertion time (for TTL)
+    ids: Mutex<HashMap<String, std::time::Instant>>,
+    /// TTL for stored request IDs (default: 5 minutes)
+    ttl: std::time::Duration,
+}
+
+impl InMemoryRequestIdTracker {
+    /// Create a new tracker with the default TTL of 5 minutes.
+    pub fn new() -> Self {
+        Self {
+            ids: Mutex::new(HashMap::new()),
+            ttl: std::time::Duration::from_secs(300),
+        }
+    }
+
+    /// Create a new tracker with a custom TTL.
+    pub fn with_ttl(ttl: std::time::Duration) -> Self {
+        Self {
+            ids: Mutex::new(HashMap::new()),
+            ttl,
+        }
+    }
+}
+
+impl Default for InMemoryRequestIdTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RequestIdTracker for InMemoryRequestIdTracker {
+    fn store(&self, request_id: &str) {
+        let mut ids = self.ids.lock().unwrap();
+        // Purge expired entries while we're here
+        let now = std::time::Instant::now();
+        ids.retain(|_, inserted| now.duration_since(*inserted) < self.ttl);
+        ids.insert(request_id.to_string(), now);
+    }
+
+    fn consume(&self, request_id: &str) -> bool {
+        let mut ids = self.ids.lock().unwrap();
+        ids.remove(request_id).is_some()
+    }
 }
 
 impl SpConfig {
@@ -75,6 +141,7 @@ impl SpConfig {
             force_authn: None,
             is_passive: None,
             protocol_binding: None,
+            request_id_tracker: Arc::new(InMemoryRequestIdTracker::new()),
             entity_id,
             acs_url,
         }
@@ -109,7 +176,6 @@ impl SpConfig {
 ///
 /// Holds the IdP's identity, signing config, and partner SP metadata.
 /// Pass this via `actix_web::web::Data`.
-#[derive(Clone)]
 pub struct IdpConfig {
     /// IdP entity ID (the Issuer in Responses/Assertions).
     pub entity_id: String,
@@ -141,6 +207,14 @@ pub struct IdpConfig {
     /// Base64-encoded DER signing certificate for KeyDescriptor and KeyInfo.
     /// Required for metadata KeyDescriptor and response/assertion signing.
     pub signing_cert_b64: Option<String>,
+
+    /// Session store for tracking IdP sessions and participants.
+    /// Required for SLO propagation. If None, logout propagation is skipped.
+    pub session_store: Option<Arc<dyn SessionStore>>,
+
+    /// Artifact store for HTTP Artifact binding resolution.
+    /// If None, artifact resolution returns an error response.
+    pub artifact_store: Option<Arc<dyn ArtifactStore + Send + Sync>>,
 }
 
 impl IdpConfig {
@@ -157,6 +231,8 @@ impl IdpConfig {
             sign_responses: true,
             sign_assertions: true,
             signing_cert_b64: None,
+            session_store: None,
+            artifact_store: None,
         }
     }
 
@@ -181,6 +257,18 @@ impl IdpConfig {
     /// Set the signing certificate (base64-encoded DER).
     pub fn with_signing_cert(mut self, cert_b64: impl Into<String>) -> Self {
         self.signing_cert_b64 = Some(cert_b64.into());
+        self
+    }
+
+    /// Set the session store for SLO propagation.
+    pub fn with_session_store(mut self, store: Arc<dyn SessionStore>) -> Self {
+        self.session_store = Some(store);
+        self
+    }
+
+    /// Set the artifact store for HTTP Artifact binding resolution.
+    pub fn with_artifact_store(mut self, store: Arc<dyn ArtifactStore + Send + Sync>) -> Self {
+        self.artifact_store = Some(store);
         self
     }
 }
@@ -255,5 +343,76 @@ mod tests {
 
         assert_eq!(config.slo_url, "https://idp.example.com/slo");
         assert_eq!(config.metadata_url, "https://idp.example.com/metadata");
+    }
+
+    #[test]
+    fn test_idp_config_defaults_no_stores() {
+        let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso");
+        assert!(config.session_store.is_none());
+        assert!(config.artifact_store.is_none());
+    }
+
+    #[test]
+    fn test_idp_config_with_session_store() {
+        use gamlastan::profiles::session::InMemorySessionStore;
+        let store = Arc::new(InMemorySessionStore::new());
+        let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
+            .with_session_store(store);
+        assert!(config.session_store.is_some());
+    }
+
+    #[test]
+    fn test_request_id_tracker_store_and_consume() {
+        let tracker = InMemoryRequestIdTracker::new();
+        tracker.store("_req_123");
+        tracker.store("_req_456");
+
+        // First consume should succeed
+        assert!(tracker.consume("_req_123"));
+        // Second consume should fail (already consumed)
+        assert!(!tracker.consume("_req_123"));
+        // Other ID still available
+        assert!(tracker.consume("_req_456"));
+    }
+
+    #[test]
+    fn test_request_id_tracker_consume_unknown() {
+        let tracker = InMemoryRequestIdTracker::new();
+        assert!(!tracker.consume("_nonexistent"));
+    }
+
+    #[test]
+    fn test_request_id_tracker_ttl_expiry() {
+        let tracker =
+            InMemoryRequestIdTracker::with_ttl(std::time::Duration::from_millis(1));
+        tracker.store("_req_expire");
+
+        // Wait for TTL to expire
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // Should be expired — store triggers purge of expired entries
+        tracker.store("_req_new");
+        assert!(!tracker.consume("_req_expire"));
+        assert!(tracker.consume("_req_new"));
+    }
+
+    #[test]
+    fn test_request_id_tracker_default() {
+        let tracker = InMemoryRequestIdTracker::default();
+        tracker.store("_req_default");
+        assert!(tracker.consume("_req_default"));
+    }
+
+    #[test]
+    fn test_sp_config_has_request_id_tracker() {
+        let config = SpConfig::new(
+            "https://sp.example.com",
+            "https://sp.example.com/acs",
+            make_dummy_entity_descriptor(),
+        );
+        // Default tracker should be InMemoryRequestIdTracker
+        config.request_id_tracker.store("_test_id");
+        assert!(config.request_id_tracker.consume("_test_id"));
+        assert!(!config.request_id_tracker.consume("_test_id"));
     }
 }

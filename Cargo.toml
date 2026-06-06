@@ -22,13 +22,13 @@ gamlastan-actix = { version = "0.1.0", path = "crates/gamlastan-actix" }
 uppsala = "0.3.0"
 
 # XML security
-bergshamra = "0.3.1"
-bergshamra-core = "0.3.1"
-bergshamra-dsig = "0.3.1"
-bergshamra-enc = "0.3.1"
-bergshamra-c14n = "0.3.1"
-bergshamra-crypto = "0.3.1"
-bergshamra-keys = "0.3.1"
+bergshamra = "0.4.0"
+bergshamra-core = "0.4.0"
+bergshamra-dsig = "0.4.0"
+bergshamra-enc = "0.4.0"
+bergshamra-c14n = "0.4.0"
+bergshamra-crypto = "0.4.0"
+bergshamra-keys = "0.4.0"
 
 # Date/time
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }

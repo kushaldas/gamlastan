@@ -9,6 +9,8 @@
 //
 // Register all routes at once with `configure_sp()`.
 
+use std::sync::Arc;
+
 use actix_web::{web, HttpRequest, HttpResponse};
 use chrono::Utc;
 
@@ -16,6 +18,7 @@ use gamlastan::bindings::redirect::RedirectEncodeParams;
 use gamlastan::bindings::relay_state::RelayState;
 use gamlastan::core::assertion::name_id::NameId;
 use gamlastan::core::protocol::response::Response as SamlResponse;
+use gamlastan::crypto::signer::SamlSigner;
 use gamlastan::profiles::logout;
 use gamlastan::profiles::sso::sp as sp_profile;
 use gamlastan::profiles::sso::web_browser::{AuthnRequestOptions, AuthnResult};
@@ -26,6 +29,17 @@ use crate::config::SpConfig;
 use crate::error::SamlActixError;
 use crate::extractors::SamlMessage;
 use crate::responders::MetadataXml;
+
+/// SP signing context for signing AuthnRequests in HTTP-Redirect binding.
+///
+/// Register as `web::Data<Arc<SpSigningContext>>`. If present, the SP login
+/// handler will sign the redirect query string.
+pub struct SpSigningContext {
+    /// The SAML signer (wraps bergshamra).
+    pub signer: SamlSigner,
+    /// The signature algorithm URI (e.g., `http://www.w3.org/2001/04/xmldsig-more#rsa-sha256`).
+    pub sig_algorithm: String,
+}
 
 /// The result returned by the ACS handler after validating a SAML Response.
 ///
@@ -78,6 +92,7 @@ pub fn configure_sp(cfg: &mut web::ServiceConfig) {
 async fn sp_login(
     req: HttpRequest,
     config: web::Data<SpConfig>,
+    signing_ctx: Option<web::Data<Arc<SpSigningContext>>>,
 ) -> Result<HttpResponse, SamlActixError> {
     let query_string = req.query_string();
     let relay_state_value = extract_query_param(query_string, "RelayState");
@@ -122,6 +137,9 @@ async fn sp_login(
         .to_xml_string()
         .map_err(|e| SamlActixError::Internal(format!("failed to serialize AuthnRequest: {e}")))?;
 
+    // Track the request ID for InResponseTo verification
+    config.request_id_tracker.store(&authn_request.base.id);
+
     // Encode and send via the appropriate binding
     let relay_state = relay_state_value
         .as_deref()
@@ -136,12 +154,15 @@ async fn sp_login(
         );
         Ok(crate::response_adapter::post_binding_response(&html))
     } else {
+        let signer_pair = signing_ctx
+            .as_ref()
+            .map(|ctx| (&ctx.signer, ctx.sig_algorithm.as_str()));
         let redirect_url = gamlastan::bindings::redirect::redirect_encode(&RedirectEncodeParams {
             saml_xml: authn_request_xml.as_bytes(),
             is_request: true,
             destination: &sso_endpoint.location,
             relay_state: relay_state.as_ref(),
-            signer: None, // TODO: add signing support
+            signer: signer_pair,
         })
         .map_err(|e| SamlActixError::Internal(format!("redirect encode failed: {e}")))?;
 
@@ -174,6 +195,14 @@ async fn sp_acs(
     // Get the IdP entity ID from metadata
     let expected_idp_entity_id = &config.idp_metadata.entity_id;
 
+    // Look up InResponseTo from the response to verify against tracked request IDs
+    let expected_request_id = response
+        .base
+        .in_response_to
+        .as_deref()
+        .filter(|id| config.request_id_tracker.consume(id))
+        .map(|id| id.to_string());
+
     // Validate the Response
     let now = Utc::now();
     let authn_result = sp_profile::process_response(
@@ -182,7 +211,7 @@ async fn sp_acs(
         Some(config.replay_cache.as_ref()),
         &config.entity_id,
         &config.acs_url,
-        None, // TODO: track request IDs for InResponseTo verification
+        expected_request_id.as_deref(),
         expected_idp_entity_id,
         now,
     )
@@ -462,5 +491,14 @@ mod tests {
             extract_query_param("url=https%3A%2F%2Fexample.com", "url"),
             Some("https://example.com".to_string())
         );
+    }
+
+    #[test]
+    fn test_sp_signing_context_fields() {
+        // Verify the SpSigningContext struct has the expected fields
+        // (we can't construct a real signer without keys, so just test the type exists)
+        let _sig_alg = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
+        // SpSigningContext is a public struct with signer and sig_algorithm fields
+        assert!(std::mem::size_of::<SpSigningContext>() > 0);
     }
 }

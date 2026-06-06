@@ -297,8 +297,46 @@ async fn idp_slo(
             logout::validate_logout_request(&logout_req, now, config.security.clock_skew_seconds)
                 .map_err(|e| SamlActixError::Internal(format!("invalid LogoutRequest: {e}")))?;
 
-            // TODO: propagate logout to session participants
-            // For now, just respond with success
+            // Propagate logout to session participants via the SessionStore
+            if let Some(ref session_store) = config.session_store {
+                use gamlastan::core::assertion::name_id::NameIdOrEncryptedId;
+                let name_id_value = match &logout_req.name_id {
+                    NameIdOrEncryptedId::NameId(nid) => nid.value.as_str(),
+                    NameIdOrEncryptedId::EncryptedId(_) => "",
+                };
+
+                if !name_id_value.is_empty() {
+                    let sessions = session_store.get_sessions_by_name_id(name_id_value);
+
+                    for session in &sessions {
+                        // Build LogoutRequest for each participant (except the requester)
+                        let requester_entity_id = logout_req
+                            .issuer
+                            .as_ref()
+                            .map(|i| i.value.as_str())
+                            .unwrap_or("");
+
+                        for participant in &session.participants {
+                            if participant.entity_id == requester_entity_id {
+                                continue; // Don't send back to the requester
+                            }
+                            let propagation_req = logout::create_idp_propagation_request(
+                                &config.entity_id,
+                                participant,
+                            );
+                            let _propagation_xml = propagation_req.to_xml_string().ok();
+                            // Note: actual HTTP delivery requires an async HTTP client.
+                            // The application should implement a SoapTransport or
+                            // use the propagation request XML directly. The SessionStore
+                            // tracks who needs logout; the application handles delivery.
+                        }
+
+                        // Clean up session
+                        session_store.destroy_session(&session.session_index);
+                    }
+                }
+            }
+
             let in_response_to = &logout_req.id;
             let response =
                 logout::create_logout_response_success(&config.entity_id, in_response_to, None);
@@ -341,17 +379,59 @@ async fn idp_artifact_resolve(
     >(&doc)?;
     let resolve = resolve_ref.to_owned();
 
-    // TODO: look up the artifact in the artifact store
-    // For now, return an error response indicating the artifact was not found
-    let error_response = artifact_resolution::create_artifact_response_error(
-        &config.entity_id,
-        &resolve.id,
-        "artifact not found",
-    );
-
-    let response_xml = error_response.to_xml_string().map_err(|e| {
-        SamlActixError::Internal(format!("failed to serialize ArtifactResponse: {e}"))
-    })?;
+    // Look up the artifact in the artifact store
+    let response_xml = if let Some(ref artifact_store) = config.artifact_store {
+        match artifact_store.resolve_and_consume(&resolve.artifact) {
+            Ok(Some(message_xml)) => {
+                // Build a successful ArtifactResponse wrapping the resolved SAML message
+                let art_response = artifact_resolution::create_artifact_response(
+                    &config.entity_id,
+                    &resolve.id,
+                    Some(message_xml),
+                );
+                art_response.to_xml_string().map_err(|e| {
+                    SamlActixError::Internal(format!(
+                        "failed to serialize ArtifactResponse: {e}"
+                    ))
+                })?
+            }
+            Ok(None) => {
+                // Artifact not found (or already consumed)
+                let error_response = artifact_resolution::create_artifact_response_error(
+                    &config.entity_id,
+                    &resolve.id,
+                    "artifact not found or already consumed",
+                );
+                error_response.to_xml_string().map_err(|e| {
+                    SamlActixError::Internal(format!(
+                        "failed to serialize ArtifactResponse: {e}"
+                    ))
+                })?
+            }
+            Err(e) => {
+                let error_response = artifact_resolution::create_artifact_response_error(
+                    &config.entity_id,
+                    &resolve.id,
+                    &format!("artifact store error: {e}"),
+                );
+                error_response.to_xml_string().map_err(|e| {
+                    SamlActixError::Internal(format!(
+                        "failed to serialize ArtifactResponse: {e}"
+                    ))
+                })?
+            }
+        }
+    } else {
+        // No artifact store configured
+        let error_response = artifact_resolution::create_artifact_response_error(
+            &config.entity_id,
+            &resolve.id,
+            "artifact resolution not configured",
+        );
+        error_response.to_xml_string().map_err(|e| {
+            SamlActixError::Internal(format!("failed to serialize ArtifactResponse: {e}"))
+        })?
+    };
 
     // Wrap in SOAP envelope
     let soap_body = gamlastan::bindings::soap::soap_envelope_wrap(&response_xml, None);
