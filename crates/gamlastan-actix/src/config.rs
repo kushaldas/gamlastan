@@ -383,8 +383,7 @@ mod tests {
 
     #[test]
     fn test_request_id_tracker_ttl_expiry() {
-        let tracker =
-            InMemoryRequestIdTracker::with_ttl(std::time::Duration::from_millis(1));
+        let tracker = InMemoryRequestIdTracker::with_ttl(std::time::Duration::from_millis(1));
         tracker.store("_req_expire");
 
         // Wait for TTL to expire

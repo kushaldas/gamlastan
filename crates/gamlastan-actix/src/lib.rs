@@ -45,8 +45,8 @@ pub use config::{IdpConfig, InMemoryRequestIdTracker, RequestIdTracker, SpConfig
 pub use error::SamlActixError;
 pub use extractors::{SamlBinding, SamlMessage};
 pub use idp::{AuthnCallback, AuthnCallbackResult, IdpSigningContext};
-pub use sp::SpSigningContext;
 pub use request_adapter::ActixHttpRequest;
 pub use response_adapter::{
     metadata_response, post_binding_response, redirect_binding_response, ActixResponseBuilder,
 };
+pub use sp::SpSigningContext;

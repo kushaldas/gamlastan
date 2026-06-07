@@ -390,9 +390,7 @@ async fn idp_artifact_resolve(
                     Some(message_xml),
                 );
                 art_response.to_xml_string().map_err(|e| {
-                    SamlActixError::Internal(format!(
-                        "failed to serialize ArtifactResponse: {e}"
-                    ))
+                    SamlActixError::Internal(format!("failed to serialize ArtifactResponse: {e}"))
                 })?
             }
             Ok(None) => {
@@ -403,9 +401,7 @@ async fn idp_artifact_resolve(
                     "artifact not found or already consumed",
                 );
                 error_response.to_xml_string().map_err(|e| {
-                    SamlActixError::Internal(format!(
-                        "failed to serialize ArtifactResponse: {e}"
-                    ))
+                    SamlActixError::Internal(format!("failed to serialize ArtifactResponse: {e}"))
                 })?
             }
             Err(e) => {
@@ -415,9 +411,7 @@ async fn idp_artifact_resolve(
                     &format!("artifact store error: {e}"),
                 );
                 error_response.to_xml_string().map_err(|e| {
-                    SamlActixError::Internal(format!(
-                        "failed to serialize ArtifactResponse: {e}"
-                    ))
+                    SamlActixError::Internal(format!("failed to serialize ArtifactResponse: {e}"))
                 })?
             }
         }
