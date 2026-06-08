@@ -185,20 +185,19 @@ The conformance suite validates three areas:
 
 ### Building the Docker image
 
-The Docker build context must be the **parent directory** of this workspace
-because the Rust build needs access to the `uppsala` and `bergshamra` path
-dependencies.
+The Docker build context is the **project root directory**. `uppsala` and
+`bergshamra` are pulled from crates.io, so no sibling source trees are required.
 
 ```sh
-cd /home/kdas/code/xml
-docker build -f saml/spid-sp-test/Dockerfile -t spid-sp-test .
+cd gamlastan
+docker build -f spid-sp-test/Dockerfile -t spid-sp-test .
 ```
 
 Or using docker compose:
 
 ```sh
-cd /home/kdas/code/xml
-docker compose -f saml/spid-sp-test/docker-compose.yml up --build
+cd gamlastan
+docker compose -f spid-sp-test/docker-compose.yml up --build
 ```
 
 ### What the Docker image contains
@@ -315,7 +314,7 @@ spid_sp_test --metadata-url https://localhost:8080/metadata ...
 
 The `example-idp` binary crate is a fully functional SAML 2.0 Identity Provider
 that can be tested against a real Service Provider. The docker-compose setup
-pairs it with a Django SP ([dsamlrp](../../learning/dsamlrp)) that uses
+pairs it with a Django SP ([dsamlrp](https://github.com/kushaldas/dsamlrp)) that uses
 `django-allauth` with `python3-saml` as the SAML backend.
 
 ### Architecture
@@ -385,7 +384,7 @@ for uid, etc.) to match the SP's `attribute_mapping` configuration.
 ### Running with docker compose
 
 ```sh
-cd /home/kdas/code/xml/saml/example-idp
+cd gamlastan/example-idp
 docker compose up --build
 ```
 
@@ -399,7 +398,7 @@ cd example-idp && cargo run
 # Starts on https://localhost:9443
 
 # Terminal 2: Run the Django SP
-cd /home/kdas/code/learning/dsamlrp && just dev
+cd /path/to/dsamlrp && just dev
 # Starts on https://localhost:8443
 
 # Terminal 3: Smoke test

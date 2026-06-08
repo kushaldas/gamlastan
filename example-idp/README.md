@@ -72,7 +72,7 @@ SP_METADATA_PATH=./sp_metadata cargo run -p example-idp
 # Starts on https://localhost:9443
 
 # Terminal 2: run the Django SP
-cd /home/kdas/code/learning/dsamlrp && just dev
+cd /path/to/dsamlrp && just dev
 # Starts on https://localhost:8443
 
 # Terminal 3: smoke test
@@ -113,7 +113,7 @@ cp /path/to/sp-b-metadata.xml sp_metadata/sp-b.xml   # add as many as you need
 Build the image from the project root:
 
 ```sh
-cd /home/kdas/code/xml/saml
+cd gamlastan
 docker build -f example-idp/Dockerfile -t example-idp .
 ```
 

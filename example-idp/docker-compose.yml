@@ -33,7 +33,7 @@ services:
     ports:
       - "8443:8443"
     volumes:
-      - /home/kdas/code/learning/dsamlrp/certs:/app/certs:ro
+      - ../dsamlrp/certs:/app/certs:ro
       - ./init-sp.sh:/app/init-sp.sh:ro
     environment:
       SECRET_KEY: "dev-secret-key-for-local-testing-only"
