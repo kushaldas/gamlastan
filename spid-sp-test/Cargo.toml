@@ -1,0 +1,26 @@
+[package]
+name = "spid-sp-test"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "SPID SAML conformance test SP - used with italia/spid-saml-check"
+
+[[bin]]
+name = "spid-sp-test"
+path = "src/main.rs"
+
+[dependencies]
+gamlastan = { workspace = true }
+gamlastan-actix = { workspace = true }
+actix-web = { workspace = true }
+serde = { workspace = true }
+chrono = { workspace = true }
+base64 = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+env_logger = { workspace = true }
+log = { workspace = true }

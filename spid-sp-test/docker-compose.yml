@@ -1,0 +1,42 @@
+# SPID SAML Conformance Test Infrastructure
+#
+# Build context is the project root directory. uppsala and bergshamra are pulled
+# from crates.io, so no sibling source trees are required.
+#
+# Build & run from the project root directory:
+#   docker compose -f spid-sp-test/docker-compose.yml up --build
+#
+# The SP container:
+#   - Builds the spid-sp-test binary (Rust)
+#   - Installs spid_sp_test (Python CLI tool) via uv
+#   - Starts the SP on https://localhost:8080
+#   - Runs spid_sp_test against it (metadata + authnreq + response tests)
+#
+# The spid-saml-check container (optional, for web UI validator):
+#   - Provides a browser-based SPID conformance validator at https://localhost:8443
+
+services:
+  sp:
+    build:
+      context: ..
+      dockerfile: spid-sp-test/Dockerfile
+    container_name: spid-sp
+    environment:
+      - RUST_LOG=info
+      - SP_HOST=localhost
+      - SP_PORT=8080
+      - IDP_ENTITY_ID=https://localhost:8443
+      - IDP_BASE_URL=https://localhost:8443
+      - CERT_DIR=/app/certs
+      - REQUESTS_CA_BUNDLE=/app/certs/rootCA.pem
+
+  # Optional: web UI validator (not used by spid_sp_test CLI)
+  # Uncomment to use the browser-based validator
+  # idp:
+  #   image: italia/spid-saml-check:latest
+  #   container_name: spid-saml-check
+  #   ports:
+  #     - "8443:8443"
+  #   environment:
+  #     - NODE_HTTPS_PORT=8443
+  #     - NODE_TLS_REJECT_UNAUTHORIZED=0
