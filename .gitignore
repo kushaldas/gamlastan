@@ -1,4 +1,5 @@
 target/
 .serena/
+spid-sp-test/certs/*
 example-idp/certs/tls-cert.pem
 example-idp/certs/tls-key.pem
