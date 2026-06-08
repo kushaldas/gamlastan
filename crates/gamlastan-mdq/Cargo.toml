@@ -1,0 +1,21 @@
+[package]
+name = "gamlastan-mdq"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "SAML Metadata Query Protocol (MDQ) client for gamlastan"
+
+[dependencies]
+gamlastan = { workspace = true }
+reqwest = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+base64 = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

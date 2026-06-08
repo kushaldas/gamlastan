@@ -2,6 +2,7 @@
 members = [
     "crates/gamlastan",
     "crates/gamlastan-actix",
+    "crates/gamlastan-mdq",
     "spid-sp-test",
     "example-idp",
 ]
@@ -19,6 +20,7 @@ rust-version = "1.75"
 # Internal crates
 gamlastan = { version = "0.1.0", path = "crates/gamlastan" }
 gamlastan-actix = { version = "0.1.0", path = "crates/gamlastan-actix" }
+gamlastan-mdq = { version = "0.1.0", path = "crates/gamlastan-mdq" }
 
 # XML parsing
 uppsala = "0.4.0"

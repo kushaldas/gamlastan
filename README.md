@@ -11,6 +11,7 @@ test suite (263/263 tests).
 |-------|-------------|
 | `gamlastan` | Core SAML 2.0 library: types, XML, crypto, metadata, bindings, security, profiles |
 | `gamlastan-actix` | actix-web integration (extractors, responders, handlers, middleware) |
+| `gamlastan-mdq` | Metadata Query Protocol (MDQ) client: fetch entity metadata on demand, verify, and cache |
 
 The `gamlastan` crate contains the following modules:
 
