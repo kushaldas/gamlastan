@@ -18,8 +18,8 @@ The `gamlastan` crate contains the following modules:
 | Module | Description |
 |--------|-------------|
 | `core` | Core SAML 2.0 types (Issuer, NameID, Assertions, StatusCode, Conditions, etc.) |
-| `xml` | XML serialization/deserialization via [uppsala](../../uppsala) |
-| `crypto` | Cryptographic operations (signing, verification) via [bergshamra](../../bergshamra) |
+| `xml` | XML serialization/deserialization via [uppsala](https://github.com/kushaldas/uppsala) |
+| `crypto` | Cryptographic operations (signing, verification) via [bergshamra](https://github.com/kushaldas/bergshamra) |
 | `metadata` | SAML metadata types, SPID extensions, caching, and validation |
 | `bindings` | HTTP Redirect, POST, Artifact, SOAP, PAOS bindings and RelayState handling |
 | `security` | 32-check assertion validator, replay cache, clock skew handling |
@@ -62,7 +62,7 @@ transport requirement is a deployment concern outside the library. The DSS/SAP
 
 ## Dependencies
 
-gamlastan depends on two sibling libraries via path dependencies:
+gamlastan depends on these two major libraries:
 
 - **[uppsala](https://github.com/kushaldas/uppsala)** -- Zero-copy XML parser (pure Rust)
 - **[bergshamra](https://github.com/kushaldas/bergshamra)** -- XML security: DSig signing/verification,
