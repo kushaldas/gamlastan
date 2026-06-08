@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-readme.workspace = true
+readme = "README.md"
 description = "SAML Metadata Query Protocol (MDQ) client for gamlastan"
 
 [dependencies]
