@@ -1,0 +1,7 @@
+# Keep the Docker build context small. The spid-sp-test image only needs the
+# workspace manifests and source; everything below is rebuilt inside the image.
+target/
+**/target/
+.git/
+.serena/
+pdf/

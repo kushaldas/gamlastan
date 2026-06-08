@@ -1,0 +1,46 @@
+# E2E test: example-idp + dsamlsp (Django SAML SP) in containers
+#
+# SAML uses browser-mediated flows (HTTP-Redirect + HTTP-POST), so both
+# containers simply expose ports to localhost — no container-to-container
+# networking is needed.
+#
+# Before starting, drop each trusted SP's metadata into ./sp_metadata/ as a
+# *.xml file (this directory is mounted read-only into the IdP container, and
+# every *.xml file is loaded as one trusted SP).
+#
+# Usage (from the example-idp directory):
+#   docker compose up --build
+#   # then open: https://localhost:8443/accounts/saml/sunet/login/
+
+services:
+  idp:
+    build:
+      context: ..               # the project root directory (uppsala/bergshamra come from crates.io)
+      dockerfile: example-idp/Dockerfile
+    ports:
+      - "9443:9443"
+    volumes:
+      - ./sp_metadata:/app/sp_metadata:ro   # one *.xml per trusted SP
+    environment:
+      RUST_LOG: info
+      CERT_DIR: /app/certs
+      IDP_HOST: localhost
+      IDP_PORT: "9443"
+      SP_METADATA_PATH: /app/sp_metadata
+
+  sp:
+    image: dsamlsp
+    ports:
+      - "8443:8443"
+    volumes:
+      - /home/kdas/code/learning/dsamlrp/certs:/app/certs:ro
+      - ./init-sp.sh:/app/init-sp.sh:ro
+    environment:
+      SECRET_KEY: "dev-secret-key-for-local-testing-only"
+      DEBUG: "True"
+      DOMAIN_NAME: "localhost:8443"
+      SITE_URL: "https://localhost:8443"
+      ALLOWED_HOSTS: "localhost"
+    command: ["sh", "/app/init-sp.sh"]
+    depends_on:
+      - idp

@@ -1,1 +1,4 @@
 target/
+.serena/
+example-idp/certs/tls-cert.pem
+example-idp/certs/tls-key.pem

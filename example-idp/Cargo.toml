@@ -1,0 +1,25 @@
+[package]
+name = "example-idp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Example SAML Identity Provider for testing against SPs."
+
+[[bin]]
+name = "example-idp"
+path = "src/main.rs"
+
+[dependencies]
+gamlastan = { workspace = true }
+gamlastan-actix = { workspace = true }
+actix-web = { workspace = true }
+chrono = { workspace = true }
+base64 = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+tokio = { workspace = true }
+env_logger = { workspace = true }
+log = { workspace = true }
+flate2 = { workspace = true }
