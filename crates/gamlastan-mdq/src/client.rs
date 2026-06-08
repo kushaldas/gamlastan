@@ -433,11 +433,7 @@ impl<F: MetadataFetcher> MdqClient<F> {
         }
     }
 
-    async fn try_load_static(
-        &self,
-        url: &str,
-        entity_id: &str,
-    ) -> Result<Resolved, MdqError> {
+    async fn try_load_static(&self, url: &str, entity_id: &str) -> Result<Resolved, MdqError> {
         let bytes = self.fetcher.fetch(url).await?;
         let xml = std::str::from_utf8(&bytes).map_err(|e| MdqError::NotUtf8(e.to_string()))?;
         self.maybe_warn_unverified();

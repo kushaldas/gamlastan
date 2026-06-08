@@ -88,9 +88,9 @@ struct AlgorithmContext {
 pub fn validate_response_algorithms(response_xml: &str) -> Result<(), SwedenConnectError> {
     let doc = uppsala::parse(response_xml)
         .map_err(|e| SwedenConnectError::Xml(crate::xml::XmlError::ParseError(e)))?;
-    let root = doc
-        .document_element()
-        .ok_or_else(|| SwedenConnectError::Other("response XML has no document element".to_string()))?;
+    let root = doc.document_element().ok_or_else(|| {
+        SwedenConnectError::Other("response XML has no document element".to_string())
+    })?;
     validate_algorithms_recursive(&doc, root, AlgorithmContext::default())
 }
 
@@ -150,9 +150,7 @@ fn validate_algorithms_recursive<'a>(
                 }
                 "DigestMethod" => {
                     let algorithm = doc.get_attribute(node, "Algorithm").ok_or_else(|| {
-                        SwedenConnectError::Other(
-                            "DigestMethod is missing Algorithm".to_string(),
-                        )
+                        SwedenConnectError::Other("DigestMethod is missing Algorithm".to_string())
                     })?;
                     let allowed = if ctx.in_encrypted_key {
                         constants::is_allowed_digest_algorithm(algorithm)
@@ -776,10 +774,10 @@ mod tests {
         assert!(result.sign_message_displayed);
     }
 
-        #[test]
-        fn test_validate_response_algorithms_rejects_sha1_signature() {
-                let xml = format!(
-                        r##"<saml2p:Response xmlns:saml2p="{p}" xmlns:ds="{ds}" ID="_r1" Version="2.0" IssueInstant="2024-01-01T00:00:00Z">
+    #[test]
+    fn test_validate_response_algorithms_rejects_sha1_signature() {
+        let xml = format!(
+            r##"<saml2p:Response xmlns:saml2p="{p}" xmlns:ds="{ds}" ID="_r1" Version="2.0" IssueInstant="2024-01-01T00:00:00Z">
                                  <ds:Signature>
                                      <ds:SignedInfo>
                                          <ds:SignatureMethod Algorithm="http://www.w3.org/2000/09/xmldsig#rsa-sha1"/>
@@ -789,45 +787,45 @@ mod tests {
                                      </ds:SignedInfo>
                                  </ds:Signature>
                              </saml2p:Response>"##,
-                        p = constants::NS_SAML_PROTOCOL,
-                        ds = constants::NS_DS,
-                        sha256 = constants::DIGEST_SHA256,
-                );
+            p = constants::NS_SAML_PROTOCOL,
+            ds = constants::NS_DS,
+            sha256 = constants::DIGEST_SHA256,
+        );
 
-                assert!(matches!(
-                        validate_response_algorithms(&xml),
-                        Err(SwedenConnectError::DisallowedAlgorithm {
-                                kind: "signature",
-                                ..
-                        })
-                ));
-        }
+        assert!(matches!(
+            validate_response_algorithms(&xml),
+            Err(SwedenConnectError::DisallowedAlgorithm {
+                kind: "signature",
+                ..
+            })
+        ));
+    }
 
-        #[test]
-        fn test_validate_response_algorithms_rejects_disallowed_block_encryption() {
-                let xml = format!(
-                        r##"<saml2p:Response xmlns:saml2p="{p}" xmlns:xenc="{xenc}" ID="_r1" Version="2.0" IssueInstant="2024-01-01T00:00:00Z">
+    #[test]
+    fn test_validate_response_algorithms_rejects_disallowed_block_encryption() {
+        let xml = format!(
+            r##"<saml2p:Response xmlns:saml2p="{p}" xmlns:xenc="{xenc}" ID="_r1" Version="2.0" IssueInstant="2024-01-01T00:00:00Z">
                                  <xenc:EncryptedData>
                                      <xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#tripledes-cbc"/>
                                  </xenc:EncryptedData>
                              </saml2p:Response>"##,
-                        p = constants::NS_SAML_PROTOCOL,
-                        xenc = NS_XMLENC,
-                );
+            p = constants::NS_SAML_PROTOCOL,
+            xenc = NS_XMLENC,
+        );
 
-                assert!(matches!(
-                        validate_response_algorithms(&xml),
-                        Err(SwedenConnectError::DisallowedAlgorithm {
-                                kind: "block encryption",
-                                ..
-                        })
-                ));
-        }
+        assert!(matches!(
+            validate_response_algorithms(&xml),
+            Err(SwedenConnectError::DisallowedAlgorithm {
+                kind: "block encryption",
+                ..
+            })
+        ));
+    }
 
-        #[test]
-        fn test_validate_response_algorithms_allows_oaep_sha1_digest() {
-                let xml = format!(
-                        r##"<saml2p:Response xmlns:saml2p="{p}" xmlns:ds="{ds}" xmlns:xenc="{xenc}" ID="_r1" Version="2.0" IssueInstant="2024-01-01T00:00:00Z">
+    #[test]
+    fn test_validate_response_algorithms_allows_oaep_sha1_digest() {
+        let xml = format!(
+            r##"<saml2p:Response xmlns:saml2p="{p}" xmlns:ds="{ds}" xmlns:xenc="{xenc}" ID="_r1" Version="2.0" IssueInstant="2024-01-01T00:00:00Z">
                                  <xenc:EncryptedKey>
                                      <xenc:EncryptionMethod Algorithm="{oaep}">
                                          <ds:DigestMethod Algorithm="{sha1}"/>
@@ -837,14 +835,14 @@ mod tests {
                                      <xenc:EncryptionMethod Algorithm="{aes}"/>
                                  </xenc:EncryptedData>
                              </saml2p:Response>"##,
-                        p = constants::NS_SAML_PROTOCOL,
-                        ds = constants::NS_DS,
-                        xenc = NS_XMLENC,
-                        oaep = constants::KEYTRANSPORT_RSA_OAEP_MGF1P,
-                        sha1 = constants::DIGEST_SHA1,
-                        aes = constants::ENC_AES256_CBC,
-                );
+            p = constants::NS_SAML_PROTOCOL,
+            ds = constants::NS_DS,
+            xenc = NS_XMLENC,
+            oaep = constants::KEYTRANSPORT_RSA_OAEP_MGF1P,
+            sha1 = constants::DIGEST_SHA1,
+            aes = constants::ENC_AES256_CBC,
+        );
 
-                assert!(validate_response_algorithms(&xml).is_ok());
-        }
+        assert!(validate_response_algorithms(&xml).is_ok());
+    }
 }

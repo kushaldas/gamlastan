@@ -8,14 +8,18 @@ use chrono::{DateTime, Utc};
 use gamlastan::core::namespace::SAML_METADATA_NS;
 use gamlastan::crypto::{SamlVerifier, VerifyResult};
 use gamlastan::metadata::{
-    EntitiesDescriptorRef, EntityDescriptor, EntityDescriptorRef, MetadataChildRef,
-    MetadataError, MetadataSigningProfile,
+    EntitiesDescriptorRef, EntityDescriptor, EntityDescriptorRef, MetadataChildRef, MetadataError,
+    MetadataSigningProfile,
 };
 use gamlastan::xml::{parse_saml, uppsala, XmlError};
 
 use crate::client::{RequiredRole, Trust};
 use crate::error::MdqError;
 use crate::transform::parse_xs_duration;
+
+/// An entity selected from an aggregate, paired with the cache hints
+/// accumulated from the enclosing `EntitiesDescriptor` layers.
+type SelectedEntity = (EntityDescriptor, Option<Duration>, Option<DateTime<Utc>>);
 
 /// A resolved entity plus the cache hints carried by the document.
 pub(crate) struct Resolved {
@@ -64,7 +68,7 @@ pub(crate) fn parse_verify_select(
         )?;
         let (entity, agg_cache_duration, agg_valid_until) =
             select_entity(&es_ref, requested_entity_id, None, None)?
-            .ok_or_else(|| MdqError::EntityNotFound(requested_entity_id.to_string()))?;
+                .ok_or_else(|| MdqError::EntityNotFound(requested_entity_id.to_string()))?;
         finish(
             entity,
             requested_entity_id,
@@ -83,7 +87,7 @@ fn select_entity(
     requested_entity_id: &str,
     inherited_cache_duration: Option<Duration>,
     inherited_valid_until: Option<DateTime<Utc>>,
-) -> Result<Option<(EntityDescriptor, Option<Duration>, Option<DateTime<Utc>>)>, MdqError> {
+) -> Result<Option<SelectedEntity>, MdqError> {
     let aggregate_cache_duration = combine_duration(
         inherited_cache_duration,
         entities.cache_duration.map(parse_xs_duration).transpose()?,
@@ -140,7 +144,11 @@ fn finish(
     if !role_ok(&entity, required_role) {
         return Err(MdqError::RoleMissing(required_role));
     }
-    let child_cache_duration = entity.cache_duration.as_deref().map(parse_xs_duration).transpose()?;
+    let child_cache_duration = entity
+        .cache_duration
+        .as_deref()
+        .map(parse_xs_duration)
+        .transpose()?;
     let cache_duration = combine_duration(child_cache_duration, parent_cache_duration);
     let valid_until = combine_valid_until(entity.valid_until, parent_valid_until);
     reject_if_expired(valid_until, now)?;
@@ -172,7 +180,10 @@ fn combine_valid_until(
     }
 }
 
-fn reject_if_expired(valid_until: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Result<(), MdqError> {
+fn reject_if_expired(
+    valid_until: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Result<(), MdqError> {
     if let Some(valid_until) = valid_until {
         if now >= valid_until {
             return Err(MdqError::Metadata(MetadataError::Expired(

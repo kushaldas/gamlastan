@@ -1014,7 +1014,11 @@ async fn sp_acs(state: web::Data<AppState>, form: web::Form<AcsForm>) -> HttpRes
     }
 
     // ── Step 9: Replay protection ─────────────────────────────────────
-    if !register_replay_ids(state.replay_cache.as_ref(), &state.security_config, &response) {
+    if !register_replay_ids(
+        state.replay_cache.as_ref(),
+        &state.security_config,
+        &response,
+    ) {
         log::warn!("ACS: Replay detected for Response or Assertion ID");
         return HttpResponse::Forbidden().body("Replay detected");
     }
@@ -1359,6 +1363,35 @@ async fn main() -> io::Result<()> {
     .await
 }
 
+/// Extract base64-encoded certificate from PEM file.
+fn extract_cert_b64(pem_data: &[u8]) -> String {
+    let pem_str = std::str::from_utf8(pem_data).expect("PEM is not valid UTF-8");
+    let mut in_cert = false;
+    let mut b64 = String::new();
+    for line in pem_str.lines() {
+        if line.contains("BEGIN CERTIFICATE") {
+            in_cert = true;
+            continue;
+        }
+        if line.contains("END CERTIFICATE") {
+            break;
+        }
+        if in_cert {
+            b64.push_str(line.trim());
+        }
+    }
+    b64
+}
+
+/// Convert PEM certificate to DER bytes.
+fn pem_to_der(pem_data: &[u8]) -> Vec<u8> {
+    use base64::Engine;
+    let b64 = extract_cert_b64(pem_data);
+    base64::engine::general_purpose::STANDARD
+        .decode(&b64)
+        .expect("Failed to decode certificate base64")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1434,7 +1467,10 @@ mod tests {
     #[actix_web::test]
     async fn test_sp_metadata_fails_closed_when_signing_fails() {
         let response = sp_metadata(web::Data::new(test_app_state())).await;
-        assert_eq!(response.status(), actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.status(),
+            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[test]
@@ -1453,33 +1489,4 @@ mod tests {
             &response,
         ));
     }
-}
-
-/// Extract base64-encoded certificate from PEM file.
-fn extract_cert_b64(pem_data: &[u8]) -> String {
-    let pem_str = std::str::from_utf8(pem_data).expect("PEM is not valid UTF-8");
-    let mut in_cert = false;
-    let mut b64 = String::new();
-    for line in pem_str.lines() {
-        if line.contains("BEGIN CERTIFICATE") {
-            in_cert = true;
-            continue;
-        }
-        if line.contains("END CERTIFICATE") {
-            break;
-        }
-        if in_cert {
-            b64.push_str(line.trim());
-        }
-    }
-    b64
-}
-
-/// Convert PEM certificate to DER bytes.
-fn pem_to_der(pem_data: &[u8]) -> Vec<u8> {
-    use base64::Engine;
-    let b64 = extract_cert_b64(pem_data);
-    base64::engine::general_purpose::STANDARD
-        .decode(&b64)
-        .expect("Failed to decode certificate base64")
 }

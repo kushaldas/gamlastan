@@ -7,6 +7,8 @@ rust-version.workspace = true
 repository.workspace = true
 readme = "README.md"
 description = "SAML Metadata Query Protocol (MDQ) client for gamlastan"
+keywords = ["saml", "mdq", "metadata", "sso", "identity"]
+categories = ["authentication", "web-programming"]
 
 [dependencies]
 gamlastan = { workspace = true }

@@ -433,11 +433,7 @@ async fn aggregate_parent_cache_duration_takes_precedence() {
 #[tokio::test]
 async fn aggregate_parent_valid_until_takes_precedence() {
     let clock = TestClock::new();
-    let child = sp_entity_with_hints(
-        "https://sp.example.com",
-        None,
-        Some("2025-01-01T02:00:00Z"),
-    );
+    let child = sp_entity_with_hints("https://sp.example.com", None, Some("2025-01-01T02:00:00Z"));
     let body = aggregate_with_children(&child, None, Some("2025-01-01T00:05:00Z"));
     let fetcher = MockFetcher::serving(&body);
     let client = MdqClient::with_fetcher("https://mdq.example.org/", fetcher.clone())
@@ -452,7 +448,11 @@ async fn aggregate_parent_valid_until_takes_precedence() {
         matches!(err, MdqError::Metadata(MetadataError::Expired(_))),
         "got {err:?}"
     );
-    assert_eq!(fetcher.calls(), 2, "expired aggregate should refetch then fail");
+    assert_eq!(
+        fetcher.calls(),
+        2,
+        "expired aggregate should refetch then fail"
+    );
 }
 
 // ── Signature tests ────────────────────────────────────────────────────────────
@@ -679,7 +679,11 @@ async fn static_from_url_refetches_after_expiry() {
 
     let ed = client.get("https://idp.example.com/idp").await.unwrap();
     assert_eq!(ed.entity_id, "https://idp.example.com/idp");
-    assert_eq!(fetcher.calls(), 2, "expired static URL metadata must be reloaded");
+    assert_eq!(
+        fetcher.calls(),
+        2,
+        "expired static URL metadata must be reloaded"
+    );
 }
 
 #[tokio::test]
