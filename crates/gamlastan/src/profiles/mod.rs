@@ -23,6 +23,7 @@ pub mod name_id_mapping;
 pub mod name_id_mgmt;
 pub mod session;
 pub mod sso;
+pub mod swedenconnect;
 
 // Re-export key types for convenience
 pub use error::ProfileError;
