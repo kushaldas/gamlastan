@@ -151,11 +151,7 @@ pub fn configure_idp(cfg: &mut web::ServiceConfig) {
 ///
 /// The template contains empty DigestValue and SignatureValue placeholders
 /// that are filled in by `signer.sign_enveloped()`.
-pub fn signature_template(
-    reference_id: &str,
-    cert_b64: &str,
-    signature_method_uri: &str,
-) -> String {
+pub fn signature_template(reference_id: &str, cert_b64: &str, signature_method_uri: &str) -> String {
     format!(
         r##"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="{sig_alg}"/><ds:Reference URI="#{id}"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{cert}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></ds:Signature>"##,
         id = reference_id,
@@ -234,10 +230,9 @@ pub fn sign_response_xml(
 
     // Then sign Response (outer)
     if sign_responses {
-        let signature_method_uri = signing_ctx
-            .signer
-            .signature_method_uri()
-            .map_err(|e| SamlActixError::Internal(format!("unsupported signing algorithm: {e}")))?;
+        let signature_method_uri = signing_ctx.signer.signature_method_uri().map_err(|e| {
+            SamlActixError::Internal(format!("unsupported signing algorithm: {e}"))
+        })?;
         let sig = signature_template(response_id, &signing_ctx.cert_b64, signature_method_uri);
         xml = insert_signature_after_element(&xml, "samlp:Response", &sig)?;
         xml = signing_ctx
@@ -680,10 +675,7 @@ mod tests {
             "CTX_CERT",
         );
 
-        assert_eq!(
-            metadata_signing_cert_b64(&config, Some(&signing_ctx)),
-            Some("CTX_CERT")
-        );
+        assert_eq!(metadata_signing_cert_b64(&config, Some(&signing_ctx)), Some("CTX_CERT"));
     }
 
     #[test]
@@ -691,9 +683,6 @@ mod tests {
         let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
             .with_signing_cert("CONFIG_CERT");
 
-        assert_eq!(
-            metadata_signing_cert_b64(&config, None),
-            Some("CONFIG_CERT")
-        );
+        assert_eq!(metadata_signing_cert_b64(&config, None), Some("CONFIG_CERT"));
     }
 }

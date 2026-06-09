@@ -90,6 +90,18 @@ ALLOW_UNSIGNED_AUTHN_REQUESTS=true SP_METADATA_PATH=/path/to/sp-metadata.xml \
     cargo run -p example-idp
 ```
 
+Optional HSM-backed SAML signing uses these environment variables instead of
+`certs/idp-key.pem`:
+
+```sh
+GAMLASTAN_PKCS11_MODULE=/usr/lib/softhsm/libsofthsm2.so \
+GAMLASTAN_PKCS11_PIN=1234 \
+GAMLASTAN_PKCS11_LABEL=saml-signing-key \
+GAMLASTAN_PKCS11_CERT=/path/to/idp-cert.pem \
+SP_METADATA_PATH=/path/to/sp-metadata.xml \
+   cargo run -p example-idp
+```
+
 Note: if the SP's metadata sets `AuthnRequestsSigned="true"`, signed requests
 are required regardless of this override.
 
@@ -189,12 +201,20 @@ Browser                    SP (:8443)                       IdP (:9443)
 | `ALLOW_UNSIGNED_AUTHN_REQUESTS` | `false` | Accept unsigned `AuthnRequest`s (insecure; ignored if SP metadata requires signing) |
 | `RUST_LOG` | `info` | Log level for the IdP binary (`debug`, `info`, `warn`, `error`) |
 
+When all four `GAMLASTAN_PKCS11_*` variables are set, SAML signing moves to the
+PKCS#11 key identified by `GAMLASTAN_PKCS11_LABEL`. `CERT_DIR` still provides
+the TLS certificate and key for the HTTPS listener.
+
 ## Certificates
 
 | File | Purpose |
 |------|---------|
 | `certs/idp-key.pem` / `certs/idp-cert.pem` | SAML signing keypair (RSA 2048, self-signed, CN=Example IdP) |
 | `certs/tls-key.pem` / `certs/tls-cert.pem` | TLS certificate for localhost (generated with mkcert) |
+
+When HSM signing is enabled, `certs/idp-key.pem` is no longer used for SAML
+signing, but the TLS files are still required unless you replace the listener
+configuration separately.
 
 ## Tests
 

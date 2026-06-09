@@ -102,6 +102,10 @@ docker run --rm spid-sp-test \
 | `RUST_LOG`           | `info`                   | Log filter                               |
 | `REQUESTS_CA_BUNDLE` | `/app/certs/rootCA.pem`  | Lets Python trust the SP's mkcert TLS    |
 
+When all four `GAMLASTAN_PKCS11_*` variables are set, SAML signing moves to the
+PKCS#11 key identified by `GAMLASTAN_PKCS11_LABEL`. `CERT_DIR` still provides
+the TLS files and the IdP verification certificate.
+
 ## Running locally (without Docker)
 
 You need the Python `spid_sp_test` tool and the certs in place. Run the SP from
@@ -123,6 +127,17 @@ A quick smoke check without the Python tool:
 
 ```sh
 curl -sk https://localhost:8080/metadata | head
+```
+
+Optional HSM-backed SP signing uses these environment variables instead of
+`certs/sp-key.pem`:
+
+```sh
+GAMLASTAN_PKCS11_MODULE=/usr/lib/softhsm/libsofthsm2.so \
+GAMLASTAN_PKCS11_PIN=1234 \
+GAMLASTAN_PKCS11_LABEL=saml-signing-key \
+GAMLASTAN_PKCS11_CERT=/path/to/sp-cert.pem \
+cargo run --release -p spid-sp-test
 ```
 
 ## Optional: browser-based validator
