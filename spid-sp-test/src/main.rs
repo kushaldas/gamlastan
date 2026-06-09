@@ -1282,10 +1282,10 @@ fn load_sp_signer(cert_dir: &str) -> io::Result<(Arc<SamlSigner>, String)> {
     }
 
     info!("Using file-based SP signing key from {cert_dir}/sp-key.pem");
-    let sp_key_pem = fs::read(format!("{cert_dir}/sp-key.pem"))
-        .expect("Failed to read SP private key");
-    let sp_cert_pem = fs::read(format!("{cert_dir}/sp-cert.pem"))
-        .expect("Failed to read SP certificate");
+    let sp_key_pem =
+        fs::read(format!("{cert_dir}/sp-key.pem")).expect("Failed to read SP private key");
+    let sp_cert_pem =
+        fs::read(format!("{cert_dir}/sp-cert.pem")).expect("Failed to read SP certificate");
 
     let cert_b64 = extract_cert_b64(&sp_cert_pem);
 

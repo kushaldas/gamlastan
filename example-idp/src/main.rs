@@ -299,11 +299,8 @@ async fn idp_metadata(state: web::Data<AppState>) -> HttpResponse {
     };
 
     // Sign the metadata
-    let sig = gamlastan_actix::idp::signature_template(
-        &metadata_id,
-        cert_b64,
-        signature_method_uri,
-    );
+    let sig =
+        gamlastan_actix::idp::signature_template(&metadata_id, cert_b64, signature_method_uri);
     let xml_with_sig = match gamlastan_actix::idp::insert_signature_after_element(
         &xml,
         "md:EntityDescriptor",

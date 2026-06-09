@@ -1,0 +1,18 @@
+# cargo-audit configuration.
+# Read by `cargo audit` and by the rustsec/audit-check CI action.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 — Marvin Attack: potential key recovery through timing
+    # side-channels in the `rsa` crate. No fixed upstream version exists (the
+    # RustCrypto `rsa` crate has no constant-time PKCS#1 v1.5 decryption yet).
+    #
+    # Reaches us transitively via bergshamra-crypto -> rsa, where it backs SAML
+    # XML-DSig RSA signature verification. We cannot drop RSA without breaking
+    # SAML conformance, and the attack requires an online decryption oracle with
+    # precise timing measurements against RSA *decryption/PKCS#1 v1.5* — not the
+    # signature-verification paths this library exercises.
+    #
+    # Re-evaluate whenever a fixed `rsa` release lands.
+    "RUSTSEC-2023-0071",
+]
