@@ -34,6 +34,12 @@ bergshamra-c14n = "0.5.1"
 bergshamra-crypto = "0.5.1"
 bergshamra-keys = "0.5.1"
 
+# HSM / PKCS#11 signing backend (the low-level crypto provider beneath
+# bergshamra). This direct dependency exists so gamlastan can re-export the
+# shared `kryptering::Signer` trait/types without version drift from the
+# bergshamra stack.
+kryptering = "0.3"
+
 # Date/time
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 

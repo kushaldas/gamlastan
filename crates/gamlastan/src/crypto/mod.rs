@@ -37,6 +37,12 @@ pub use error::CryptoError;
 pub use signer::SamlSigner;
 pub use verifier::SamlVerifier;
 
+// Re-export the HSM/PKCS#11 signing backend so consumers can build a
+// `kryptering::pkcs11::Pkcs11Signer` from the same resolved crate instance and
+// hand it to [`SamlSigner::with_hsm_signer`] without risking a version mismatch
+// on the `kryptering::Signer` trait object.
+pub use kryptering;
+
 // Re-export bergshamra types needed by consumers.
 pub use bergshamra_c14n::{self, C14nMode};
 pub use bergshamra_dsig::{VerifiedKeyInfo, VerifiedReference, VerifyResult};
