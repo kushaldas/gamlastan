@@ -36,6 +36,16 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      # Tests parse a real federation aggregate via include_str!; fetch the
+      # fixture (justfile recipe) before compiling test targets.
+      - name: Download eduGAIN metadata fixture
+        run: just _ensure-edugain
+
       - name: Format check
         run: cargo fmt --all -- --check
 

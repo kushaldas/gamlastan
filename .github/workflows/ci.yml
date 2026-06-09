@@ -34,6 +34,19 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      # Several tests parse a real federation aggregate via
+      # `include_str!(".../edugain-v2.xml")`, so the fixture must exist at the
+      # workspace root before anything compiles test targets (clippy
+      # --all-targets and test). Reuse the justfile recipe so the source URL
+      # stays defined in one place.
+      - name: Download eduGAIN metadata fixture
+        run: just _ensure-edugain
+
       - name: Format check
         run: cargo fmt --all -- --check
 
