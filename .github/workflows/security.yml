@@ -1,0 +1,30 @@
+name: Security audit
+
+on:
+  schedule:
+    # Daily at 06:17 UTC. Offset from :00 to avoid the GitHub cron rush.
+    - cron: "17 6 * * *"
+  push:
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/security.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  checks: write
+
+jobs:
+  cargo-audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Run cargo audit
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

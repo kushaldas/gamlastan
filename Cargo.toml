@@ -9,7 +9,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 repository = "https://github.com/kushaldas/gamlastan"
 readme = "README.md"
@@ -18,9 +18,9 @@ rust-version = "1.75"
 
 [workspace.dependencies]
 # Internal crates
-gamlastan = { version = "0.1.0", path = "crates/gamlastan" }
-gamlastan-actix = { version = "0.1.0", path = "crates/gamlastan-actix" }
-gamlastan-mdq = { version = "0.1.0", path = "crates/gamlastan-mdq" }
+gamlastan = { version = "0.2.0", path = "crates/gamlastan" }
+gamlastan-actix = { version = "0.2.0", path = "crates/gamlastan-actix" }
+gamlastan-mdq = { version = "0.2.0", path = "crates/gamlastan-mdq" }
 
 # XML parsing
 uppsala = "0.4.0"
