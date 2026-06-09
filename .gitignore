@@ -4,3 +4,4 @@ spid-sp-test/certs/*
 spid-sp-test/docker/*
 example-idp/certs/tls-cert.pem
 example-idp/certs/tls-key.pem
+edugain-v2.xml
