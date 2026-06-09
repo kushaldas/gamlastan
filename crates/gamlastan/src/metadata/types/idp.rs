@@ -118,8 +118,10 @@ impl IdpSsoDescriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::types::entity_descriptor::{EntitiesDescriptorRef, EntityRolesRef, MetadataChildRef};
     use crate::metadata::types::endpoint::Endpoint;
+    use crate::metadata::types::entity_descriptor::{
+        EntitiesDescriptorRef, EntityRolesRef, MetadataChildRef,
+    };
     use crate::metadata::types::key_descriptor::{KeyDescriptor, KeyUse};
     use crate::metadata::types::role_descriptor::{RoleDescriptorBase, SsoDescriptorBase};
     use crate::xml::parse_saml;

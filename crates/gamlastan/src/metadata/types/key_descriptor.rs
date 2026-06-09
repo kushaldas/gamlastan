@@ -302,7 +302,9 @@ fn find_tag_end(xml: &str, from: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::types::entity_descriptor::{EntitiesDescriptorRef, EntityRolesRef, MetadataChildRef};
+    use crate::metadata::types::entity_descriptor::{
+        EntitiesDescriptorRef, EntityRolesRef, MetadataChildRef,
+    };
     use crate::xml::parse_saml;
 
     fn first_idp_key_descriptor_without_inline_ds<'a>(
@@ -332,7 +334,8 @@ mod tests {
                     }
                 }
                 MetadataChildRef::Entities(entities) => {
-                    if let Some(key_descriptor) = first_idp_key_descriptor_without_inline_ds(entities)
+                    if let Some(key_descriptor) =
+                        first_idp_key_descriptor_without_inline_ds(entities)
                     {
                         return Some(key_descriptor);
                     }
