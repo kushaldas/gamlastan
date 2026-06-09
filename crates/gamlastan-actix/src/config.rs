@@ -204,8 +204,12 @@ pub struct IdpConfig {
     /// Whether to sign assertions.
     pub sign_assertions: bool,
 
-    /// Base64-encoded DER signing certificate for KeyDescriptor and KeyInfo.
-    /// Required for metadata KeyDescriptor and response/assertion signing.
+    /// Optional base64-encoded DER signing certificate for IdP metadata.
+    ///
+    /// When a signing context is registered, its certificate is used for
+    /// response/assertion `KeyInfo` and as the preferred metadata
+    /// `KeyDescriptor`. This config value is mainly a fallback for metadata when
+    /// no signing context is present.
     pub signing_cert_b64: Option<String>,
 
     /// Session store for tracking IdP sessions and participants.

@@ -40,4 +40,8 @@ pub enum CryptoError {
     /// An invalid configuration was provided.
     #[error("Configuration error: {0}")]
     ConfigError(String),
+
+    /// An HSM / PKCS#11-backed signing operation failed.
+    #[error("HSM signing error: {0}")]
+    HsmError(String),
 }

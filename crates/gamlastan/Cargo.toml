@@ -24,6 +24,12 @@ bergshamra-c14n = { workspace = true }
 bergshamra-crypto = { workspace = true }
 bergshamra-keys = { workspace = true }
 
+# HSM / PKCS#11 signing backend. gamlastan uses the shared `Signer` trait and
+# related algorithm types directly and re-exports the crate for consumers.
+# The current bergshamra/kryptering stack already resolves PKCS#11 support in
+# normal builds, so this line does not create a separate opt-in feature gate.
+kryptering = { workspace = true }
+
 # Date/time
 chrono = { workspace = true }
 
@@ -39,3 +45,4 @@ flate2 = { workspace = true }
 
 # RNG (pinned to 0.8 as in gamlastan core)
 rand = "0.8"
+

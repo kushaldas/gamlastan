@@ -22,6 +22,12 @@
 //   IDP_PORT=9443 CERT_DIR=example-idp/certs SP_METADATA_PATH=/path/to/sp-metadata.xml cargo run -p example-idp
 //   # multiple SPs (directory of *.xml metadata files):
 //   SP_METADATA_PATH=./sp_metadata cargo run -p example-idp
+//   # optional HSM-backed SAML signing key:
+//   GAMLASTAN_PKCS11_MODULE=/usr/lib/softhsm/libsofthsm2.so \
+//   GAMLASTAN_PKCS11_PIN=1234 \
+//   GAMLASTAN_PKCS11_LABEL=saml-signing-key \
+//   GAMLASTAN_PKCS11_CERT=/path/to/idp-cert.pem \
+//   SP_METADATA_PATH=./sp_metadata cargo run -p example-idp
 //   # insecure local interop override:
 //   ALLOW_UNSIGNED_AUTHN_REQUESTS=true cargo run -p example-idp
 
@@ -174,6 +180,13 @@ struct AppState {
     sessions: Arc<Mutex<HashMap<String, Session>>>,
 }
 
+struct Pkcs11SigningConfig {
+    module: String,
+    pin: String,
+    label: String,
+    cert_path: String,
+}
+
 // ── Handlers ──────────────────────────────────────────────────────────────
 
 /// GET / - Landing page
@@ -277,8 +290,17 @@ async fn idp_metadata(state: web::Data<AppState>) -> HttpResponse {
         }
     };
 
+    let signature_method_uri = match state.signing_ctx.signer.signature_method_uri() {
+        Ok(uri) => uri,
+        Err(e) => {
+            return HttpResponse::InternalServerError()
+                .body(format!("Unsupported signing algorithm: {e}"))
+        }
+    };
+
     // Sign the metadata
-    let sig = gamlastan_actix::idp::signature_template(&metadata_id, cert_b64);
+    let sig =
+        gamlastan_actix::idp::signature_template(&metadata_id, cert_b64, signature_method_uri);
     let xml_with_sig = match gamlastan_actix::idp::insert_signature_after_element(
         &xml,
         "md:EntityDescriptor",
@@ -1005,6 +1027,85 @@ fn extract_cert_b64(pem_data: &[u8]) -> String {
     b64
 }
 
+fn pkcs11_signing_config() -> Option<Pkcs11SigningConfig> {
+    Some(Pkcs11SigningConfig {
+        module: std::env::var("GAMLASTAN_PKCS11_MODULE").ok()?,
+        pin: std::env::var("GAMLASTAN_PKCS11_PIN").ok()?,
+        label: std::env::var("GAMLASTAN_PKCS11_LABEL").ok()?,
+        cert_path: std::env::var("GAMLASTAN_PKCS11_CERT").ok()?,
+    })
+}
+
+fn load_signing_context(cert_dir: &str) -> io::Result<Arc<IdpSigningContext>> {
+    if let Some(pkcs11) = pkcs11_signing_config() {
+        info!(
+            "Using HSM-backed SAML signing key with label {} via {}",
+            pkcs11.label, pkcs11.module
+        );
+
+        let signing_cert_pem = fs::read(&pkcs11.cert_path).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "Failed to read HSM signing cert from {}: {e}",
+                    pkcs11.cert_path
+                ),
+            )
+        })?;
+        let cert_b64 = extract_cert_b64(&signing_cert_pem);
+
+        let provider = gamlastan::crypto::kryptering::pkcs11::Pkcs11Provider::new(
+            std::path::Path::new(&pkcs11.module),
+        )
+        .map_err(|e| io::Error::other(format!("Failed to load PKCS#11 module: {e}")))?;
+        let session = provider
+            .open_session(&pkcs11.pin)
+            .map_err(|e| io::Error::other(format!("Failed to open PKCS#11 session: {e}")))?;
+        let signer = gamlastan::crypto::kryptering::pkcs11::Pkcs11Signer::new(
+            &session,
+            &pkcs11.label,
+            gamlastan::crypto::kryptering::SignatureAlgorithm::RsaPkcs1v15(
+                gamlastan::crypto::kryptering::HashAlgorithm::Sha256,
+            ),
+        )
+        .map_err(|e| io::Error::other(format!("Failed to bind PKCS#11 signer: {e}")))?;
+
+        return Ok(Arc::new(IdpSigningContext::from_hsm(
+            Arc::new(signer),
+            cert_b64,
+        )));
+    }
+
+    info!("Using file-based SAML signing key from {cert_dir}/idp-key.pem");
+    let signing_key_pem = fs::read(format!("{cert_dir}/idp-key.pem"))
+        .expect("Failed to read IdP signing key (idp-key.pem)");
+    let signing_cert_pem = fs::read(format!("{cert_dir}/idp-cert.pem"))
+        .expect("Failed to read IdP signing cert (idp-cert.pem)");
+
+    let cert_b64 = extract_cert_b64(&signing_cert_pem);
+
+    let mut signing_key = gamlastan::crypto::keys::loader::load_pem_auto(&signing_key_pem, None)
+        .expect("Failed to load IdP signing key");
+    signing_key.usage = gamlastan::crypto::KeyUsage::Sign;
+
+    // Add X.509 certificate chain
+    let cert_der = {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .decode(&cert_b64)
+            .expect("Failed to decode signing cert base64")
+    };
+    signing_key.x509_chain = vec![cert_der];
+
+    let mut keys_manager = gamlastan::crypto::KeysManager::new();
+    keys_manager.add_key(signing_key);
+
+    Ok(Arc::new(IdpSigningContext::new(
+        SamlSigner::new(keys_manager),
+        cert_b64,
+    )))
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────
 
 #[actix_web::main]
@@ -1034,35 +1135,8 @@ async fn main() -> io::Result<()> {
     info!("Loading certificates from {cert_dir}");
     info!("Loading trusted SP metadata from {sp_metadata_path}");
 
-    // Load SAML signing key
-    let signing_key_pem = fs::read(format!("{cert_dir}/idp-key.pem"))
-        .expect("Failed to read IdP signing key (idp-key.pem)");
-    let signing_cert_pem = fs::read(format!("{cert_dir}/idp-cert.pem"))
-        .expect("Failed to read IdP signing cert (idp-cert.pem)");
-
-    let cert_b64 = extract_cert_b64(&signing_cert_pem);
-
-    let mut signing_key = gamlastan::crypto::keys::loader::load_pem_auto(&signing_key_pem, None)
-        .expect("Failed to load IdP signing key");
-    signing_key.usage = gamlastan::crypto::KeyUsage::Sign;
-
-    // Add X.509 certificate chain
-    let cert_der = {
-        use base64::Engine;
-        base64::engine::general_purpose::STANDARD
-            .decode(&cert_b64)
-            .expect("Failed to decode signing cert base64")
-    };
-    signing_key.x509_chain = vec![cert_der];
-
-    let mut keys_manager = gamlastan::crypto::KeysManager::new();
-    keys_manager.add_key(signing_key);
-    let signer = SamlSigner::new(keys_manager);
-
-    let signing_ctx = Arc::new(IdpSigningContext {
-        signer,
-        cert_b64: cert_b64.clone(),
-    });
+    let signing_ctx = load_signing_context(&cert_dir)?;
+    let cert_b64 = signing_ctx.cert_b64.clone();
 
     let trusted_sps = load_trusted_sps(&sp_metadata_path, allow_unsigned_authn_requests)?;
     // The IdP advertises that it wants signed AuthnRequests unless the local
@@ -1233,10 +1307,10 @@ mod tests {
             ),
             trusted_sps,
             want_authn_requests_signed: require_signed_authn_requests,
-            signing_ctx: Arc::new(IdpSigningContext {
-                signer: SamlSigner::new(KeysManager::new()),
-                cert_b64: String::new(),
-            }),
+            signing_ctx: Arc::new(IdpSigningContext::new(
+                SamlSigner::new(KeysManager::new()),
+                String::new(),
+            )),
             users: test_users(),
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),

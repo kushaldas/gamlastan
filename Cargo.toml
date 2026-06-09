@@ -9,7 +9,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 repository = "https://github.com/kushaldas/gamlastan"
 readme = "README.md"
@@ -18,9 +18,9 @@ rust-version = "1.75"
 
 [workspace.dependencies]
 # Internal crates
-gamlastan = { version = "0.2.0", path = "crates/gamlastan" }
-gamlastan-actix = { version = "0.2.0", path = "crates/gamlastan-actix" }
-gamlastan-mdq = { version = "0.2.0", path = "crates/gamlastan-mdq" }
+gamlastan = { version = "0.2.1", path = "crates/gamlastan" }
+gamlastan-actix = { version = "0.2.1", path = "crates/gamlastan-actix" }
+gamlastan-mdq = { version = "0.2.1", path = "crates/gamlastan-mdq" }
 
 # XML parsing
 uppsala = "0.4.0"
@@ -33,6 +33,12 @@ bergshamra-enc = "0.5.1"
 bergshamra-c14n = "0.5.1"
 bergshamra-crypto = "0.5.1"
 bergshamra-keys = "0.5.1"
+
+# HSM / PKCS#11 signing backend (the low-level crypto provider beneath
+# bergshamra). This direct dependency exists so gamlastan can re-export the
+# shared `kryptering::Signer` trait/types without version drift from the
+# bergshamra stack.
+kryptering = "0.3"
 
 # Date/time
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }

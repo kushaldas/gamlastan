@@ -9,6 +9,13 @@
 //   3. Navigate to https://localhost:8443 to access the validator
 //   4. Configure the validator with the SP metadata URL
 //   5. Run the conformance tests
+//
+// Optional HSM-backed SP signing key:
+//   GAMLASTAN_PKCS11_MODULE=/usr/lib/softhsm/libsofthsm2.so \
+//   GAMLASTAN_PKCS11_PIN=1234 \
+//   GAMLASTAN_PKCS11_LABEL=saml-signing-key \
+//   GAMLASTAN_PKCS11_CERT=/path/to/sp-cert.pem \
+//   cargo run -p spid-sp-test
 
 use std::fs;
 use std::io;
@@ -84,6 +91,13 @@ struct AppState {
     replay_cache: Arc<InMemoryReplayCache>,
     /// Security configuration for response validation
     security_config: SecurityConfig,
+}
+
+struct Pkcs11SigningConfig {
+    module: String,
+    pin: String,
+    label: String,
+    cert_path: String,
 }
 
 fn register_replay_ids(
@@ -289,24 +303,21 @@ fn sign_metadata(
     metadata_xml: &str,
     metadata_id: &str,
 ) -> Result<String, String> {
-    // Build the signature template
-    let sig_template = format!(
-        r##"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#{id}"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{cert}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></ds:Signature>"##,
-        id = metadata_id,
-        cert = state.cert_b64,
+    let signature_method_uri = state
+        .signer
+        .signature_method_uri()
+        .map_err(|e| format!("Unsupported signing algorithm: {e}"))?;
+    let sig_template = gamlastan_actix::idp::signature_template(
+        metadata_id,
+        &state.cert_b64,
+        signature_method_uri,
     );
-
-    // Insert signature template after the opening EntityDescriptor tag
-    let insert_pos = metadata_xml
-        .find('>')
-        .ok_or_else(|| "Invalid metadata XML: no closing >".to_string())?;
-
-    let xml_with_sig = format!(
-        "{}{}{}",
-        &metadata_xml[..=insert_pos],
-        sig_template,
-        &metadata_xml[insert_pos + 1..]
-    );
+    let xml_with_sig = gamlastan_actix::idp::insert_signature_after_element(
+        metadata_xml,
+        "md:EntityDescriptor",
+        &sig_template,
+    )
+    .map_err(|e| format!("Failed to insert signature template: {e}"))?;
 
     // Sign using bergshamra
     state
@@ -1218,6 +1229,79 @@ fn uuid_v4() -> String {
     )
 }
 
+fn pkcs11_signing_config() -> Option<Pkcs11SigningConfig> {
+    Some(Pkcs11SigningConfig {
+        module: std::env::var("GAMLASTAN_PKCS11_MODULE").ok()?,
+        pin: std::env::var("GAMLASTAN_PKCS11_PIN").ok()?,
+        label: std::env::var("GAMLASTAN_PKCS11_LABEL").ok()?,
+        cert_path: std::env::var("GAMLASTAN_PKCS11_CERT").ok()?,
+    })
+}
+
+fn load_sp_signer(cert_dir: &str) -> io::Result<(Arc<SamlSigner>, String)> {
+    if let Some(pkcs11) = pkcs11_signing_config() {
+        info!(
+            "Using HSM-backed SP signing key with label {} via {}",
+            pkcs11.label, pkcs11.module
+        );
+
+        let cert_pem = fs::read(&pkcs11.cert_path).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "Failed to read HSM signing cert from {}: {e}",
+                    pkcs11.cert_path
+                ),
+            )
+        })?;
+        let cert_b64 = extract_cert_b64(&cert_pem);
+
+        let provider = gamlastan::crypto::kryptering::pkcs11::Pkcs11Provider::new(
+            std::path::Path::new(&pkcs11.module),
+        )
+        .map_err(|e| io::Error::other(format!("Failed to load PKCS#11 module: {e}")))?;
+        let session = provider
+            .open_session(&pkcs11.pin)
+            .map_err(|e| io::Error::other(format!("Failed to open PKCS#11 session: {e}")))?;
+        let signer = gamlastan::crypto::kryptering::pkcs11::Pkcs11Signer::new(
+            &session,
+            &pkcs11.label,
+            gamlastan::crypto::kryptering::SignatureAlgorithm::RsaPkcs1v15(
+                gamlastan::crypto::kryptering::HashAlgorithm::Sha256,
+            ),
+        )
+        .map_err(|e| io::Error::other(format!("Failed to bind PKCS#11 signer: {e}")))?;
+
+        return Ok((
+            Arc::new(SamlSigner::with_hsm_signer(
+                gamlastan::crypto::KeysManager::new(),
+                Arc::new(signer),
+            )),
+            cert_b64,
+        ));
+    }
+
+    info!("Using file-based SP signing key from {cert_dir}/sp-key.pem");
+    let sp_key_pem =
+        fs::read(format!("{cert_dir}/sp-key.pem")).expect("Failed to read SP private key");
+    let sp_cert_pem =
+        fs::read(format!("{cert_dir}/sp-cert.pem")).expect("Failed to read SP certificate");
+
+    let cert_b64 = extract_cert_b64(&sp_cert_pem);
+
+    let mut signing_key = gamlastan::crypto::keys::loader::load_pem_auto(&sp_key_pem, None)
+        .expect("Failed to load SP private key");
+    signing_key.usage = gamlastan::crypto::KeyUsage::Sign;
+
+    let cert_der = pem_to_der(&sp_cert_pem);
+    signing_key.x509_chain = vec![cert_der];
+
+    let mut keys_manager = gamlastan::crypto::KeysManager::new();
+    keys_manager.add_key(signing_key);
+
+    Ok((Arc::new(SamlSigner::new(keys_manager)), cert_b64))
+}
+
 // ── Main ───────────────────────────────────────────────────────────────────
 
 #[actix_web::main]
@@ -1250,28 +1334,7 @@ async fn main() -> io::Result<()> {
 
     // Load SP signing key and certificate
     let cert_dir = std::env::var("CERT_DIR").unwrap_or_else(|_| "spid-sp-test/certs".to_string());
-
-    let sp_key_pem =
-        fs::read(format!("{cert_dir}/sp-key.pem")).expect("Failed to read SP private key");
-    let sp_cert_pem =
-        fs::read(format!("{cert_dir}/sp-cert.pem")).expect("Failed to read SP certificate");
-
-    // Extract base64-encoded certificate for KeyInfo
-    let cert_b64 = extract_cert_b64(&sp_cert_pem);
-
-    // Build keys manager for signing
-    let mut signing_key = gamlastan::crypto::keys::loader::load_pem_auto(&sp_key_pem, None)
-        .expect("Failed to load SP private key");
-    signing_key.usage = gamlastan::crypto::KeyUsage::Sign;
-
-    // Add the X.509 certificate chain to the key
-    let cert_der = pem_to_der(&sp_cert_pem);
-    signing_key.x509_chain = vec![cert_der];
-
-    let mut keys_manager = gamlastan::crypto::KeysManager::new();
-    keys_manager.add_key(signing_key);
-
-    let signer = Arc::new(SamlSigner::new(keys_manager));
+    let (signer, cert_b64) = load_sp_signer(&cert_dir)?;
 
     // Load the IdP certificate for signature verification
     let idp_cert_pem = fs::read(format!("{cert_dir}/idp-cert.pem"))

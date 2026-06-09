@@ -39,6 +39,64 @@ pub struct IdpSigningContext {
     pub cert_b64: String,
 }
 
+impl IdpSigningContext {
+    /// Build a signing context from an already-constructed [`SamlSigner`].
+    ///
+    /// `cert_b64` is the base64 DER of the signing certificate — the same value
+    /// that populates `<ds:X509Certificate>` in signed messages and metadata.
+    pub fn new(signer: SamlSigner, cert_b64: impl Into<String>) -> Self {
+        Self {
+            signer,
+            cert_b64: cert_b64.into(),
+        }
+    }
+
+    /// Build an HSM / PKCS#11-backed signing context.
+    ///
+    /// `signer` is any [`kryptering::Signer`] — typically a
+    /// `kryptering::pkcs11::Pkcs11Signer` bound to a private key on a token. The
+    /// private key never leaves the token; signing happens on the HSM.
+    ///
+    /// The XML `SignatureMethod` placed into response/assertion/metadata
+    /// templates is derived from the signer's configured algorithm.
+    ///
+    /// The IdP handlers already embed `cert_b64` into the `<ds:KeyInfo>` of the
+    /// signature template (see [`signature_template`]), which is exactly what
+    /// the HSM signing path needs — bergshamra-dsig does not auto-populate
+    /// `<ds:KeyInfo>` when an HSM signer is in use. No `KeysManager` plumbing is
+    /// required: an empty one is created internally.
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use std::path::Path;
+    /// use gamlastan_actix::IdpSigningContext;
+    /// use gamlastan::crypto::kryptering::pkcs11::{Pkcs11Provider, Pkcs11Signer};
+    /// use gamlastan::crypto::kryptering::{HashAlgorithm, SignatureAlgorithm};
+    ///
+    /// # let cert_b64 = String::new(); // base64 DER of the signing certificate
+    /// let provider = Pkcs11Provider::new(Path::new("/usr/lib/softhsm/libsofthsm2.so"))?;
+    /// let session = provider.open_session("1234")?;
+    /// let pkcs11_signer = Pkcs11Signer::new(
+    ///     &session,
+    ///     "saml-signing-key",
+    ///     SignatureAlgorithm::RsaPkcs1v15(HashAlgorithm::Sha256),
+    /// )?;
+    ///
+    /// let signing_ctx = IdpSigningContext::from_hsm(Arc::new(pkcs11_signer), cert_b64);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn from_hsm(
+        signer: Arc<dyn gamlastan::crypto::kryptering::Signer>,
+        cert_b64: impl Into<String>,
+    ) -> Self {
+        let keys_manager = gamlastan::crypto::KeysManager::new();
+        Self {
+            signer: SamlSigner::with_hsm_signer(keys_manager, signer),
+            cert_b64: cert_b64.into(),
+        }
+    }
+}
+
 /// Callback type for IdP authentication.
 ///
 /// When the IdP receives an AuthnRequest, the application must authenticate the user.
@@ -93,12 +151,26 @@ pub fn configure_idp(cfg: &mut web::ServiceConfig) {
 ///
 /// The template contains empty DigestValue and SignatureValue placeholders
 /// that are filled in by `signer.sign_enveloped()`.
-pub fn signature_template(reference_id: &str, cert_b64: &str) -> String {
+pub fn signature_template(
+    reference_id: &str,
+    cert_b64: &str,
+    signature_method_uri: &str,
+) -> String {
     format!(
-        r##"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#{id}"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{cert}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></ds:Signature>"##,
+        r##"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="{sig_alg}"/><ds:Reference URI="#{id}"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{cert}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></ds:Signature>"##,
         id = reference_id,
         cert = cert_b64,
+        sig_alg = signature_method_uri,
     )
+}
+
+fn metadata_signing_cert_b64<'a>(
+    config: &'a IdpConfig,
+    signing_ctx: Option<&'a IdpSigningContext>,
+) -> Option<&'a str> {
+    signing_ctx
+        .map(|ctx| ctx.cert_b64.as_str())
+        .or(config.signing_cert_b64.as_deref())
 }
 
 /// Insert a signature template after the first occurrence of a given element's opening tag.
@@ -148,7 +220,10 @@ pub fn sign_response_xml(
     // Sign Assertion first (inner-to-outer order)
     if sign_assertions {
         if let Some(assertion_id) = assertion_id {
-            let sig = signature_template(assertion_id, &signing_ctx.cert_b64);
+            let signature_method_uri = signing_ctx.signer.signature_method_uri().map_err(|e| {
+                SamlActixError::Internal(format!("unsupported signing algorithm: {e}"))
+            })?;
+            let sig = signature_template(assertion_id, &signing_ctx.cert_b64, signature_method_uri);
             xml = insert_signature_after_element(&xml, "saml:Assertion", &sig)?;
             xml = signing_ctx
                 .signer
@@ -159,7 +234,11 @@ pub fn sign_response_xml(
 
     // Then sign Response (outer)
     if sign_responses {
-        let sig = signature_template(response_id, &signing_ctx.cert_b64);
+        let signature_method_uri = signing_ctx
+            .signer
+            .signature_method_uri()
+            .map_err(|e| SamlActixError::Internal(format!("unsupported signing algorithm: {e}")))?;
+        let sig = signature_template(response_id, &signing_ctx.cert_b64, signature_method_uri);
         xml = insert_signature_after_element(&xml, "samlp:Response", &sig)?;
         xml = signing_ctx
             .signer
@@ -449,8 +528,14 @@ async fn idp_metadata(
     use gamlastan::metadata::types::key_descriptor::KeyDescriptor;
     use gamlastan::metadata::types::role_descriptor::{RoleDescriptorBase, SsoDescriptorBase};
 
-    // Build key descriptors if signing cert is available
-    let key_descriptors = if let Some(cert_b64) = &config.signing_cert_b64 {
+    // Prefer the active signing context's certificate so metadata stays in sync
+    // with the key that actually signs responses and metadata.
+    let metadata_cert_b64 = metadata_signing_cert_b64(
+        config.get_ref(),
+        signing_ctx.as_ref().map(|ctx| ctx.get_ref().as_ref()),
+    );
+
+    let key_descriptors = if let Some(cert_b64) = metadata_cert_b64 {
         let key_info_xml = gamlastan::crypto::build_x509_key_info(&[cert_b64]);
         vec![KeyDescriptor::signing(key_info_xml)]
     } else {
@@ -528,7 +613,11 @@ async fn idp_metadata(
 
     // Sign metadata if signing context is available
     let final_xml = if let Some(ctx) = &signing_ctx {
-        let sig = signature_template(&metadata_id, &ctx.cert_b64);
+        let signature_method_uri = ctx
+            .signer
+            .signature_method_uri()
+            .map_err(|e| SamlActixError::Internal(format!("unsupported signing algorithm: {e}")))?;
+        let sig = signature_template(&metadata_id, &ctx.cert_b64, signature_method_uri);
         let xml_with_sig = insert_signature_after_element(&xml, "md:EntityDescriptor", &sig)?;
         ctx.signer
             .sign_enveloped(&xml_with_sig)
@@ -563,7 +652,11 @@ mod tests {
 
     #[test]
     fn test_signature_template() {
-        let sig = signature_template("_abc123", "MIID...");
+        let sig = signature_template(
+            "_abc123",
+            "MIID...",
+            "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
+        );
         assert!(sig.contains("URI=\"#_abc123\""));
         assert!(sig.contains("<ds:X509Certificate>MIID...</ds:X509Certificate>"));
         assert!(sig.contains("rsa-sha256"));
@@ -576,5 +669,31 @@ mod tests {
         let sig = "<SIGNATURE/>";
         let result = insert_signature_after_element(xml, "samlp:Response", sig).unwrap();
         assert!(result.contains(r#"ID="_resp1"><SIGNATURE/><saml:Assertion"#));
+    }
+
+    #[test]
+    fn test_metadata_signing_cert_prefers_signing_context() {
+        let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
+            .with_signing_cert("CONFIG_CERT");
+        let signing_ctx = IdpSigningContext::new(
+            SamlSigner::new(gamlastan::crypto::KeysManager::new()),
+            "CTX_CERT",
+        );
+
+        assert_eq!(
+            metadata_signing_cert_b64(&config, Some(&signing_ctx)),
+            Some("CTX_CERT")
+        );
+    }
+
+    #[test]
+    fn test_metadata_signing_cert_falls_back_to_config() {
+        let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
+            .with_signing_cert("CONFIG_CERT");
+
+        assert_eq!(
+            metadata_signing_cert_b64(&config, None),
+            Some("CONFIG_CERT")
+        );
     }
 }
