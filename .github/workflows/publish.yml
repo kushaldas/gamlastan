@@ -1,0 +1,128 @@
+name: Publish
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Run the same gate CI runs on main, against the exact commit a
+  # tag points at, before any publish step touches the registry.
+  test:
+    name: Release-gate tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-publish-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace --verbose
+
+      - name: Tests
+        run: cargo test --workspace --verbose
+
+  # Publish the library crates to crates.io via OIDC trusted publishing.
+  # No long-lived CARGO_REGISTRY_TOKEN secret is needed -- `crates-io-auth-action`
+  # exchanges the GitHub OIDC token for a short-lived crates.io token gated by
+  # the trusted-publishing config on https://crates.io/me (configure it for
+  # each of: gamlastan, gamlastan-mdq, gamlastan-actix).
+  #
+  # The three crates share one workspace version, so a single `vX.Y.Z` tag
+  # releases all of them. They are published in dependency order: gamlastan
+  # first, then its dependents. `cargo publish` (>= 1.66) waits for each
+  # published version to become downloadable before returning, so the
+  # dependents resolve the freshly published gamlastan.
+  publish-crates:
+    name: Publish to crates.io
+    needs: test
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1
+
+      # On a real tag push, refuse to publish unless the tag matches the shared
+      # workspace version (read from [workspace.package] in the root Cargo.toml).
+      # Skipped for manual dispatch (no tag context).
+      - name: Verify tag matches workspace version
+        if: github.event_name == 'push'
+        run: |
+          version=$(grep -m 1 '^version' Cargo.toml | sed -E 's/version *= *"(.+)"/\1/')
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match workspace version v${version}"
+            exit 1
+          fi
+
+      # gamlastan has no path-dep prerequisites on crates.io, so it can be
+      # dry-run before anything is published. The dependents cannot (they need
+      # the new gamlastan on the index first), so they are only verified by the
+      # real publish on a tag push.
+      - name: Verify gamlastan packages cleanly
+        run: cargo publish -p gamlastan --dry-run
+
+      - name: Publish in dependency order
+        if: github.event_name == 'push'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          set -euo pipefail
+          cargo publish -p gamlastan
+          cargo publish -p gamlastan-mdq
+          cargo publish -p gamlastan-actix
+
+  # GitHub Release with auto-generated notes from commit history.
+  github-release:
+    name: GitHub release
+    needs: publish-crates
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        with:
+          generate_release_notes: true
