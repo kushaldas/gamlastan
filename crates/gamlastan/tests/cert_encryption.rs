@@ -21,6 +21,7 @@ use gamlastan::crypto::keys::bergshamra_keys::KeysManager;
 use gamlastan::crypto::keys::loader;
 use gamlastan::profiles::sso::idp::{
     add_encrypted_advice, assertion_to_self_contained_xml, encrypt_assertion_to_cert,
+    encrypt_response_assertions_to_cert,
 };
 use gamlastan::xml::deserialize::SamlDeserialize;
 use gamlastan::xml::serialize::SamlSerialize;
@@ -177,4 +178,41 @@ fn test_encrypted_advice_roundtrip() {
     let inner = parse_assertion_xml(&plaintext);
     assert_eq!(inner.id, advice_assertion.id);
     assert_eq!(inner.attribute_statements[0].attributes.len(), 2);
+}
+
+#[test]
+fn test_encrypt_response_assertions_drains_cleartext_and_preserves_existing() {
+    use gamlastan::core::assertion::types::EncryptedAssertion;
+    use gamlastan::core::protocol::response::{Response, ResponseBase};
+    use gamlastan::core::protocol::status::Status;
+
+    let preexisting = EncryptedAssertion {
+        raw: b"<saml:EncryptedAssertion>pre</saml:EncryptedAssertion>".to_vec(),
+    };
+    let response = Response {
+        base: ResponseBase {
+            id: SamlId::generate().as_str().to_string(),
+            version: SamlVersion::V2_0,
+            issue_instant: Utc::now(),
+            destination: None,
+            consent: None,
+            issuer: Some(Issuer::entity("https://idp.example.com")),
+            has_signature: false,
+            in_response_to: None,
+            status: Status::success(),
+        },
+        assertions: vec![sample_assertion()],
+        encrypted_assertions: vec![preexisting.clone()],
+    };
+
+    let out = encrypt_response_assertions_to_cert(response, &cert_der(), None).unwrap();
+    // Cleartext is drained; the pre-existing encrypted assertion is kept
+    // first and the freshly encrypted one is appended after it.
+    assert!(out.assertions.is_empty());
+    assert_eq!(out.encrypted_assertions.len(), 2);
+    assert_eq!(out.encrypted_assertions[0].raw, preexisting.raw);
+
+    // Re-invoking must not accumulate further (nothing cleartext remains).
+    let again = encrypt_response_assertions_to_cert(out, &cert_der(), None).unwrap();
+    assert_eq!(again.encrypted_assertions.len(), 2);
 }

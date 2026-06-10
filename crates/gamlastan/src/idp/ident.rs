@@ -293,8 +293,18 @@ impl<S: IdentityStore> IdentDb<S> {
             input.extend_from_slice(sp_name_qualifier.unwrap_or("").as_bytes());
             let digest = sha256(&input).expect("SHA-256 is always available");
             let id = to_hex(&digest);
-            if self.store.get(&Self::reverse_key(&id)).is_none() {
-                return id;
+            // Build the final stored value (email format appends `@domain`)
+            // *before* the collision check, otherwise the check tests a key
+            // that is never stored and a rare collision would silently
+            // overwrite the reverse mapping.
+            let value = if format == constants::NAMEID_EMAIL {
+                let domain = self.domain.as_deref().unwrap_or("idp.example.org");
+                format!("{id}@{domain}")
+            } else {
+                id
+            };
+            if self.store.get(&Self::reverse_key(&value)).is_none() {
+                return value;
             }
         }
     }
@@ -318,11 +328,9 @@ impl<S: IdentityStore> IdentDb<S> {
             }
         }
 
-        let mut value = self.create_id(format, name_qualifier, sp_name_qualifier);
-        if format == constants::NAMEID_EMAIL {
-            let domain = self.domain.as_deref().unwrap_or("idp.example.org");
-            value = format!("{value}@{domain}");
-        }
+        // `create_id` already applies the email-format `@domain` suffix and
+        // guarantees the value is free in the reverse index.
+        let value = self.create_id(format, name_qualifier, sp_name_qualifier);
 
         let name_id = NameId {
             value,
@@ -726,5 +734,16 @@ mod tests {
         let db = IdentDb::in_memory(IDP).with_domain("example.org");
         let nid = db.get_nameid("alice", constants::NAMEID_EMAIL, Some(SP), Some(IDP));
         assert!(nid.value.ends_with("@example.org"));
+    }
+
+    #[test]
+    fn test_email_format_reverse_mapping_uses_full_value() {
+        // The collision check and the reverse index must both key on the
+        // final `local-part@domain` value, so the issued email NameID resolves
+        // back to its local principal.
+        let db = IdentDb::in_memory(IDP).with_domain("example.org");
+        let nid = db.get_nameid("alice", constants::NAMEID_EMAIL, Some(SP), Some(IDP));
+        assert!(nid.value.contains('@'));
+        assert_eq!(db.find_local_id(&nid).as_deref(), Some("alice"));
     }
 }

@@ -373,23 +373,28 @@ pub fn encrypt_assertion_to_cert(
     })
 }
 
-/// Replace every cleartext assertion in `response` with an
-/// `<saml:EncryptedAssertion>` encrypted toward the request-supplied cert.
+/// Encrypt every cleartext assertion in `response` toward the
+/// request-supplied cert, moving each into `response.encrypted_assertions`.
+///
+/// The cleartext `assertions` vector is drained, so no assertion is encrypted
+/// twice and re-invoking this on the result is a no-op. Assertions already
+/// present in `encrypted_assertions` are preserved as-is (not re-encrypted and
+/// not dropped); the freshly encrypted assertions are appended after them.
 pub fn encrypt_response_assertions_to_cert(
     mut response: Response,
     recipient_cert_der: &[u8],
     options: Option<&CertEncryptionOptions>,
 ) -> Result<Response, ProfileError> {
     let assertions = std::mem::take(&mut response.assertions);
+    let mut newly_encrypted = Vec::with_capacity(assertions.len());
     for assertion in &assertions {
-        response
-            .encrypted_assertions
-            .push(encrypt_assertion_to_cert(
-                assertion,
-                recipient_cert_der,
-                options,
-            )?);
+        newly_encrypted.push(encrypt_assertion_to_cert(
+            assertion,
+            recipient_cert_der,
+            options,
+        )?);
     }
+    response.encrypted_assertions.extend(newly_encrypted);
     Ok(response)
 }
 
