@@ -87,10 +87,8 @@ fn sample_assertion() -> Assertion {
 }
 
 fn parse_assertion_xml(xml: &str) -> Assertion {
-    let doc = Box::leak(Box::new(
-        gamlastan::xml::uppsala::parse(Box::leak(xml.to_string().into_boxed_str()))
-            .expect("parse decrypted assertion"),
-    ));
+    let xml_owned = xml.to_string();
+    let doc = gamlastan::xml::uppsala::parse(&xml_owned).expect("parse decrypted assertion");
     let root = doc.document_element().expect("root element");
     // Decryption leaves the <saml:EncryptedAssertion> wrapper in place;
     // descend to the inner <saml:Assertion> when needed.
@@ -107,7 +105,7 @@ fn parse_assertion_xml(xml: &str) -> Assertion {
             })
             .expect("Assertion element inside wrapper")
     };
-    AssertionRef::from_xml(doc, assertion_node)
+    AssertionRef::from_xml(&doc, assertion_node)
         .expect("deserialize assertion")
         .to_owned()
 }

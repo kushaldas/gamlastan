@@ -5,6 +5,11 @@ library implements the full SAML 2.0 specification with errata corrections and
 passes the Italian SPID (Sistema Pubblico di Identita Digitale) conformance
 test suite (263/263 tests).
 
+The plan is to become Rust equivalent of
+[pysaml2](https://https://github.com/IdentityPython/pysaml2) project. We will
+not be 100% compatible, but will try to close the gap. We thank the amazing
+maintainers of the `pysaml2` project for maintaining the stack for the community.
+
 ## Workspace Structure
 
 | Crate | Description |

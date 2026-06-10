@@ -47,6 +47,3 @@ flate2 = { workspace = true }
 rand = "0.8"
 regex = "1.12.4"
 
-[dev-dependencies]
-base64 = { workspace = true }
-
