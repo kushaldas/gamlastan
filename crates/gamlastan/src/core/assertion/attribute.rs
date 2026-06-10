@@ -1,5 +1,7 @@
 // SAML 2.0 Attribute types
 
+use super::name_id::{NameId, NameIdRef};
+
 /// Borrowed AttributeValue.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AttributeValueRef<'a> {
@@ -13,6 +15,9 @@ pub enum AttributeValueRef<'a> {
     DateTime(&'a str),
     /// Base64-encoded binary data.
     Base64(&'a [u8]),
+    /// A `<saml:NameID>` value (eduPersonTargetedID and other
+    /// NameID-valued attributes).
+    NameId(NameIdRef<'a>),
     /// Raw XML content.
     Xml(&'a [u8]),
     /// Null/nil value (xsi:nil="true").
@@ -28,6 +33,7 @@ impl<'a> AttributeValueRef<'a> {
             AttributeValueRef::Boolean(b) => AttributeValue::Boolean(*b),
             AttributeValueRef::DateTime(s) => AttributeValue::DateTime(s.to_string()),
             AttributeValueRef::Base64(b) => AttributeValue::Base64(b.to_vec()),
+            AttributeValueRef::NameId(n) => AttributeValue::NameId(n.to_owned()),
             AttributeValueRef::Xml(b) => AttributeValue::Xml(b.to_vec()),
             AttributeValueRef::Null => AttributeValue::Null,
         }
@@ -55,6 +61,9 @@ pub enum AttributeValue {
     DateTime(String),
     /// Base64-encoded binary data.
     Base64(Vec<u8>),
+    /// A `<saml:NameID>` value (eduPersonTargetedID and other
+    /// NameID-valued attributes).
+    NameId(NameId),
     /// Raw XML content.
     Xml(Vec<u8>),
     /// Null/nil value.

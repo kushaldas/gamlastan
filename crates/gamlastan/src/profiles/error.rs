@@ -135,6 +135,12 @@ pub enum ProfileError {
     #[error("unsolicited SSO response not allowed by configuration")]
     UnsolicitedNotAllowed,
 
+    #[error("crypto error: {0}")]
+    Crypto(#[from] crate::crypto::error::CryptoError),
+
+    #[error("XML error: {0}")]
+    Xml(#[from] crate::xml::error::XmlError),
+
     #[error("{0}")]
     Other(String),
 }

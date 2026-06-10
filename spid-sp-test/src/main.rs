@@ -1079,6 +1079,9 @@ async fn sp_acs(state: web::Data<AppState>, form: web::Form<AcsForm>) -> HttpRes
                         use base64::Engine;
                         base64::engine::general_purpose::STANDARD.encode(b)
                     }
+                    gamlastan::core::assertion::attribute::AttributeValue::NameId(n) => {
+                        n.value.clone()
+                    }
                     gamlastan::core::assertion::attribute::AttributeValue::Xml(b) => {
                         String::from_utf8_lossy(b).to_string()
                     }
@@ -1520,6 +1523,7 @@ mod tests {
                     one_time_use: false,
                     proxy_restriction: None,
                 }),
+                advice: None,
                 authn_statements: vec![],
                 authz_decision_statements: vec![],
                 attribute_statements: vec![],

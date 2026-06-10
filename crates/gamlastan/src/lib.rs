@@ -13,10 +13,14 @@
 //! - [`bindings`] - Protocol bindings (HTTP Redirect, POST, Artifact, SOAP, PAOS, URI)
 //! - [`security`] - Security validation (assertion validator, replay cache, clock skew)
 //! - [`profiles`] - Profile implementations (Web Browser SSO, SLO, ECP, etc.)
+//! - [`attribute_map`] - Attribute name conversion (wire <-> local) with shipped maps
+//! - [`idp`] - IdP-side infrastructure (release policy, identity DB, AuthnBroker, assertion store)
 
+pub mod attribute_map;
 pub mod bindings;
 pub mod core;
 pub mod crypto;
+pub mod idp;
 pub mod metadata;
 pub mod profiles;
 pub mod security;

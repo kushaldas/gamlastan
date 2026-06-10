@@ -45,4 +45,5 @@ flate2 = { workspace = true }
 
 # RNG (pinned to 0.8 as in gamlastan core)
 rand = "0.8"
+regex = "1.12.4"
 
