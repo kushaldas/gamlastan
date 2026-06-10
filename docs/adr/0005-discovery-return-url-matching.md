@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-06-10
 - **Deciders:** gamlastan maintainers
-- **Spec:** Identity Provider Discovery Service Protocol and Profile (`specs/sstc-saml-idp-discovery.txt` / `specs/sstc-saml-idp-discovery.txt` mirrored source references), section 2.4.1
+- **Spec:** Identity Provider Discovery Service Protocol and Profile (`specs/sstc-saml-idp-discovery.txt`), section 2.4.1
 - **Implementation:** `crates/gamlastan/src/profiles/idp_discovery.rs`
 
 ## Context

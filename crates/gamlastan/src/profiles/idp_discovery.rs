@@ -159,7 +159,7 @@ pub fn parse_discovery_service_request(
             "return" => return_url = Some(value),
             "returnIDParam" => return_id_param = Some(value),
             "policy" => policy = Some(value),
-            "isPassive" => is_passive = value == "true",
+            "isPassive" => is_passive = value == "true" || value == "1",
             _ => {}
         }
     }
@@ -237,11 +237,15 @@ fn collect_discovery_responses(
     for child in doc.children_iter(node) {
         if let Some(elem) = doc.element(child) {
             if elem.matches_name_ns(IDPDISC_NS, "DiscoveryResponse") {
-                if let Some(location) = doc.get_attribute(child, "Location") {
-                    let index = doc
-                        .get_attribute(child, "index")
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(0);
+                // `index` is required on IndexedEndpoint. Skip endpoints with
+                // a missing or unparseable index instead of defaulting to 0,
+                // which could promote malformed metadata to the lowest-index
+                // (default) endpoint.
+                let location = doc.get_attribute(child, "Location");
+                let index = doc
+                    .get_attribute(child, "index")
+                    .and_then(|v| v.parse().ok());
+                if let (Some(location), Some(index)) = (location, index) {
                     let is_default = doc
                         .get_attribute(child, "isDefault")
                         .is_some_and(|v| v == "true" || v == "1");
@@ -456,6 +460,20 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_discovery_service_request_is_passive_numeric() {
+        // xs:boolean also admits the literal "1"
+        let req =
+            parse_discovery_service_request("entityID=https%3A%2F%2Fsp.example.com&isPassive=1")
+                .unwrap();
+        assert!(req.is_passive);
+
+        let req =
+            parse_discovery_service_request("entityID=https%3A%2F%2Fsp.example.com&isPassive=0")
+                .unwrap();
+        assert!(!req.is_passive);
+    }
+
+    #[test]
     fn test_parse_discovery_service_request_missing_entity_id() {
         let result = parse_discovery_service_request("return=https%3A%2F%2Fsp.example.com");
         assert!(matches!(
@@ -486,6 +504,21 @@ mod tests {
     #[test]
     fn test_parse_discovery_response_endpoints_empty() {
         assert!(parse_discovery_response_endpoints("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_parse_discovery_response_endpoints_invalid_index_skipped() {
+        // Endpoints with a missing or unparseable index must not be silently
+        // treated as index 0 (the default-endpoint slot).
+        let extensions = concat!(
+            r#"<idpdisc:DiscoveryResponse Location="https://sp.example.com/no-index"/>"#,
+            r#"<idpdisc:DiscoveryResponse index="bogus" Location="https://sp.example.com/bad-index"/>"#,
+            r#"<idpdisc:DiscoveryResponse index="1" Location="https://sp.example.com/disco"/>"#,
+        );
+        let endpoints = parse_discovery_response_endpoints(extensions).unwrap();
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].location, "https://sp.example.com/disco");
+        assert_eq!(endpoints[0].index, 1);
     }
 
     #[test]
