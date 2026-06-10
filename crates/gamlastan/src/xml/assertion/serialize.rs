@@ -11,7 +11,7 @@ use crate::core::assertion::conditions::{AudienceRestriction, Conditions, ProxyR
 use crate::core::assertion::issuer::Issuer;
 use crate::core::assertion::name_id::{NameId, NameIdOrEncryptedId, NameIdPolicy};
 use crate::core::assertion::subject::{Subject, SubjectConfirmation, SubjectConfirmationData};
-use crate::core::assertion::types::Assertion;
+use crate::core::assertion::types::{Advice, Assertion};
 use crate::core::namespace::{SAML_ASSERTION_NS, XSI_NS, XS_NS};
 
 use crate::xml::error::XmlError;
@@ -435,6 +435,11 @@ impl SamlSerialize for AttributeValue {
                 w.text(encoded);
                 w.end_element("saml:AttributeValue");
             }
+            AttributeValue::NameId(name_id) => {
+                w.start_element("saml:AttributeValue", &[]);
+                name_id.to_xml(w)?;
+                w.end_element("saml:AttributeValue");
+            }
             AttributeValue::Xml(data) => {
                 // Raw XML content injected verbatim
                 let raw_str = std::str::from_utf8(data)
@@ -485,6 +490,34 @@ impl SamlSerialize for AttributeStatement {
     }
 }
 
+// ── Advice ──────────────────────────────────────────────────────────────────
+
+impl SamlSerialize for Advice {
+    fn to_xml(&self, w: &mut XmlWriter) -> Result<(), XmlError> {
+        w.start_element("saml:Advice", &[]);
+        for id_ref in &self.assertion_id_refs {
+            w.start_element("saml:AssertionIDRef", &[]);
+            w.text(id_ref);
+            w.end_element("saml:AssertionIDRef");
+        }
+        for uri_ref in &self.assertion_uri_refs {
+            w.start_element("saml:AssertionURIRef", &[]);
+            w.text(uri_ref);
+            w.end_element("saml:AssertionURIRef");
+        }
+        for assertion in &self.assertions {
+            assertion.to_xml(w)?;
+        }
+        for encrypted in &self.encrypted_assertions {
+            let raw_str = std::str::from_utf8(&encrypted.raw)
+                .map_err(|e| XmlError::SerializationError(e.to_string()))?;
+            w.raw(raw_str);
+        }
+        w.end_element("saml:Advice");
+        Ok(())
+    }
+}
+
 // ── Assertion ───────────────────────────────────────────────────────────────
 
 impl SamlSerialize for Assertion {
@@ -506,6 +539,9 @@ impl SamlSerialize for Assertion {
         }
         if let Some(ref conditions) = self.conditions {
             conditions.to_xml(w)?;
+        }
+        if let Some(ref advice) = self.advice {
+            advice.to_xml(w)?;
         }
         for stmt in &self.authn_statements {
             stmt.to_xml(w)?;

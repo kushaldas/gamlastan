@@ -20,7 +20,7 @@ use crate::core::assertion::name_id::{
 use crate::core::assertion::subject::{
     SubjectConfirmationDataRef, SubjectConfirmationRef, SubjectRef,
 };
-use crate::core::assertion::types::{AssertionRef, EncryptedAssertionRef};
+use crate::core::assertion::types::{AdviceRef, AssertionRef, EncryptedAssertionRef};
 use crate::core::identifiers::SamlVersion;
 use crate::core::namespace::{SAML_ASSERTION_NS, XMLDSIG_NS, XSI_NS};
 
@@ -460,6 +460,21 @@ impl<'a> SamlDeserialize<'a> for AttributeValueRef<'a> {
         // Check if there are child elements (XML content)
         let has_element_children = doc.children_iter(node).any(|c| doc.element(c).is_some());
         if has_element_children {
+            // A single <saml:NameID> child is a NameID-valued attribute
+            // (eduPersonTargetedID, KeyInfoConfirmationData-style values).
+            if let Some(name_id_node) = find_child_element(doc, node, SAML_ASSERTION_NS, "NameID") {
+                let only_child = doc
+                    .children_iter(node)
+                    .filter(|c| doc.element(*c).is_some())
+                    .count()
+                    == 1;
+                if only_child {
+                    return Ok(AttributeValueRef::NameId(NameIdRef::from_xml(
+                        doc,
+                        name_id_node,
+                    )?));
+                }
+            }
             // Contains XML elements - store as raw XML bytes
             let raw = doc.node_source(node).map(|s| s.as_bytes()).unwrap_or(b"");
             return Ok(AttributeValueRef::Xml(raw));
@@ -548,6 +563,11 @@ impl<'a> SamlDeserialize<'a> for AssertionRef<'a> {
             .map(|n| ConditionsRef::from_xml(doc, n))
             .transpose()?;
 
+        // Advice (optional)
+        let advice = find_child_element(doc, node, SAML_ASSERTION_NS, "Advice")
+            .map(|n| AdviceRef::from_xml(doc, n))
+            .transpose()?;
+
         // AuthnStatement elements
         let authn_nodes = find_child_elements(doc, node, SAML_ASSERTION_NS, "AuthnStatement");
         let mut authn_statements = Vec::with_capacity(authn_nodes.len());
@@ -579,9 +599,48 @@ impl<'a> SamlDeserialize<'a> for AssertionRef<'a> {
             has_signature,
             subject,
             conditions,
+            advice,
             authn_statements,
             authz_decision_statements,
             attribute_statements,
+        })
+    }
+}
+
+// ── Advice ──────────────────────────────────────────────────────────────────
+
+impl<'a> SamlDeserialize<'a> for AdviceRef<'a> {
+    fn from_xml(doc: &'a Document<'a>, node: NodeId) -> Result<Self, XmlError> {
+        verify_element(doc, node, SAML_ASSERTION_NS, "Advice")?;
+
+        let assertion_id_refs = find_child_elements(doc, node, SAML_ASSERTION_NS, "AssertionIDRef")
+            .into_iter()
+            .filter_map(|n| doc.element_text(n))
+            .collect();
+        let assertion_uri_refs =
+            find_child_elements(doc, node, SAML_ASSERTION_NS, "AssertionURIRef")
+                .into_iter()
+                .filter_map(|n| doc.element_text(n))
+                .collect();
+
+        let assertion_nodes = find_child_elements(doc, node, SAML_ASSERTION_NS, "Assertion");
+        let mut assertions = Vec::with_capacity(assertion_nodes.len());
+        for a_node in assertion_nodes {
+            assertions.push(AssertionRef::from_xml(doc, a_node)?);
+        }
+
+        let encrypted_nodes =
+            find_child_elements(doc, node, SAML_ASSERTION_NS, "EncryptedAssertion");
+        let mut encrypted_assertions = Vec::with_capacity(encrypted_nodes.len());
+        for e_node in encrypted_nodes {
+            encrypted_assertions.push(EncryptedAssertionRef::from_xml(doc, e_node)?);
+        }
+
+        Ok(AdviceRef {
+            assertion_id_refs,
+            assertion_uri_refs,
+            assertions,
+            encrypted_assertions,
         })
     }
 }

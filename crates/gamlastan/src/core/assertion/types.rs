@@ -30,6 +30,9 @@ pub struct AssertionRef<'a> {
     pub subject: Option<SubjectRef<'a>>,
     /// The assertion conditions.
     pub conditions: Option<ConditionsRef<'a>>,
+    /// Additional information (assertions, references) the relying party
+    /// may ignore (saml:Advice).
+    pub advice: Option<AdviceRef<'a>>,
     /// Authentication statements.
     pub authn_statements: Vec<AuthnStatementRef<'a>>,
     /// Authorization decision statements.
@@ -49,6 +52,7 @@ impl<'a> AssertionRef<'a> {
             has_signature: self.has_signature,
             subject: self.subject.as_ref().map(|s| s.to_owned()),
             conditions: self.conditions.as_ref().map(|c| c.to_owned()),
+            advice: self.advice.as_ref().map(|a| a.to_owned()),
             authn_statements: self.authn_statements.iter().map(|s| s.to_owned()).collect(),
             authz_decision_statements: self
                 .authz_decision_statements
@@ -81,12 +85,67 @@ pub struct Assertion {
     pub subject: Option<Subject>,
     /// The assertion conditions.
     pub conditions: Option<Conditions>,
+    /// Additional information (assertions, references) the relying party
+    /// may ignore (saml:Advice).
+    pub advice: Option<Advice>,
     /// Authentication statements.
     pub authn_statements: Vec<AuthnStatement>,
     /// Authorization decision statements.
     pub authz_decision_statements: Vec<AuthzDecisionStatement>,
     /// Attribute statements.
     pub attribute_statements: Vec<AttributeStatement>,
+}
+
+/// Borrowed Advice (saml:Advice).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AdviceRef<'a> {
+    /// Referenced assertion IDs (saml:AssertionIDRef).
+    pub assertion_id_refs: Vec<&'a str>,
+    /// Referenced assertion URIs (saml:AssertionURIRef).
+    pub assertion_uri_refs: Vec<&'a str>,
+    /// Embedded assertions.
+    pub assertions: Vec<AssertionRef<'a>>,
+    /// Embedded encrypted assertions.
+    pub encrypted_assertions: Vec<EncryptedAssertionRef<'a>>,
+}
+
+impl<'a> AdviceRef<'a> {
+    /// Convert to an owned Advice.
+    pub fn to_owned(&self) -> Advice {
+        Advice {
+            assertion_id_refs: self
+                .assertion_id_refs
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            assertion_uri_refs: self
+                .assertion_uri_refs
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            assertions: self.assertions.iter().map(|a| a.to_owned()).collect(),
+            encrypted_assertions: self
+                .encrypted_assertions
+                .iter()
+                .map(|e| EncryptedAssertion {
+                    raw: e.raw.to_vec(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Owned Advice (saml:Advice).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Advice {
+    /// Referenced assertion IDs (saml:AssertionIDRef).
+    pub assertion_id_refs: Vec<String>,
+    /// Referenced assertion URIs (saml:AssertionURIRef).
+    pub assertion_uri_refs: Vec<String>,
+    /// Embedded assertions.
+    pub assertions: Vec<Assertion>,
+    /// Embedded encrypted assertions.
+    pub encrypted_assertions: Vec<EncryptedAssertion>,
 }
 
 /// An encrypted assertion (opaque encrypted data).
@@ -160,6 +219,7 @@ mod tests {
                 one_time_use: false,
                 proxy_restriction: None,
             }),
+            advice: None,
             authn_statements: vec![AuthnStatementRef {
                 authn_instant: now,
                 session_index: Some("_session_789"),

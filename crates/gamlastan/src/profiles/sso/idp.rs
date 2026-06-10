@@ -15,12 +15,15 @@ use crate::core::assertion::conditions::{AudienceRestriction, Conditions};
 use crate::core::assertion::issuer::Issuer;
 use crate::core::assertion::name_id::{NameId, NameIdOrEncryptedId};
 use crate::core::assertion::subject::{Subject, SubjectConfirmation, SubjectConfirmationData};
-use crate::core::assertion::types::Assertion;
+use crate::core::assertion::types::{Advice, Assertion, EncryptedAssertion};
 use crate::core::constants;
 use crate::core::identifiers::{SamlId, SamlVersion};
 use crate::core::protocol::request::AuthnRequest;
 use crate::core::protocol::response::{Response, ResponseBase};
 use crate::core::protocol::status::Status;
+use crate::crypto::encryptor::{
+    encrypted_data_template_for_cert, CertEncryptionOptions, SamlEncryptor,
+};
 use crate::metadata::types::sp::SpSsoDescriptor;
 
 use crate::profiles::error::ProfileError;
@@ -268,6 +271,7 @@ pub fn create_response(
         has_signature: false,
         subject: Some(subject),
         conditions: Some(conditions),
+        advice: None,
         authn_statements: vec![authn_statement],
         authz_decision_statements: vec![],
         attribute_statements,
@@ -321,6 +325,93 @@ pub fn create_error_response(
         assertions: vec![],
         encrypted_assertions: vec![],
     }
+}
+
+// ── Per-request encryption & encrypted Advice ──────────────────────────────
+
+/// Serialize an assertion as a self-contained (namespace-complete) XML
+/// document, suitable for standalone encryption.
+///
+/// The serializer declares `xmlns:saml` on the `<saml:Assertion>` element
+/// and every nested namespace (xsi/xs/ds) inline, so the produced fragment
+/// decrypts and parses without inheriting declarations from a parent
+/// document (pysaml2 `encrypt_assertion_self_contained`).
+pub fn assertion_to_self_contained_xml(assertion: &Assertion) -> Result<String, ProfileError> {
+    use crate::xml::serialize::SamlSerialize;
+    Ok(assertion.to_xml_string()?)
+}
+
+/// Encrypt one assertion toward a recipient certificate (DER) supplied at
+/// request time — the PEFIM `encrypt_cert_assertion` flow.
+///
+/// The cert typically comes from the AuthnRequest's `pefim:SPCertEnc`
+/// extension (see [`crate::profiles::pefim::first_encryption_cert_der`])
+/// rather than from SP metadata.
+pub fn encrypt_assertion_to_cert(
+    assertion: &Assertion,
+    recipient_cert_der: &[u8],
+    options: Option<&CertEncryptionOptions>,
+) -> Result<EncryptedAssertion, ProfileError> {
+    let default_options = CertEncryptionOptions::default();
+    let options = options.unwrap_or(&default_options);
+
+    // Fresh session key per call; wrapped for the supplied cert's RSA key.
+    let encryptor = SamlEncryptor::for_certificate(recipient_cert_der)?;
+    let template = encrypted_data_template_for_cert(recipient_cert_der, options);
+
+    let plaintext = assertion_to_self_contained_xml(assertion)?;
+    let encrypted = encryptor.encrypt(&template, plaintext.as_bytes())?;
+
+    // Wrap the EncryptedData in the SAML envelope element.
+    let wrapped = format!(
+        "<saml:EncryptedAssertion xmlns:saml=\"{}\">{}</saml:EncryptedAssertion>",
+        crate::core::namespace::SAML_ASSERTION_NS,
+        encrypted
+    );
+    Ok(EncryptedAssertion {
+        raw: wrapped.into_bytes(),
+    })
+}
+
+/// Replace every cleartext assertion in `response` with an
+/// `<saml:EncryptedAssertion>` encrypted toward the request-supplied cert.
+pub fn encrypt_response_assertions_to_cert(
+    mut response: Response,
+    recipient_cert_der: &[u8],
+    options: Option<&CertEncryptionOptions>,
+) -> Result<Response, ProfileError> {
+    let assertions = std::mem::take(&mut response.assertions);
+    for assertion in &assertions {
+        response
+            .encrypted_assertions
+            .push(encrypt_assertion_to_cert(
+                assertion,
+                recipient_cert_der,
+                options,
+            )?);
+    }
+    Ok(response)
+}
+
+/// Attach an encrypted assertion inside the main assertion's `saml:Advice`
+/// (pysaml2 `encrypted_advice_attributes` + `encrypt_cert_advice`).
+///
+/// The advice assertion (typically carrying the attribute statement) is
+/// encrypted toward the supplied certificate and embedded; relying parties
+/// that cannot process it may ignore it, per Core 2.6.1.
+pub fn add_encrypted_advice(
+    assertion: &mut Assertion,
+    advice_assertion: &Assertion,
+    recipient_cert_der: &[u8],
+    options: Option<&CertEncryptionOptions>,
+) -> Result<(), ProfileError> {
+    let encrypted = encrypt_assertion_to_cert(advice_assertion, recipient_cert_der, options)?;
+    assertion
+        .advice
+        .get_or_insert_with(Advice::default)
+        .encrypted_assertions
+        .push(encrypted);
+    Ok(())
 }
 
 /// Create an unsolicited (IdP-initiated) SAML Response.

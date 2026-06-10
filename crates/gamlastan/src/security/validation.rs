@@ -899,6 +899,7 @@ mod tests {
                     one_time_use: false,
                     proxy_restriction: None,
                 }),
+                advice: None,
                 authn_statements: vec![AuthnStatement {
                     authn_instant: now,
                     session_index: Some("_session_001".to_string()),

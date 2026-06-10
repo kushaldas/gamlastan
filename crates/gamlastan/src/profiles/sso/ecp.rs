@@ -22,7 +22,7 @@ use crate::bindings::paos::{
     self, EcpRelayState, PaosRequest, PaosResponse, ECP_NS, PAOS_CONTENT_TYPE, PAOS_NS,
 };
 use crate::bindings::soap::{soap_envelope_wrap, soap_fault};
-use crate::core::namespace::{SAML_ASSERTION_NS, SAML_PROTOCOL_NS};
+use crate::core::namespace::{SAML_ASSERTION_NS, SAML_PROTOCOL_NS, SOAP11_NS};
 use crate::profiles::error::ProfileError;
 
 /// HTTP `Accept` header value an ECP client sends to signal PAOS support.
@@ -334,9 +334,10 @@ fn parse_envelope(soap_xml: &[u8]) -> Result<ParsedEcpEnvelope, ProfileError> {
     let root_elem = doc
         .element(root)
         .ok_or_else(|| ProfileError::Other("invalid root element".to_string()))?;
-    if root_elem.name.local_name != "Envelope" {
+    if !root_elem.matches_name_ns(SOAP11_NS, "Envelope") {
         return Err(ProfileError::Other(format!(
-            "expected SOAP Envelope, got {}",
+            "expected SOAP 1.1 Envelope, got {{{}}}{}",
+            root_elem.name.namespace_uri.as_deref().unwrap_or(""),
             root_elem.name.local_name
         )));
     }
@@ -347,25 +348,31 @@ fn parse_envelope(soap_xml: &[u8]) -> Result<ParsedEcpEnvelope, ProfileError> {
         let Some(elem) = doc.element(child) else {
             continue;
         };
-        match elem.name.local_name.as_ref() {
-            "Header" => parse_header_blocks(&doc, child, &mut parsed)?,
-            "Body" => {
-                for bc in doc.children_iter(child) {
-                    if let Some(bc_elem) = doc.element(bc) {
-                        if bc_elem.name.local_name == "Fault" {
-                            let fault = doc.text_content_deep(bc);
-                            return Err(ProfileError::Other(format!(
-                                "SOAP fault in ECP envelope: {}",
-                                fault.trim()
-                            )));
-                        }
-                        if parsed.body_xml.is_empty() {
-                            parsed.body_xml = doc.node_to_xml(bc);
-                        }
+        if elem.matches_name_ns(SOAP11_NS, "Header") {
+            parse_header_blocks(&doc, child, &mut parsed)?;
+        } else if elem.matches_name_ns(SOAP11_NS, "Body") {
+            // The SOAP binding requires exactly one element in the Body;
+            // accepting extras would allow element smuggling (a decoy first
+            // element with the real SAML message hidden after it).
+            let mut body_children = 0usize;
+            for bc in doc.children_iter(child) {
+                if let Some(bc_elem) = doc.element(bc) {
+                    if bc_elem.matches_name_ns(SOAP11_NS, "Fault") {
+                        let fault = doc.text_content_deep(bc);
+                        return Err(ProfileError::Other(format!(
+                            "SOAP fault in ECP envelope: {}",
+                            fault.trim()
+                        )));
                     }
+                    body_children += 1;
+                    if body_children > 1 {
+                        return Err(ProfileError::Other(
+                            "SOAP Body must contain exactly one element".to_string(),
+                        ));
+                    }
+                    parsed.body_xml = doc.node_to_xml(bc);
                 }
             }
-            _ => {}
         }
     }
 
@@ -620,5 +627,24 @@ mod tests {
     fn test_extract_idp_list() {
         let idps = vec!["https://idp.example.com".to_string()];
         assert_eq!(extract_idp_list(&idps), idps);
+    }
+
+    #[test]
+    fn test_parse_envelope_rejects_non_soap_namespace() {
+        let xml = r#"<Envelope xmlns="urn:not-soap"><Body><samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"/></Body></Envelope>"#;
+        let result = parse_ecp_response_at_sp(xml.as_bytes());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_envelope_rejects_multiple_body_children() {
+        let xml = concat!(
+            r#"<S:Envelope xmlns:S="http://schemas.xmlsoap.org/soap/envelope/"><S:Body>"#,
+            r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_decoy"/>"#,
+            r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_real"/>"#,
+            r#"</S:Body></S:Envelope>"#
+        );
+        let result = parse_ecp_response_at_sp(xml.as_bytes());
+        assert!(result.is_err());
     }
 }

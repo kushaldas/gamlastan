@@ -353,13 +353,18 @@ impl SpLogoutOrchestrator {
                 ))
             })?;
 
-        if let Some(issuer) = &response.issuer {
-            if issuer.value != target.entity_id {
-                return Err(ProfileError::Other(format!(
-                    "LogoutResponse issuer {} does not match target entity {}",
-                    issuer.value, target.entity_id
-                )));
-            }
+        // The Issuer is the only responder-identity signal here (and is
+        // required by the protocol schema); a response without one could be
+        // spoofed and correlated solely by InResponseTo.
+        let issuer = response
+            .issuer
+            .as_ref()
+            .ok_or_else(|| ProfileError::Other("LogoutResponse has no Issuer".to_string()))?;
+        if issuer.value != target.entity_id {
+            return Err(ProfileError::Other(format!(
+                "LogoutResponse issuer {} does not match target entity {}",
+                issuer.value, target.entity_id
+            )));
         }
 
         let success = response.status.is_success();
@@ -736,6 +741,18 @@ mod tests {
 
         let response =
             create_logout_response_success("https://evil.example.com", &pending.request.id, None);
+        assert!(orch.handle_response(&response).is_err());
+    }
+
+    #[test]
+    fn test_orchestrator_rejects_missing_issuer() {
+        let mut orch = SpLogoutOrchestrator::new("https://sp.example.com");
+        orch.add_target(make_target("https://idp1.example.com"));
+        let pending = orch.next_request().unwrap().unwrap();
+
+        let mut response =
+            create_logout_response_success("https://idp1.example.com", &pending.request.id, None);
+        response.issuer = None;
         assert!(orch.handle_response(&response).is_err());
     }
 
