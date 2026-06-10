@@ -20,7 +20,7 @@ use regex::Regex;
 use crate::attribute_map::AttributeConverterSet;
 use crate::core::assertion::attribute::{Attribute, AttributeValue};
 use crate::core::constants;
-use crate::idp::entity_category::{releasable_attributes, EntityCategoryPolicy};
+use crate::idp::entity_category::{releasable_attributes, EntityCategoryPolicy, SubjectIdReq};
 use crate::metadata::types::sp::{RequestedAttribute, SpSsoDescriptor};
 
 /// Errors raised by policy evaluation.
@@ -330,7 +330,13 @@ impl ReleasePolicy {
     ///    (`sp_entity_categories` are the SP's published categories);
     /// 2. otherwise, required/optional matching against the SP's
     ///    `RequestedAttribute`s (honoring `fail_on_missing_requested`);
-    /// 3. the entry's attribute/value restrictions.
+    /// 3. the entry's attribute/value restrictions;
+    /// 4. subject-id / pairwise-id mutual exclusion when the SP's
+    ///    `subject-id:req` is `any` (pysaml2 PR #987).
+    ///
+    /// `subject_id_req` is the SP's requested subject identifier, read from its
+    /// `subject-id:req` metadata entity attribute
+    /// (see [`SubjectIdReq::from_metadata_values`]).
     pub fn filter(
         &self,
         attributes: Vec<Attribute>,
@@ -338,6 +344,7 @@ impl ReleasePolicy {
         sp_entity_categories: &[String],
         required: &[RequestedAttribute],
         optional: &[RequestedAttribute],
+        subject_id_req: SubjectIdReq,
     ) -> Result<Vec<Attribute>, PolicyError> {
         let mut result = attributes;
         let fail_on_missing_requested = self.fail_on_missing_requested(sp_entity_id);
@@ -364,6 +371,32 @@ impl ReleasePolicy {
             result = self.filter_attribute_value_assertions(result, &restrictions);
         }
 
+        // Step 4: pysaml2 PR #987 — when the SP requests subject-id with
+        // requirement "any" and both subject-id and pairwise-id are about to be
+        // released, keep only the privacy-preserving pairwise-id. Other
+        // metadata values are intentionally left unchanged; the profile defines
+        // the signal but leaves asserting-party response unspecified.
+        if subject_id_req == SubjectIdReq::Any {
+            let mut has_subject_id = false;
+            let mut has_pairwise_id = false;
+
+            for attr in &result {
+                match self.local_key(attr).as_str() {
+                    "subject-id" => has_subject_id = true,
+                    "pairwise-id" => has_pairwise_id = true,
+                    _ => {}
+                }
+
+                if has_subject_id && has_pairwise_id {
+                    break;
+                }
+            }
+
+            if has_subject_id && has_pairwise_id {
+                result.retain(|a| self.local_key(a) != "subject-id");
+            }
+        }
+
         if fail_on_missing_requested && !required.is_empty() {
             self.validate_required_attributes(&result, required)?;
         }
@@ -384,6 +417,7 @@ impl ReleasePolicy {
         sp_metadata: Option<&SpSsoDescriptor>,
         sp_entity_categories: &[String],
         acs_index: Option<u16>,
+        subject_id_req: SubjectIdReq,
     ) -> Result<Vec<Attribute>, PolicyError> {
         let (required, optional) = match sp_metadata {
             Some(sp) => sp_attribute_requirements(sp, acs_index),
@@ -395,6 +429,7 @@ impl ReleasePolicy {
             sp_entity_categories,
             &required,
             &optional,
+            subject_id_req,
         )
     }
 
@@ -699,7 +734,14 @@ mod tests {
             eppn_attribute("alice@example.com"),
         ];
         let out = policy
-            .filter(attrs, "https://sp.example.com", &[], &[], &[])
+            .filter(
+                attrs,
+                "https://sp.example.com",
+                &[],
+                &[],
+                &[],
+                SubjectIdReq::None,
+            )
             .unwrap();
 
         // eppn is not listed -> dropped; mail keeps only the matching value
@@ -718,7 +760,14 @@ mod tests {
         );
         let attrs = vec![mail_attribute(&["alice@example.com", "malice@example.com"])];
         let out = policy
-            .filter(attrs, "https://sp.example.com", &[], &[], &[])
+            .filter(
+                attrs,
+                "https://sp.example.com",
+                &[],
+                &[],
+                &[],
+                SubjectIdReq::None,
+            )
             .unwrap();
         // re.match semantics: only values starting with "alice"
         assert_eq!(out[0].values.len(), 1);
@@ -740,6 +789,7 @@ mod tests {
                 &[],
                 &required,
                 &[],
+                SubjectIdReq::None,
             )
             .unwrap_err();
         assert!(matches!(err, PolicyError::MissingRequiredAttribute(_)));
@@ -764,7 +814,14 @@ mod tests {
             crate::profiles::attribute::x500::cn_attribute(&["Alice"]),
         ];
         let out = policy
-            .filter(attrs, "https://sp.example.com", &[], &required, &optional)
+            .filter(
+                attrs,
+                "https://sp.example.com",
+                &[],
+                &required,
+                &optional,
+                SubjectIdReq::None,
+            )
             .unwrap();
         let names: Vec<_> = out
             .iter()
@@ -807,7 +864,14 @@ mod tests {
             true,
         )];
         let out = policy
-            .filter(vec![], "https://sp.example.com", &[], &required, &[])
+            .filter(
+                vec![],
+                "https://sp.example.com",
+                &[],
+                &required,
+                &[],
+                SubjectIdReq::None,
+            )
             .unwrap();
         assert!(out.is_empty());
     }
@@ -832,6 +896,7 @@ mod tests {
                 &[],
                 &required,
                 &[],
+                SubjectIdReq::None,
             )
             .unwrap_err();
 
@@ -864,6 +929,7 @@ mod tests {
                 &[REFEDS_RESEARCH_AND_SCHOLARSHIP.to_string()],
                 &required,
                 &[],
+                SubjectIdReq::None,
             )
             .unwrap_err();
 
@@ -889,6 +955,7 @@ mod tests {
                 &[REFEDS_RESEARCH_AND_SCHOLARSHIP.to_string()],
                 &[],
                 &[],
+                SubjectIdReq::None,
             )
             .unwrap();
         // mail is in R&S, cn is not
@@ -916,11 +983,87 @@ mod tests {
                 &[COCO_V1.to_string()],
                 &required,
                 &[],
+                SubjectIdReq::None,
             )
             .unwrap();
         // CoCo + only_required: eppn (not required by the SP) is withheld
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].friendly_name.as_deref(), Some("mail"));
+    }
+
+    fn subject_identifier(name: &str, friendly: &str, value: &str) -> Attribute {
+        Attribute {
+            name: name.to_string(),
+            name_format: Some(constants::ATTRNAME_FORMAT_URI.to_string()),
+            friendly_name: Some(friendly.to_string()),
+            values: vec![AttributeValue::String(value.to_string())],
+        }
+    }
+
+    #[test]
+    fn test_subject_id_req_any_prefers_pairwise() {
+        use crate::idp::entity_category::{PAIRWISE_ID_ATTR, SUBJECT_ID_ATTR};
+        let policy = ReleasePolicy::new();
+        let attrs = || {
+            vec![
+                subject_identifier(SUBJECT_ID_ATTR, "subject-id", "alice@example.com"),
+                subject_identifier(PAIRWISE_ID_ATTR, "pairwise-id", "opaque@example.com"),
+                mail_attribute(&["alice@example.com"]),
+            ]
+        };
+
+        // req == any: subject-id dropped, pairwise-id (and mail) kept.
+        let out = policy
+            .filter(
+                attrs(),
+                "https://sp.example.com",
+                &[],
+                &[],
+                &[],
+                SubjectIdReq::Any,
+            )
+            .unwrap();
+        let names: Vec<_> = out.iter().filter_map(|a| a.friendly_name.clone()).collect();
+        assert!(names.contains(&"pairwise-id".to_string()));
+        assert!(names.contains(&"mail".to_string()));
+        assert!(!names.contains(&"subject-id".to_string()));
+
+        // Non-`any` leaves the release set unchanged by design: the metadata
+        // signal does not define asserting-party behavior for those values.
+        let out = policy
+            .filter(
+                attrs(),
+                "https://sp.example.com",
+                &[],
+                &[],
+                &[],
+                SubjectIdReq::None,
+            )
+            .unwrap();
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn test_subject_id_req_any_keeps_lone_subject_id() {
+        use crate::idp::entity_category::SUBJECT_ID_ATTR;
+        let policy = ReleasePolicy::new();
+        // Only subject-id present: nothing to prefer, so it is kept.
+        let out = policy
+            .filter(
+                vec![subject_identifier(
+                    SUBJECT_ID_ATTR,
+                    "subject-id",
+                    "alice@example.com",
+                )],
+                "https://sp.example.com",
+                &[],
+                &[],
+                &[],
+                SubjectIdReq::Any,
+            )
+            .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].friendly_name.as_deref(), Some("subject-id"));
     }
 
     #[test]

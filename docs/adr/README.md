@@ -22,3 +22,5 @@ rewriting history (mark the old one `Superseded by NNNN`).
 | [0011](0011-per-request-certificate-encryption.md) | Per-request certificate encryption (PEFIM) | Accepted |
 | [0012](0012-ecp-soap-envelope-hardening.md) | ECP envelope parsing verifies the SOAP 1.1 namespace and rejects multi-element Bodies | Accepted |
 | [0013](0013-logout-response-requires-issuer.md) | LogoutResponse without an Issuer is rejected | Accepted |
+| [0014](0014-entity-category-conflict-matcher.md) | Conflict-aware entity-category matcher for REFEDS Access | Accepted |
+| [0015](0015-subject-id-pairwise-id-mutual-exclusion.md) | Prefer pairwise-id when subject-id:req is any | Accepted |

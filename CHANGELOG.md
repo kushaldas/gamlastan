@@ -7,6 +7,28 @@ where needed to correct protocol handling.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-06-10
+
+### Changed
+
+- `idp::entity_category`: REFEDS Access categories (personalized / pseudonymous
+  / anonymous) now use a conflict-aware matcher. `EntityCategoryRule` gained a
+  `conflicts` field (the `no_aggregation` flag was removed), mirroring pysaml2's
+  `EntityCategoryMatcher` on the `ft-typing` / `ft-refeds_ec` branches: a rule
+  matches only when every required category is present and no conflicting
+  category is. The three REFEDS Access rules are mutually exclusive yet combine
+  with non-conflicting categories (R&S, CoCo, ESI), and are now active by
+  default in the `SWAMID` policy. See ADR 0014.
+
+### Added
+
+- `idp::policy`: subject-id / pairwise-id mutual exclusion (pysaml2 PR #987).
+  New `SubjectIdReq` (parsed from the SP's `subject-id:req` metadata entity
+  attribute) and `prefer_pairwise_over_subject_id()`; `ReleasePolicy::filter()`
+  and `restrict()` take a `subject_id_req` argument and drop `subject-id` when
+  the requirement is `any` and both `subject-id` and `pairwise-id` would
+  otherwise be released. See ADR 0015.
+
 ## [0.4.0] - 2026-06-10
 
 ### Added
