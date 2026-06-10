@@ -20,9 +20,7 @@ use regex::Regex;
 use crate::attribute_map::AttributeConverterSet;
 use crate::core::assertion::attribute::{Attribute, AttributeValue};
 use crate::core::constants;
-use crate::idp::entity_category::{
-    prefer_pairwise_over_subject_id, releasable_attributes, EntityCategoryPolicy, SubjectIdReq,
-};
+use crate::idp::entity_category::{releasable_attributes, EntityCategoryPolicy, SubjectIdReq};
 use crate::metadata::types::sp::{RequestedAttribute, SpSsoDescriptor};
 
 /// Errors raised by policy evaluation.
@@ -379,10 +377,24 @@ impl ReleasePolicy {
         // metadata values are intentionally left unchanged; the profile defines
         // the signal but leaves asserting-party response unspecified.
         if subject_id_req == SubjectIdReq::Any {
-            let mut locals: std::collections::HashSet<String> =
-                result.iter().map(|a| self.local_key(a)).collect();
-            prefer_pairwise_over_subject_id(subject_id_req, &mut locals);
-            result.retain(|a| locals.contains(&self.local_key(a)));
+            let mut has_subject_id = false;
+            let mut has_pairwise_id = false;
+
+            for attr in &result {
+                match self.local_key(attr).as_str() {
+                    "subject-id" => has_subject_id = true,
+                    "pairwise-id" => has_pairwise_id = true,
+                    _ => {}
+                }
+
+                if has_subject_id && has_pairwise_id {
+                    break;
+                }
+            }
+
+            if has_subject_id && has_pairwise_id {
+                result.retain(|a| self.local_key(a) != "subject-id");
+            }
         }
 
         if fail_on_missing_requested && !required.is_empty() {

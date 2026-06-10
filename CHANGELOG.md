@@ -7,6 +7,8 @@ where needed to correct protocol handling.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-06-10
+
 ### Changed
 
 - `idp::entity_category`: REFEDS Access categories (personalized / pseudonymous
