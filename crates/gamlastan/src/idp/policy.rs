@@ -262,6 +262,66 @@ impl ReleasePolicy {
             .to_lowercase()
     }
 
+    fn matching_requested_attribute(
+        &self,
+        attributes: &[Attribute],
+        requested: &RequestedAttribute,
+    ) -> Option<Attribute> {
+        let req_local = self.local_key(&requested.attribute);
+        let req_wire = requested.attribute.name.to_lowercase();
+
+        // Assertion parsing does not merge duplicate Attribute elements,
+        // so collect every input attribute mapping to this requested name
+        // (by local or wire name) rather than just the first.
+        let mut matched = attributes.iter().filter(|attr| {
+            self.local_key(attr) == req_local || attr.name.to_lowercase() == req_wire
+        });
+
+        let mut released = matched.next()?.clone();
+        for extra in matched {
+            for v in &extra.values {
+                if !released.values.contains(v) {
+                    released.values.push(v.clone());
+                }
+            }
+        }
+
+        Some(released)
+    }
+
+    fn validate_required_attributes(
+        &self,
+        attributes: &[Attribute],
+        required: &[RequestedAttribute],
+    ) -> Result<(), PolicyError> {
+        for requested in required {
+            let Some(mut matched) = self.matching_requested_attribute(attributes, requested) else {
+                return Err(PolicyError::MissingRequiredAttribute(
+                    requested.attribute.name.clone(),
+                ));
+            };
+
+            let wanted: Vec<String> = requested
+                .attribute
+                .values
+                .iter()
+                .filter_map(value_text)
+                .collect();
+            if !wanted.is_empty() {
+                matched
+                    .values
+                    .retain(|v| value_text(v).is_some_and(|t| wanted.contains(&t)));
+                if matched.values.is_empty() {
+                    return Err(PolicyError::MissingRequiredValue {
+                        attribute: requested.attribute.name.clone(),
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Filter attributes for release to `sp_entity_id`
     /// (pysaml2 `Policy.filter`).
     ///
@@ -280,6 +340,7 @@ impl ReleasePolicy {
         optional: &[RequestedAttribute],
     ) -> Result<Vec<Attribute>, PolicyError> {
         let mut result = attributes;
+        let fail_on_missing_requested = self.fail_on_missing_requested(sp_entity_id);
 
         // Step 1: entity-category release rules take precedence over
         // per-attribute requested/optional matching when configured.
@@ -294,17 +355,17 @@ impl ReleasePolicy {
         } else if !required.is_empty() || !optional.is_empty() {
             // Step 2: release only what the SP asked for in its
             // AttributeConsumingService (or the explicit lists given here).
-            result = self.filter_on_attributes(
-                result,
-                required,
-                optional,
-                self.fail_on_missing_requested(sp_entity_id),
-            )?;
+            result =
+                self.filter_on_attributes(result, required, optional, fail_on_missing_requested)?;
         }
 
         // Step 3: the IdP's own attribute/value restrictions always apply.
         if let Some(restrictions) = self.get(sp_entity_id, |e| e.attribute_restrictions.clone()) {
             result = self.filter_attribute_value_assertions(result, &restrictions);
+        }
+
+        if fail_on_missing_requested && !required.is_empty() {
+            self.validate_required_attributes(&result, required)?;
         }
 
         Ok(result)
@@ -354,17 +415,8 @@ impl ReleasePolicy {
             .map(|r| (r, true))
             .chain(optional.iter().map(|r| (r, false)))
         {
-            let req_local = self.local_key(&requested.attribute);
-            let req_wire = requested.attribute.name.to_lowercase();
-
-            // Assertion parsing does not merge duplicate Attribute elements,
-            // so collect every input attribute mapping to this requested name
-            // (by local or wire name) rather than just the first.
-            let mut matched = attributes.iter().filter(|attr| {
-                self.local_key(attr) == req_local || attr.name.to_lowercase() == req_wire
-            });
-
-            let Some(first) = matched.next() else {
+            let Some(mut released) = self.matching_requested_attribute(&attributes, requested)
+            else {
                 if must && fail_on_unfulfilled {
                     return Err(PolicyError::MissingRequiredAttribute(
                         requested.attribute.name.clone(),
@@ -372,17 +424,6 @@ impl ReleasePolicy {
                 }
                 continue;
             };
-
-            // Union the values of any duplicate Attribute elements into the
-            // first match so released values are not silently dropped.
-            let mut released = first.clone();
-            for extra in matched {
-                for v in &extra.values {
-                    if !released.values.contains(v) {
-                        released.values.push(v.clone());
-                    }
-                }
-            }
 
             let wanted: Vec<String> = requested
                 .attribute
@@ -580,6 +621,26 @@ mod tests {
         }
     }
 
+    fn requested_with_values(
+        name: &str,
+        friendly: Option<&str>,
+        required: bool,
+        values: &[&str],
+    ) -> RequestedAttribute {
+        RequestedAttribute {
+            attribute: Attribute {
+                name: name.to_string(),
+                name_format: Some(constants::ATTRNAME_FORMAT_URI.to_string()),
+                friendly_name: friendly.map(str::to_string),
+                values: values
+                    .iter()
+                    .map(|value| AttributeValue::String((*value).to_string()))
+                    .collect(),
+            },
+            is_required: Some(required),
+        }
+    }
+
     #[test]
     fn test_defaults() {
         let policy = ReleasePolicy::new();
@@ -749,6 +810,68 @@ mod tests {
             .filter(vec![], "https://sp.example.com", &[], &required, &[])
             .unwrap();
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_filter_rechecks_required_attributes_after_restrictions() {
+        let policy = ReleasePolicy::with_default(
+            PolicyEntry::new()
+                .with_attribute_restrictions(&[("mail", Some(&[r".*@other\.example"]))])
+                .unwrap(),
+        );
+        let required = vec![requested(
+            "urn:oid:0.9.2342.19200300.100.1.3",
+            Some("mail"),
+            true,
+        )];
+
+        let err = policy
+            .filter(
+                vec![mail_attribute(&["alice@example.com"])],
+                "https://sp.example.com",
+                &[],
+                &required,
+                &[],
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            PolicyError::MissingRequiredAttribute(ref attribute)
+                if attribute == "urn:oid:0.9.2342.19200300.100.1.3"
+        ));
+    }
+
+    #[test]
+    fn test_filter_rechecks_required_values_after_entity_category_restrictions() {
+        let policy = ReleasePolicy::with_default(
+            PolicyEntry::new()
+                .with_entity_categories(vec![&REFEDS])
+                .with_attribute_restrictions(&[("mail", Some(&[r".*@work\.example"]))])
+                .unwrap(),
+        );
+        let required = vec![requested_with_values(
+            "urn:oid:0.9.2342.19200300.100.1.3",
+            Some("mail"),
+            true,
+            &["alice@example.com"],
+        )];
+
+        let err = policy
+            .filter(
+                vec![mail_attribute(&["alice@example.com", "alice@work.example"])],
+                "https://sp.example.com",
+                &[REFEDS_RESEARCH_AND_SCHOLARSHIP.to_string()],
+                &required,
+                &[],
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            PolicyError::MissingRequiredValue { ref attribute }
+                if attribute == "urn:oid:0.9.2342.19200300.100.1.3"
+        ));
     }
 
     #[test]

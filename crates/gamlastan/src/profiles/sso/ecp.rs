@@ -343,6 +343,7 @@ fn parse_envelope(soap_xml: &[u8]) -> Result<ParsedEcpEnvelope, ProfileError> {
     }
 
     let mut parsed = ParsedEcpEnvelope::default();
+    let mut body_count = 0usize;
 
     for child in doc.children_iter(root) {
         let Some(elem) = doc.element(child) else {
@@ -351,6 +352,13 @@ fn parse_envelope(soap_xml: &[u8]) -> Result<ParsedEcpEnvelope, ProfileError> {
         if elem.matches_name_ns(SOAP11_NS, "Header") {
             parse_header_blocks(&doc, child, &mut parsed)?;
         } else if elem.matches_name_ns(SOAP11_NS, "Body") {
+            body_count += 1;
+            if body_count > 1 {
+                return Err(ProfileError::Other(
+                    "SOAP Envelope must contain exactly one Body".to_string(),
+                ));
+            }
+
             // The SOAP binding requires exactly one element in the Body;
             // accepting extras would allow element smuggling (a decoy first
             // element with the real SAML message hidden after it).
@@ -643,6 +651,18 @@ mod tests {
             r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_decoy"/>"#,
             r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_real"/>"#,
             r#"</S:Body></S:Envelope>"#
+        );
+        let result = parse_ecp_response_at_sp(xml.as_bytes());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_envelope_rejects_multiple_body_elements() {
+        let xml = concat!(
+            r#"<S:Envelope xmlns:S="http://schemas.xmlsoap.org/soap/envelope/">"#,
+            r#"<S:Body><samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_decoy"/></S:Body>"#,
+            r#"<S:Body><samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_real"/></S:Body>"#,
+            r#"</S:Envelope>"#
         );
         let result = parse_ecp_response_at_sp(xml.as_bytes());
         assert!(result.is_err());
