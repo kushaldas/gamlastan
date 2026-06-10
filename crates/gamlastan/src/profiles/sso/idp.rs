@@ -285,6 +285,38 @@ pub fn create_response(
     }
 }
 
+/// Build an error `Response` carrying the given (non-success) status and no
+/// assertions.
+///
+/// Per Core 3.2.2 an error response keeps `InResponseTo` when it answers a
+/// request, and per Profiles 4.1.4.2 it is delivered to the SP's ACS like any
+/// other response. The response is returned unsigned; assertion-less error
+/// responses are commonly sent without a signature, but callers may sign the
+/// envelope before delivery if their deployment profile requires it.
+pub fn create_error_response(
+    idp_entity_id: &str,
+    in_response_to: Option<&str>,
+    acs_url: &str,
+    status: Status,
+    now: DateTime<Utc>,
+) -> Response {
+    Response {
+        base: ResponseBase {
+            id: SamlId::generate().as_str().to_string(),
+            version: SamlVersion::V2_0,
+            issue_instant: now,
+            destination: Some(acs_url.to_string()),
+            consent: None,
+            issuer: Some(Issuer::entity(idp_entity_id)),
+            has_signature: false,
+            in_response_to: in_response_to.map(|s| s.to_string()),
+            status,
+        },
+        assertions: vec![],
+        encrypted_assertions: vec![],
+    }
+}
+
 /// Create an unsolicited (IdP-initiated) SAML Response.
 ///
 /// Per Profiles 4.1.5:
@@ -534,6 +566,46 @@ mod tests {
         // Check AttributeStatement
         assert_eq!(assertion.attribute_statements.len(), 1);
         assert_eq!(assertion.attribute_statements[0].attributes.len(), 1);
+    }
+
+    #[test]
+    fn test_create_error_response() {
+        let now = Utc::now();
+        let status = Status::with_sub_status(
+            constants::STATUS_REQUESTER,
+            constants::STATUS_INVALID_NAMEID_POLICY,
+            Some("Unsupported NameIDPolicy".to_string()),
+        );
+        let resp = create_error_response(
+            "https://idp.example.com",
+            Some("_req123"),
+            "https://sp.example.com/acs",
+            status,
+            now,
+        );
+
+        assert!(resp.assertions.is_empty());
+        assert!(resp.encrypted_assertions.is_empty());
+        assert!(!resp.base.status.is_success());
+        assert_eq!(resp.base.in_response_to, Some("_req123".to_string()));
+        assert_eq!(
+            resp.base.destination,
+            Some("https://sp.example.com/acs".to_string())
+        );
+        assert_eq!(
+            resp.base.issuer.as_ref().unwrap().value,
+            "https://idp.example.com"
+        );
+        assert_eq!(
+            resp.base
+                .status
+                .status_code
+                .sub_status
+                .as_ref()
+                .unwrap()
+                .value,
+            constants::STATUS_INVALID_NAMEID_POLICY
+        );
     }
 
     #[test]

@@ -14,11 +14,9 @@
 use chrono::{DateTime, Utc};
 
 use crate::core::assertion::attribute::AttributeStatement;
-use crate::core::assertion::issuer::Issuer;
 use crate::core::assertion::name_id::NameId;
 use crate::core::assertion::types::EncryptedAssertion;
-use crate::core::identifiers::{SamlId, SamlVersion};
-use crate::core::protocol::response::{Response, ResponseBase};
+use crate::core::protocol::response::Response;
 use crate::core::protocol::status::Status;
 use crate::crypto::SamlEncryptor;
 use crate::profiles::sso::idp as idp_profile;
@@ -99,21 +97,7 @@ pub fn error_response(
     status: Status,
     now: DateTime<Utc>,
 ) -> Response {
-    Response {
-        base: ResponseBase {
-            id: SamlId::generate().as_str().to_string(),
-            version: SamlVersion::V2_0,
-            issue_instant: now,
-            destination: Some(acs_url.to_string()),
-            consent: None,
-            issuer: Some(Issuer::entity(&cfg.entity_id)),
-            has_signature: false,
-            in_response_to: in_response_to.map(|s| s.to_string()),
-            status,
-        },
-        assertions: vec![],
-        encrypted_assertions: vec![],
-    }
+    idp_profile::create_error_response(&cfg.entity_id, in_response_to, acs_url, status, now)
 }
 
 /// Status for a user-cancelled authentication (section 6.4).
