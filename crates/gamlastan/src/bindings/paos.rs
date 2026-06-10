@@ -57,10 +57,15 @@ pub struct PaosResponse {
 /// Included in the SOAP response from SP to ECP (phase 1).
 #[derive(Debug, Clone)]
 pub struct EcpRequest {
-    /// IdP list (discovery information).
+    /// The SP entity ID (serialized as a `saml:Issuer` child, required by
+    /// Profiles 4.2.4.2).
+    pub issuer: Option<String>,
+    /// Human-readable SP name.
     pub provider_name: Option<String>,
     /// Whether passive authentication is required.
     pub is_passive: bool,
+    /// IdP entity IDs the ECP may use (serialized as `samlp:IDPList`).
+    pub idp_list: Vec<String>,
 }
 
 /// ECP Response SOAP header block.
@@ -79,18 +84,36 @@ pub struct EcpRelayState {
     pub relay_state: String,
 }
 
+/// Escape a string for use in XML attribute values and text content.
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Serialize a PAOS Request header block to XML.
 pub fn paos_request_header_xml(req: &PaosRequest) -> String {
     let mut xml = String::with_capacity(256);
     xml.push_str(&format!(
         r#"<paos:Request xmlns:paos="{}" soap:mustUnderstand="1" soap:actor="{}" responseConsumerURL="{}""#,
-        PAOS_NS, SOAP11_ACTOR_NEXT, req.response_consumer_url
+        PAOS_NS,
+        SOAP11_ACTOR_NEXT,
+        xml_escape(&req.response_consumer_url)
     ));
     if let Some(ref svc) = req.service {
-        xml.push_str(&format!(r#" service="{}""#, svc));
+        xml.push_str(&format!(r#" service="{}""#, xml_escape(svc)));
     }
     if let Some(ref mid) = req.message_id {
-        xml.push_str(&format!(r#" messageID="{}""#, mid));
+        xml.push_str(&format!(r#" messageID="{}""#, xml_escape(mid)));
     }
     xml.push_str("/>");
     xml
@@ -118,9 +141,30 @@ pub fn ecp_request_header_xml(req: &EcpRequest) -> String {
         ECP_NS, SOAP11_ACTOR_NEXT, req.is_passive
     ));
     if let Some(ref pn) = req.provider_name {
-        xml.push_str(&format!(r#" ProviderName="{}""#, pn));
+        xml.push_str(&format!(r#" ProviderName="{}""#, xml_escape(pn)));
     }
-    xml.push_str("/>");
+    if req.issuer.is_none() && req.idp_list.is_empty() {
+        xml.push_str("/>");
+        return xml;
+    }
+    xml.push('>');
+    if let Some(ref issuer) = req.issuer {
+        xml.push_str(&format!(
+            r#"<saml:Issuer xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">{}</saml:Issuer>"#,
+            xml_escape(issuer)
+        ));
+    }
+    if !req.idp_list.is_empty() {
+        xml.push_str(r#"<samlp:IDPList xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol">"#);
+        for idp in &req.idp_list {
+            xml.push_str(&format!(
+                r#"<samlp:IDPEntry ProviderID="{}"/>"#,
+                xml_escape(idp)
+            ));
+        }
+        xml.push_str("</samlp:IDPList>");
+    }
+    xml.push_str("</ecp:Request>");
     xml
 }
 
@@ -128,7 +172,9 @@ pub fn ecp_request_header_xml(req: &EcpRequest) -> String {
 pub fn ecp_response_header_xml(resp: &EcpResponse) -> String {
     format!(
         r#"<ecp:Response xmlns:ecp="{}" soap:mustUnderstand="1" soap:actor="{}" AssertionConsumerServiceURL="{}"/>"#,
-        ECP_NS, SOAP11_ACTOR_NEXT, resp.assertion_consumer_service_url
+        ECP_NS,
+        SOAP11_ACTOR_NEXT,
+        xml_escape(&resp.assertion_consumer_service_url)
     )
 }
 
@@ -136,7 +182,9 @@ pub fn ecp_response_header_xml(resp: &EcpResponse) -> String {
 pub fn ecp_relay_state_header_xml(rs: &EcpRelayState) -> String {
     format!(
         r#"<ecp:RelayState xmlns:ecp="{}" soap:mustUnderstand="1" soap:actor="{}">{}</ecp:RelayState>"#,
-        ECP_NS, SOAP11_ACTOR_NEXT, rs.relay_state
+        ECP_NS,
+        SOAP11_ACTOR_NEXT,
+        xml_escape(&rs.relay_state)
     )
 }
 
@@ -152,15 +200,17 @@ pub fn is_paos_request(request: &impl crate::bindings::traits::HttpRequest) -> b
 /// Build a complete PAOS/ECP SOAP envelope for phase 1 (SP -> ECP).
 ///
 /// The SP sends this to the ECP containing the AuthnRequest for the IdP.
+/// Per Profiles 4.2.4.2 the envelope carries a `paos:Request` header
+/// (responseConsumerURL) and an `ecp:Request` header.
 pub fn build_ecp_phase1_envelope(
     authn_request_xml: &str,
     ecp_request: &EcpRequest,
-    paos_response: &PaosResponse,
+    paos_request: &PaosRequest,
     relay_state: Option<&EcpRelayState>,
 ) -> Result<String, BindingError> {
     let mut headers = String::new();
+    headers.push_str(&paos_request_header_xml(paos_request));
     headers.push_str(&ecp_request_header_xml(ecp_request));
-    headers.push_str(&paos_response_header_xml(paos_response));
     if let Some(rs) = relay_state {
         headers.push_str(&ecp_relay_state_header_xml(rs));
     }
@@ -234,19 +284,48 @@ mod tests {
     fn test_ecp_phase1_envelope() {
         let authn_req = "<samlp:AuthnRequest/>";
         let ecp_req = EcpRequest {
+            issuer: Some("https://sp.example.com".to_string()),
             provider_name: Some("Test SP".to_string()),
             is_passive: false,
+            idp_list: vec!["https://idp.example.com".to_string()],
         };
-        let paos_resp = PaosResponse {
-            ref_to_message_id: Some("_msg001".to_string()),
+        let paos_req = PaosRequest {
+            response_consumer_url: "https://sp.example.com/acs".to_string(),
+            service: Some(ECP_NS.to_string()),
+            message_id: Some("_msg001".to_string()),
         };
 
-        let env = build_ecp_phase1_envelope(authn_req, &ecp_req, &paos_resp, None).unwrap();
+        let env = build_ecp_phase1_envelope(authn_req, &ecp_req, &paos_req, None).unwrap();
         assert!(env.contains("soap:Envelope"));
         assert!(env.contains("soap:Header"));
         assert!(env.contains("ecp:Request"));
-        assert!(env.contains("paos:Response"));
+        assert!(env.contains("paos:Request"));
+        assert!(env.contains("saml:Issuer"));
+        assert!(env.contains("samlp:IDPEntry"));
+        assert!(env.contains("responseConsumerURL=\"https://sp.example.com/acs\""));
         assert!(env.contains("AuthnRequest"));
+    }
+
+    #[test]
+    fn test_ecp_request_header_empty_children_self_closes() {
+        let req = EcpRequest {
+            issuer: None,
+            provider_name: None,
+            is_passive: true,
+            idp_list: vec![],
+        };
+        let xml = ecp_request_header_xml(&req);
+        assert!(xml.ends_with("/>"));
+        assert!(xml.contains("IsPassive=\"true\""));
+    }
+
+    #[test]
+    fn test_xml_escape_in_headers() {
+        let resp = EcpResponse {
+            assertion_consumer_service_url: "https://sp.example.com/acs?a=1&b=2".to_string(),
+        };
+        let xml = ecp_response_header_xml(&resp);
+        assert!(xml.contains("a=1&amp;b=2"));
     }
 
     #[test]

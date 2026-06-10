@@ -1340,6 +1340,7 @@ mod tests {
             protocol_binding: None,
             attribute_consuming_service_index: None,
             provider_name: None,
+            extensions: None,
         }
     }
 

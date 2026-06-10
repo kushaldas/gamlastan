@@ -11,6 +11,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 
 use crate::core::assertion::issuer::Issuer;
 use crate::core::assertion::name_id::{NameId, NameIdOrEncryptedId};
+use crate::core::constants::STATUS_PARTIAL_LOGOUT;
 use crate::core::identifiers::{SamlId, SamlVersion};
 use crate::core::protocol::logout::{LogoutRequest, LogoutResponse};
 use crate::core::protocol::status::{Status, StatusCode};
@@ -186,6 +187,261 @@ pub fn create_logout_response_partial(
     create_logout_response(entity_id, in_response_to, destination, status)
 }
 
+// ── SP-side logout orchestration ────────────────────────────────────────────
+
+/// State of one entity in an SP-driven multi-entity logout.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TargetLogoutState {
+    /// No LogoutRequest issued yet.
+    Pending,
+    /// A LogoutRequest was issued and we await the response.
+    InProgress {
+        /// The LogoutRequest ID (matched against InResponseTo).
+        request_id: String,
+    },
+    /// The entity confirmed the logout.
+    Succeeded,
+    /// The logout failed (transport error or error status).
+    Failed {
+        /// Why the logout failed.
+        reason: String,
+    },
+}
+
+/// A session authority/participant the SP must log out from.
+#[derive(Debug, Clone)]
+pub struct LogoutTarget {
+    /// The entity ID of the IdP (or other participant).
+    pub entity_id: String,
+    /// The NameID this entity knows the principal by.
+    pub name_id: NameId,
+    /// Session indexes to terminate at this entity.
+    pub session_indexes: Vec<String>,
+    /// The entity's SLO endpoint location.
+    pub slo_url: String,
+    /// The binding to use for the SLO endpoint.
+    pub slo_binding: String,
+}
+
+/// A LogoutRequest ready to be delivered by the caller's transport.
+#[derive(Debug)]
+pub struct PendingLogoutRequest {
+    /// The entity this request targets.
+    pub entity_id: String,
+    /// The LogoutRequest (sign before delivery for front-channel bindings).
+    pub request: LogoutRequest,
+    /// The binding to deliver it over.
+    pub binding: String,
+    /// The endpoint location to deliver it to.
+    pub destination: String,
+}
+
+/// Outcome of correlating one LogoutResponse.
+#[derive(Debug, Clone)]
+pub struct LogoutResponseOutcome {
+    /// The entity that responded.
+    pub entity_id: String,
+    /// Whether the top-level status was Success.
+    pub success: bool,
+    /// Whether the entity reported PartialLogout.
+    pub partial: bool,
+}
+
+/// Transport-agnostic state machine for SP-initiated logout across all
+/// entities that hold a session for the principal (the equivalent of
+/// pysaml2's `global_logout`/`do_logout`/`handle_logout_response` loop).
+///
+/// The orchestrator never performs I/O. Drive it like this:
+///
+/// 1. `add_target()` for every entity that issued information about the
+///    subject (typically the session-issuing IdPs).
+/// 2. Loop: `next_request()` → sign if required → deliver over the returned
+///    binding. For SOAP, parse the LogoutResponse and call
+///    `handle_response()` immediately; for front-channel bindings call
+///    `handle_response()` when the response comes back, or `mark_failed()`
+///    on transport errors.
+/// 3. When `is_complete()` is true, inspect `progress()` and perform the
+///    local logout.
+#[derive(Debug)]
+pub struct SpLogoutOrchestrator {
+    sp_entity_id: String,
+    reason: Option<String>,
+    targets: Vec<(LogoutTarget, TargetLogoutState)>,
+}
+
+impl SpLogoutOrchestrator {
+    /// Create an orchestrator for the given SP entity ID.
+    pub fn new(sp_entity_id: impl Into<String>) -> Self {
+        SpLogoutOrchestrator {
+            sp_entity_id: sp_entity_id.into(),
+            reason: Some(reason::USER.to_string()),
+            targets: Vec::new(),
+        }
+    }
+
+    /// Set the logout reason URI included in every request.
+    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
+        self
+    }
+
+    /// Register an entity that must be logged out.
+    pub fn add_target(&mut self, target: LogoutTarget) {
+        self.targets.push((target, TargetLogoutState::Pending));
+    }
+
+    /// Produce the next LogoutRequest to deliver, if any target is pending.
+    ///
+    /// Marks the target as in-progress; the request ID is recorded so the
+    /// matching LogoutResponse can be correlated via `handle_response()`.
+    pub fn next_request(&mut self) -> Result<Option<PendingLogoutRequest>, ProfileError> {
+        let sp_entity_id = self.sp_entity_id.clone();
+        let reason = self.reason.clone();
+
+        let Some((target, state)) = self
+            .targets
+            .iter_mut()
+            .find(|(_, state)| *state == TargetLogoutState::Pending)
+        else {
+            return Ok(None);
+        };
+
+        let request = create_sp_logout_request(&SpLogoutRequestOptions {
+            sp_entity_id,
+            name_id: target.name_id.clone(),
+            session_indexes: target.session_indexes.clone(),
+            reason,
+            destination: Some(target.slo_url.clone()),
+            not_on_or_after: None,
+        })?;
+
+        *state = TargetLogoutState::InProgress {
+            request_id: request.id.clone(),
+        };
+
+        Ok(Some(PendingLogoutRequest {
+            entity_id: target.entity_id.clone(),
+            binding: target.slo_binding.clone(),
+            destination: target.slo_url.clone(),
+            request,
+        }))
+    }
+
+    /// Correlate a LogoutResponse with its in-progress request and record
+    /// the outcome.
+    ///
+    /// The response is matched by InResponseTo; if an Issuer is present it
+    /// must match the target's entity ID. Returns the per-entity outcome.
+    pub fn handle_response(
+        &mut self,
+        response: &LogoutResponse,
+    ) -> Result<LogoutResponseOutcome, ProfileError> {
+        let in_response_to = response
+            .in_response_to
+            .as_deref()
+            .ok_or_else(|| ProfileError::Other("LogoutResponse has no InResponseTo".to_string()))?;
+
+        let (target, state) = self
+            .targets
+            .iter_mut()
+            .find(|(_, state)| {
+                matches!(state, TargetLogoutState::InProgress { request_id } if request_id == in_response_to)
+            })
+            .ok_or_else(|| {
+                ProfileError::Other(format!(
+                    "LogoutResponse InResponseTo {in_response_to} matches no outstanding request"
+                ))
+            })?;
+
+        if let Some(issuer) = &response.issuer {
+            if issuer.value != target.entity_id {
+                return Err(ProfileError::Other(format!(
+                    "LogoutResponse issuer {} does not match target entity {}",
+                    issuer.value, target.entity_id
+                )));
+            }
+        }
+
+        let success = response.status.is_success();
+        let partial = response
+            .status
+            .status_code
+            .sub_status
+            .as_ref()
+            .is_some_and(|sub| sub.value == STATUS_PARTIAL_LOGOUT);
+
+        *state = if partial {
+            TargetLogoutState::Failed {
+                reason: STATUS_PARTIAL_LOGOUT.to_string(),
+            }
+        } else if success {
+            TargetLogoutState::Succeeded
+        } else {
+            TargetLogoutState::Failed {
+                reason: response.status.status_code.value.clone(),
+            }
+        };
+
+        Ok(LogoutResponseOutcome {
+            entity_id: target.entity_id.clone(),
+            success,
+            partial,
+        })
+    }
+
+    /// Record a transport-level failure for an entity (e.g., the SOAP call
+    /// failed or the front-channel response never arrived).
+    pub fn mark_failed(&mut self, entity_id: &str, failure_reason: impl Into<String>) {
+        if let Some((_, state)) = self
+            .targets
+            .iter_mut()
+            .find(|(t, _)| t.entity_id == entity_id)
+        {
+            *state = TargetLogoutState::Failed {
+                reason: failure_reason.into(),
+            };
+        }
+    }
+
+    /// The current state of a target entity.
+    pub fn target_state(&self, entity_id: &str) -> Option<&TargetLogoutState> {
+        self.targets
+            .iter()
+            .find(|(t, _)| t.entity_id == entity_id)
+            .map(|(_, state)| state)
+    }
+
+    /// Whether every target reached a final state (succeeded or failed).
+    pub fn is_complete(&self) -> bool {
+        self.targets.iter().all(|(_, state)| {
+            matches!(
+                state,
+                TargetLogoutState::Succeeded | TargetLogoutState::Failed { .. }
+            )
+        })
+    }
+
+    /// Aggregate progress across all targets.
+    pub fn progress(&self) -> LogoutPropagationResult {
+        let successful = self
+            .targets
+            .iter()
+            .filter(|(_, state)| *state == TargetLogoutState::Succeeded)
+            .count();
+        let failed = self
+            .targets
+            .iter()
+            .filter(|(_, state)| matches!(state, TargetLogoutState::Failed { .. }))
+            .map(|(t, _)| t.entity_id.clone())
+            .collect();
+        LogoutPropagationResult {
+            total_participants: self.targets.len(),
+            successful_logouts: successful,
+            failed_participants: failed,
+        }
+    }
+}
+
 /// Find the SLO endpoint from a descriptor for the given binding.
 pub fn find_slo_endpoint<'a>(
     sso_base: &'a SsoDescriptorBase,
@@ -357,6 +613,130 @@ mod tests {
         };
         assert!(!result.is_complete());
         assert!(result.is_partial());
+    }
+
+    fn make_target(entity_id: &str) -> LogoutTarget {
+        LogoutTarget {
+            entity_id: entity_id.to_string(),
+            name_id: make_name_id(),
+            session_indexes: vec!["_sess1".to_string()],
+            slo_url: format!("{entity_id}/slo"),
+            slo_binding: "urn:oasis:names:tc:SAML:2.0:bindings:SOAP".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_orchestrator_full_success() {
+        let mut orch = SpLogoutOrchestrator::new("https://sp.example.com");
+        orch.add_target(make_target("https://idp1.example.com"));
+        orch.add_target(make_target("https://idp2.example.com"));
+        assert!(!orch.is_complete());
+
+        // Drive the loop: request -> response per target
+        while let Some(pending) = orch.next_request().unwrap() {
+            assert_eq!(pending.destination, format!("{}/slo", pending.entity_id));
+            assert_eq!(
+                pending.request.issuer.as_ref().unwrap().value,
+                "https://sp.example.com"
+            );
+            let response = create_logout_response_success(
+                &pending.entity_id,
+                &pending.request.id,
+                Some("https://sp.example.com/slo"),
+            );
+            let outcome = orch.handle_response(&response).unwrap();
+            assert!(outcome.success);
+            assert!(!outcome.partial);
+        }
+
+        assert!(orch.is_complete());
+        let progress = orch.progress();
+        assert_eq!(progress.total_participants, 2);
+        assert!(progress.is_complete());
+    }
+
+    #[test]
+    fn test_orchestrator_partial_logout_response() {
+        let mut orch = SpLogoutOrchestrator::new("https://sp.example.com");
+        orch.add_target(make_target("https://idp1.example.com"));
+
+        let pending = orch.next_request().unwrap().unwrap();
+        let response =
+            create_logout_response_partial("https://idp1.example.com", &pending.request.id, None);
+        let outcome = orch.handle_response(&response).unwrap();
+        assert!(outcome.success);
+        assert!(outcome.partial);
+        assert!(orch.is_complete());
+        assert!(matches!(
+            orch.target_state("https://idp1.example.com"),
+            Some(TargetLogoutState::Failed { reason }) if reason == STATUS_PARTIAL_LOGOUT
+        ));
+
+        let progress = orch.progress();
+        assert_eq!(progress.successful_logouts, 0);
+        assert_eq!(
+            progress.failed_participants,
+            vec!["https://idp1.example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_orchestrator_failure_and_mark_failed() {
+        let mut orch = SpLogoutOrchestrator::new("https://sp.example.com");
+        orch.add_target(make_target("https://idp1.example.com"));
+        orch.add_target(make_target("https://idp2.example.com"));
+
+        // First target: error status
+        let pending = orch.next_request().unwrap().unwrap();
+        let response = create_logout_response(
+            &pending.entity_id,
+            &pending.request.id,
+            None,
+            Status {
+                status_code: StatusCode {
+                    value: "urn:oasis:names:tc:SAML:2.0:status:Responder".to_string(),
+                    sub_status: None,
+                },
+                status_message: None,
+                status_detail: None,
+            },
+        );
+        let outcome = orch.handle_response(&response).unwrap();
+        assert!(!outcome.success);
+
+        // Second target: transport failure
+        let pending = orch.next_request().unwrap().unwrap();
+        orch.mark_failed(&pending.entity_id, "connection refused");
+
+        assert!(orch.is_complete());
+        let progress = orch.progress();
+        assert_eq!(progress.successful_logouts, 0);
+        assert_eq!(progress.failed_participants.len(), 2);
+        assert!(matches!(
+            orch.target_state("https://idp2.example.com"),
+            Some(TargetLogoutState::Failed { .. })
+        ));
+    }
+
+    #[test]
+    fn test_orchestrator_rejects_unknown_in_response_to() {
+        let mut orch = SpLogoutOrchestrator::new("https://sp.example.com");
+        orch.add_target(make_target("https://idp1.example.com"));
+        let _ = orch.next_request().unwrap().unwrap();
+
+        let response = create_logout_response_success("https://idp1.example.com", "_unknown", None);
+        assert!(orch.handle_response(&response).is_err());
+    }
+
+    #[test]
+    fn test_orchestrator_rejects_issuer_mismatch() {
+        let mut orch = SpLogoutOrchestrator::new("https://sp.example.com");
+        orch.add_target(make_target("https://idp1.example.com"));
+        let pending = orch.next_request().unwrap().unwrap();
+
+        let response =
+            create_logout_response_success("https://evil.example.com", &pending.request.id, None);
+        assert!(orch.handle_response(&response).is_err());
     }
 
     #[test]

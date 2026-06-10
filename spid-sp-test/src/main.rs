@@ -379,6 +379,7 @@ async fn sp_login(state: web::Data<AppState>, query: web::Query<LoginParams>) ->
         protocol_binding: None,
         attribute_consuming_service_index: Some(0),
         provider_name: None,
+        extensions: None,
     };
 
     // Serialize to XML

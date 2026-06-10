@@ -74,6 +74,12 @@ pub enum ProfileError {
     #[error("missing PAOS header in ECP request")]
     MissingPaosHeader,
 
+    #[error("missing ecp:Request header in phase-1 ECP envelope")]
+    EcpMissingRequestHeader,
+
+    #[error("missing ecp:Response header in IdP response")]
+    EcpMissingResponseHeader,
+
     // --- Subject Confirmation errors ---
     #[error("subject confirmation method not supported: {0}")]
     UnsupportedConfirmationMethod(String),
@@ -103,6 +109,15 @@ pub enum ProfileError {
     // --- IdP Discovery errors ---
     #[error("invalid Common Domain Cookie value")]
     InvalidCommonDomainCookie,
+
+    #[error("discovery service request missing entityID parameter")]
+    DiscoveryMissingEntityId,
+
+    #[error("discovery service return URL is not registered in SP metadata: {0}")]
+    DiscoveryReturnUrlNotRegistered(String),
+
+    #[error("no discovery return URL: none in request and no DiscoveryResponse in metadata")]
+    DiscoveryNoReturnUrl,
 
     // --- General errors ---
     #[error("metadata error: {0}")]

@@ -206,16 +206,31 @@ pub fn build_bearer_confirmation(
             recipient: Some(recipient.to_string()),
             in_response_to: in_response_to.map(|s| s.to_string()),
             address: address.map(|s| s.to_string()),
+            key_info_x509_certs: vec![],
         }),
     }
 }
 
-/// Validate a holder-of-key SubjectConfirmation.
+/// Validate a holder-of-key SubjectConfirmation against the key the
+/// presenter actually proved possession of.
 ///
-/// Holder-of-Key requires the presenter to prove possession of the key
-/// referenced in the confirmation. This validates the structural requirements;
-/// actual key proof must be done at the transport or message level.
-pub fn validate_holder_of_key(confirmation: &SubjectConfirmation) -> ConfirmationResult {
+/// Per the SAML Holder-of-Key profiles, SubjectConfirmationData is of
+/// KeyInfoConfirmationDataType and carries one or more `ds:KeyInfo`
+/// elements identifying the subject's key. The presenter proves possession
+/// at the transport layer (TLS client authentication) or message layer; the
+/// relying party MUST then check that the proven key matches a key in the
+/// confirmation.
+///
+/// `presented_cert_der` is the DER encoding of the certificate the presenter
+/// authenticated with (e.g. the TLS client certificate). Pass `None` when no
+/// proof of possession is available — the confirmation is then rejected.
+pub fn validate_holder_of_key(
+    confirmation: &SubjectConfirmation,
+    presented_cert_der: Option<&[u8]>,
+) -> ConfirmationResult {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+
     if confirmation.method != constants::CM_HOLDER_OF_KEY {
         return ConfirmationResult {
             method: confirmation.method.clone(),
@@ -227,13 +242,68 @@ pub fn validate_holder_of_key(confirmation: &SubjectConfirmation) -> Confirmatio
         };
     }
 
-    // SubjectConfirmationData should contain ds:KeyInfo (represented in our
-    // model by the presence of SubjectConfirmationData). The actual key
-    // verification happens at a different layer.
-    ConfirmationResult {
+    let invalid = |reason: String| ConfirmationResult {
         method: constants::CM_HOLDER_OF_KEY.to_string(),
-        valid: true,
-        reason: None,
+        valid: false,
+        reason: Some(reason),
+    };
+
+    // SubjectConfirmationData with ds:KeyInfo MUST be present
+    let Some(data) = &confirmation.subject_confirmation_data else {
+        return invalid("missing SubjectConfirmationData".to_string());
+    };
+    if data.key_info_x509_certs.is_empty() {
+        return invalid(
+            "holder-of-key SubjectConfirmationData has no ds:KeyInfo X509Certificate".to_string(),
+        );
+    }
+
+    // The presenter must have proven possession of a key
+    let Some(presented) = presented_cert_der else {
+        return invalid("no client certificate presented for proof of possession".to_string());
+    };
+
+    // Compare DER bytes against each confirmed certificate
+    let matched = data.key_info_x509_certs.iter().any(|cert_b64| {
+        STANDARD
+            .decode(cert_b64)
+            .map(|der| der == presented)
+            .unwrap_or(false)
+    });
+
+    if matched {
+        ConfirmationResult {
+            method: constants::CM_HOLDER_OF_KEY.to_string(),
+            valid: true,
+            reason: None,
+        }
+    } else {
+        invalid("presented certificate does not match any holder-of-key KeyInfo".to_string())
+    }
+}
+
+/// Build a holder-of-key SubjectConfirmation binding the subject to a
+/// certificate (used by the IdP when issuing HoK assertions).
+pub fn build_holder_of_key_confirmation(
+    subject_cert_der: &[u8],
+    not_on_or_after: Option<DateTime<Utc>>,
+    recipient: Option<&str>,
+    in_response_to: Option<&str>,
+) -> SubjectConfirmation {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+
+    SubjectConfirmation {
+        method: constants::CM_HOLDER_OF_KEY.to_string(),
+        name_id: None,
+        subject_confirmation_data: Some(SubjectConfirmationData {
+            not_before: None,
+            not_on_or_after,
+            recipient: recipient.map(|s| s.to_string()),
+            in_response_to: in_response_to.map(|s| s.to_string()),
+            address: None,
+            key_info_x509_certs: vec![STANDARD.encode(subject_cert_der)],
+        }),
     }
 }
 
@@ -263,16 +333,22 @@ pub fn validate_sender_vouches(confirmation: &SubjectConfirmation) -> Confirmati
 }
 
 /// Validate any subject confirmation, dispatching by method.
+///
+/// `hok_presented_cert_der` is the DER certificate the presenter proved
+/// possession of (TLS client certificate), used for holder-of-key.
 pub fn validate_confirmation(
     confirmation: &SubjectConfirmation,
     bearer_params: Option<&BearerValidationParams<'_>>,
+    hok_presented_cert_der: Option<&[u8]>,
 ) -> Result<ConfirmationResult, ProfileError> {
     match confirmation.method.as_str() {
         m if m == constants::CM_BEARER => {
             let params = bearer_params.ok_or(ProfileError::BearerMissingConfirmationData)?;
             Ok(validate_bearer(confirmation, params))
         }
-        m if m == constants::CM_HOLDER_OF_KEY => Ok(validate_holder_of_key(confirmation)),
+        m if m == constants::CM_HOLDER_OF_KEY => {
+            Ok(validate_holder_of_key(confirmation, hok_presented_cert_der))
+        }
         m if m == constants::CM_SENDER_VOUCHES => Ok(validate_sender_vouches(confirmation)),
         other => Err(ProfileError::UnsupportedConfirmationMethod(
             other.to_string(),
@@ -299,6 +375,7 @@ mod tests {
                 recipient: Some(recipient.to_string()),
                 in_response_to: in_response_to.map(|s| s.to_string()),
                 address: None,
+                key_info_x509_certs: vec![],
             }),
         }
     }
@@ -419,13 +496,108 @@ mod tests {
     }
 
     #[test]
-    fn test_holder_of_key() {
+    fn test_holder_of_key_matching_cert() {
+        let cert_der: &[u8] = b"\x30\x82\x01\x00fake-der-cert";
+        let conf = build_holder_of_key_confirmation(cert_der, None, None, None);
+        let result = validate_holder_of_key(&conf, Some(cert_der));
+        assert!(result.valid, "expected valid, got: {:?}", result.reason);
+    }
+
+    #[test]
+    fn test_holder_of_key_wrong_cert() {
+        let conf = build_holder_of_key_confirmation(b"the-real-cert", None, None, None);
+        let result = validate_holder_of_key(&conf, Some(b"a-different-cert"));
+        assert!(!result.valid);
+        assert!(result.reason.unwrap().contains("does not match"));
+    }
+
+    #[test]
+    fn test_holder_of_key_no_presented_cert() {
+        let conf = build_holder_of_key_confirmation(b"the-real-cert", None, None, None);
+        let result = validate_holder_of_key(&conf, None);
+        assert!(!result.valid);
+        assert!(result.reason.unwrap().contains("no client certificate"));
+    }
+
+    #[test]
+    fn test_holder_of_key_missing_key_info() {
         let conf = SubjectConfirmation {
             method: constants::CM_HOLDER_OF_KEY.to_string(),
             name_id: None,
             subject_confirmation_data: None,
         };
-        let result = validate_holder_of_key(&conf);
+        let result = validate_holder_of_key(&conf, Some(b"cert"));
+        assert!(!result.valid);
+        assert!(result
+            .reason
+            .unwrap()
+            .contains("missing SubjectConfirmationData"));
+
+        let conf = SubjectConfirmation {
+            method: constants::CM_HOLDER_OF_KEY.to_string(),
+            name_id: None,
+            subject_confirmation_data: Some(SubjectConfirmationData {
+                not_before: None,
+                not_on_or_after: None,
+                recipient: None,
+                in_response_to: None,
+                address: None,
+                key_info_x509_certs: vec![],
+            }),
+        };
+        let result = validate_holder_of_key(&conf, Some(b"cert"));
+        assert!(!result.valid);
+        assert!(result.reason.unwrap().contains("no ds:KeyInfo"));
+    }
+
+    #[test]
+    fn test_holder_of_key_xml_roundtrip() {
+        use crate::core::assertion::subject::{Subject, SubjectRef};
+        use crate::xml::deserialize::SamlDeserialize;
+        use crate::xml::serialize::SamlSerialize;
+
+        let cert_der: &[u8] = b"roundtrip-cert";
+        let conf = build_holder_of_key_confirmation(
+            cert_der,
+            Some(Utc::now() + TimeDelta::minutes(5)),
+            Some("https://sp.example.com/acs"),
+            None,
+        );
+        let subject = Subject {
+            name_id: None,
+            subject_confirmations: vec![conf],
+        };
+
+        let xml = subject.to_xml_string().unwrap();
+        assert!(xml.contains("ds:KeyInfo"));
+        assert!(xml.contains("ds:X509Certificate"));
+
+        let wrapped =
+            format!(r#"<root xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">{xml}</root>"#);
+        let doc = uppsala::parse(&wrapped).unwrap();
+        let root = doc.document_element().unwrap();
+        let subject_node = doc
+            .first_child_element_by_name_ns(
+                root,
+                "urn:oasis:names:tc:SAML:2.0:assertion",
+                "Subject",
+            )
+            .unwrap();
+        let parsed = SubjectRef::from_xml(&doc, subject_node).unwrap().to_owned();
+
+        let confirmation = &parsed.subject_confirmations[0];
+        let data = confirmation.subject_confirmation_data.as_ref().unwrap();
+        assert_eq!(data.key_info_x509_certs.len(), 1);
+
+        let result = validate_holder_of_key(confirmation, Some(cert_der));
+        assert!(result.valid, "expected valid, got: {:?}", result.reason);
+    }
+
+    #[test]
+    fn test_holder_of_key_via_dispatch() {
+        let cert_der: &[u8] = b"dispatch-cert";
+        let conf = build_holder_of_key_confirmation(cert_der, None, None, None);
+        let result = validate_confirmation(&conf, None, Some(cert_der)).unwrap();
         assert!(result.valid);
     }
 
@@ -447,7 +619,7 @@ mod tests {
             name_id: None,
             subject_confirmation_data: None,
         };
-        let result = validate_confirmation(&conf, None);
+        let result = validate_confirmation(&conf, None, None);
         assert!(result.is_err());
     }
 }

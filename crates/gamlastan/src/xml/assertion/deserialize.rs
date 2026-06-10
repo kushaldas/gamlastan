@@ -119,12 +119,29 @@ impl<'a> SamlDeserialize<'a> for SubjectConfirmationDataRef<'a> {
         let recipient = optional_attribute(doc, node, "Recipient");
         let in_response_to = optional_attribute(doc, node, "InResponseTo");
         let address = optional_attribute(doc, node, "Address");
+
+        // KeyInfoConfirmationDataType (Holder-of-Key): one or more ds:KeyInfo
+        // children, each possibly carrying X509Data/X509Certificate.
+        let mut key_info_x509_certs = Vec::new();
+        for key_info in find_child_elements(doc, node, XMLDSIG_NS, "KeyInfo") {
+            for x509_data in find_child_elements(doc, key_info, XMLDSIG_NS, "X509Data") {
+                for cert in find_child_elements(doc, x509_data, XMLDSIG_NS, "X509Certificate") {
+                    let text = doc.text_content_deep(cert);
+                    let normalized: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+                    if !normalized.is_empty() {
+                        key_info_x509_certs.push(normalized);
+                    }
+                }
+            }
+        }
+
         Ok(SubjectConfirmationDataRef {
             not_before,
             not_on_or_after,
             recipient,
             in_response_to,
             address,
+            key_info_x509_certs,
         })
     }
 }

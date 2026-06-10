@@ -164,6 +164,7 @@ pub fn build_authn_request(
         proxy_count: opts.proxy_count,
         requester_ids: opts.requester_ids.clone(),
         attribute_consuming_service_index: opts.attribute_consuming_service_index,
+        extensions: None,
     };
 
     let mut request = sp_profile::create_authn_request(&builder_opts)?;

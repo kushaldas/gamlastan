@@ -147,6 +147,7 @@ mod tests {
                         recipient: Some("https://sp.example.com/acs"),
                         in_response_to: Some("_request_456"),
                         address: None,
+                        key_info_x509_certs: vec![],
                     }),
                 }],
             }),

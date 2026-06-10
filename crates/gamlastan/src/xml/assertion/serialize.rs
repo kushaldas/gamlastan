@@ -121,10 +121,31 @@ impl SamlSerialize for SubjectConfirmationData {
         if let Some(ref addr) = self.address {
             attrs.push(("Address", addr.clone()));
         }
-        w.empty_element_with(
-            "saml:SubjectConfirmationData",
-            attrs.iter().map(|(k, v)| (*k, v.as_str())),
-        );
+        if self.key_info_x509_certs.is_empty() {
+            w.empty_element_with(
+                "saml:SubjectConfirmationData",
+                attrs.iter().map(|(k, v)| (*k, v.as_str())),
+            );
+        } else {
+            // KeyInfoConfirmationDataType (Holder-of-Key)
+            w.start_element_with(
+                "saml:SubjectConfirmationData",
+                attrs.iter().map(|(k, v)| (*k, v.as_str())),
+            );
+            w.start_element(
+                "ds:KeyInfo",
+                &[("xmlns:ds", "http://www.w3.org/2000/09/xmldsig#")],
+            );
+            w.start_element("ds:X509Data", &[]);
+            for cert in &self.key_info_x509_certs {
+                w.start_element("ds:X509Certificate", &[]);
+                w.text(cert);
+                w.end_element("ds:X509Certificate");
+            }
+            w.end_element("ds:X509Data");
+            w.end_element("ds:KeyInfo");
+            w.end_element("saml:SubjectConfirmationData");
+        }
         Ok(())
     }
 }

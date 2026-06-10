@@ -286,6 +286,10 @@ impl<'a> SamlDeserialize<'a> for AuthnRequestRef<'a> {
             .map(|n| ScopingRef::from_xml(doc, n))
             .transpose()?;
 
+        // Optional Extensions (kept as raw XML; content is opaque here)
+        let extensions = find_child_element(doc, node, SAML_PROTOCOL_NS, "Extensions")
+            .and_then(|n| doc.node_source(n));
+
         Ok(AuthnRequestRef {
             base,
             subject,
@@ -300,6 +304,7 @@ impl<'a> SamlDeserialize<'a> for AuthnRequestRef<'a> {
             protocol_binding,
             attribute_consuming_service_index,
             provider_name,
+            extensions,
         })
     }
 }

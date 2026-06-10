@@ -18,6 +18,7 @@ pub use error::MetadataError;
 pub use signing::MetadataSigningProfile;
 pub use types::*;
 pub use validation::{
-    resolve_default_indexed_endpoint, resolve_endpoint_by_binding,
-    resolve_indexed_endpoint_by_binding, MetadataValidator,
+    binding_preferences, negotiate_endpoint_by_preference,
+    negotiate_indexed_endpoint_by_preference, resolve_default_indexed_endpoint,
+    resolve_endpoint_by_binding, resolve_indexed_endpoint_by_binding, MetadataValidator,
 };

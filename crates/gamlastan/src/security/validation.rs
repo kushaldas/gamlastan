@@ -886,6 +886,7 @@ mod tests {
                             recipient: Some("https://sp.example.com/acs".to_string()),
                             in_response_to: Some("_req_456".to_string()),
                             address: None,
+                            key_info_x509_certs: vec![],
                         }),
                     }],
                 }),
