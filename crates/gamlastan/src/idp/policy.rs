@@ -218,7 +218,6 @@ impl ReleasePolicy {
             .get(sp_entity_id)
             .and_then(&f)
             .or_else(|| self.entries.get(DEFAULT_ENTRY).and_then(&f))
-            .or_else(|| self.entries.get("").and_then(&f))
     }
 
     /// NameID format for the SP (default: transient).
@@ -358,11 +357,14 @@ impl ReleasePolicy {
             let req_local = self.local_key(&requested.attribute);
             let req_wire = requested.attribute.name.to_lowercase();
 
-            let matched = attributes.iter().find(|attr| {
+            // Assertion parsing does not merge duplicate Attribute elements,
+            // so collect every input attribute mapping to this requested name
+            // (by local or wire name) rather than just the first.
+            let mut matched = attributes.iter().filter(|attr| {
                 self.local_key(attr) == req_local || attr.name.to_lowercase() == req_wire
             });
 
-            let Some(attr) = matched else {
+            let Some(first) = matched.next() else {
                 if must && fail_on_unfulfilled {
                     return Err(PolicyError::MissingRequiredAttribute(
                         requested.attribute.name.clone(),
@@ -371,13 +373,23 @@ impl ReleasePolicy {
                 continue;
             };
 
+            // Union the values of any duplicate Attribute elements into the
+            // first match so released values are not silently dropped.
+            let mut released = first.clone();
+            for extra in matched {
+                for v in &extra.values {
+                    if !released.values.contains(v) {
+                        released.values.push(v.clone());
+                    }
+                }
+            }
+
             let wanted: Vec<String> = requested
                 .attribute
                 .values
                 .iter()
                 .filter_map(value_text)
                 .collect();
-            let mut released = attr.clone();
             if !wanted.is_empty() {
                 released
                     .values
@@ -700,6 +712,28 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert!(names.contains(&"mail".to_string()));
         assert!(names.contains(&"eduPersonPrincipalName".to_string()));
+    }
+
+    #[test]
+    fn test_filter_on_attributes_unions_duplicate_input_attributes() {
+        // Two separate Attribute elements both mapping to `mail` (assertion
+        // parsing does not merge them) must contribute all their values.
+        let policy = ReleasePolicy::new();
+        let optional = vec![requested(
+            "urn:oid:0.9.2342.19200300.100.1.3",
+            Some("mail"),
+            false,
+        )];
+        let attrs = vec![
+            mail_attribute(&["alice@example.com"]),
+            mail_attribute(&["alice@work.example"]),
+        ];
+        let out = policy
+            .filter_on_attributes(attrs, &[], &optional, false)
+            .unwrap();
+        assert_eq!(out.len(), 1);
+        let vals: Vec<&str> = out[0].values.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(vals, vec!["alice@example.com", "alice@work.example"]);
     }
 
     #[test]

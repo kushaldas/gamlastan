@@ -70,12 +70,14 @@ impl AssertionStore for InMemoryAssertionStore {
             .insert(assertion_id.clone(), assertion);
 
         if let Some(subject) = subject {
-            self.by_subject
-                .lock()
-                .unwrap()
-                .entry(subject)
-                .or_default()
-                .push(assertion_id);
+            let mut by_subject = self.by_subject.lock().unwrap();
+            let ids = by_subject.entry(subject).or_default();
+            // Re-storing the same assertion ID (overwriting in `by_id`) must
+            // not duplicate it in the subject index, or `assertions_for_subject`
+            // would return the assertion more than once.
+            if !ids.contains(&assertion_id) {
+                ids.push(assertion_id);
+            }
         }
     }
 
@@ -365,6 +367,17 @@ mod tests {
         store.remove_assertion("_a1");
         assert!(store.get_assertion("_a1").is_none());
         assert!(store.assertions_for_subject("alice").is_empty());
+    }
+
+    #[test]
+    fn test_store_same_id_twice_does_not_duplicate_subject_index() {
+        let store = InMemoryAssertionStore::new();
+        let a = assertion("_a1", "alice", "_s1", constants::AUTHN_CONTEXT_PASSWORD);
+        store.store_assertion(a.clone());
+        // Re-storing the same assertion ID (e.g. an update) must not make
+        // `assertions_for_subject` return it twice.
+        store.store_assertion(a);
+        assert_eq!(store.assertions_for_subject("alice").len(), 1);
     }
 
     #[test]
