@@ -543,6 +543,7 @@ mod tests {
                         recipient: Some(ACS.to_string()),
                         in_response_to: Some(REQ_ID.to_string()),
                         address: None,
+                        key_info_x509_certs: vec![],
                     }),
                 }],
             }),

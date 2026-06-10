@@ -175,12 +175,113 @@ pub fn resolve_indexed_endpoint_by_binding<'a>(
     endpoints.iter().find(|e| e.endpoint.binding == binding)
 }
 
+/// Negotiate an endpoint from an ordered list of binding preferences.
+///
+/// Returns the endpoint for the first preference that the peer supports
+/// (mirrors pysaml2's `pick_binding` / `preferred_binding` behavior).
+/// Returns `None` if no preferred binding is offered; callers may then fall
+/// back to `endpoints.first()` if any binding is acceptable.
+pub fn negotiate_endpoint_by_preference<'a>(
+    endpoints: &'a [Endpoint],
+    binding_preferences: &[&str],
+) -> Option<&'a Endpoint> {
+    binding_preferences
+        .iter()
+        .find_map(|binding| resolve_endpoint_by_binding(endpoints, binding))
+}
+
+/// Negotiate an indexed endpoint from an ordered list of binding preferences.
+pub fn negotiate_indexed_endpoint_by_preference<'a>(
+    endpoints: &'a [IndexedEndpoint],
+    binding_preferences: &[&str],
+) -> Option<&'a IndexedEndpoint> {
+    binding_preferences
+        .iter()
+        .find_map(|binding| resolve_indexed_endpoint_by_binding(endpoints, binding))
+}
+
+/// Default binding preference orders per service, mirroring pysaml2's
+/// `preferred_binding` configuration defaults.
+pub mod binding_preferences {
+    const HTTP_REDIRECT: &str = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect";
+    const HTTP_POST: &str = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST";
+    const HTTP_ARTIFACT: &str = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Artifact";
+    const SOAP: &str = "urn:oasis:names:tc:SAML:2.0:bindings:SOAP";
+
+    /// SingleSignOnService preference order.
+    pub const SINGLE_SIGN_ON: &[&str] = &[HTTP_REDIRECT, HTTP_POST, HTTP_ARTIFACT];
+
+    /// AssertionConsumerService preference order.
+    pub const ASSERTION_CONSUMER: &[&str] = &[HTTP_POST, HTTP_REDIRECT, HTTP_ARTIFACT];
+
+    /// SingleLogoutService preference order.
+    pub const SINGLE_LOGOUT: &[&str] = &[SOAP, HTTP_REDIRECT, HTTP_POST, HTTP_ARTIFACT];
+
+    /// ManageNameIDService preference order.
+    pub const MANAGE_NAME_ID: &[&str] = &[SOAP, HTTP_REDIRECT, HTTP_POST, HTTP_ARTIFACT];
+
+    /// ArtifactResolutionService preference order.
+    pub const ARTIFACT_RESOLUTION: &[&str] = &[SOAP];
+
+    /// NameIDMappingService / AttributeService / AuthnQueryService /
+    /// AuthzService preference order (back-channel only).
+    pub const BACK_CHANNEL_QUERY: &[&str] = &[SOAP];
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::metadata::types::endpoint::{Endpoint, IndexedEndpoint};
     use crate::metadata::types::entity_descriptor::{EntityDescriptor, EntityRoles};
     use crate::metadata::types::role_descriptor::{RoleDescriptorBase, SsoDescriptorBase};
+
+    #[test]
+    fn test_negotiate_endpoint_by_preference() {
+        let endpoints = vec![
+            Endpoint::new(
+                "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST",
+                "https://idp.example.com/sso/post",
+            ),
+            Endpoint::new(
+                "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect",
+                "https://idp.example.com/sso/redirect",
+            ),
+        ];
+
+        // Default SSO preference order picks Redirect first
+        let ep = negotiate_endpoint_by_preference(&endpoints, binding_preferences::SINGLE_SIGN_ON)
+            .unwrap();
+        assert!(ep.location.contains("redirect"));
+
+        // SLO order prefers SOAP, falls through to Redirect
+        let ep = negotiate_endpoint_by_preference(&endpoints, binding_preferences::SINGLE_LOGOUT)
+            .unwrap();
+        assert!(ep.location.contains("redirect"));
+
+        // No match when only unsupported bindings preferred
+        assert!(negotiate_endpoint_by_preference(
+            &endpoints,
+            binding_preferences::ARTIFACT_RESOLUTION
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_negotiate_indexed_endpoint_by_preference() {
+        let endpoints = vec![IndexedEndpoint::new(
+            Endpoint::new(
+                "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST",
+                "https://sp.example.com/acs",
+            ),
+            0,
+        )];
+        let ep = negotiate_indexed_endpoint_by_preference(
+            &endpoints,
+            binding_preferences::ASSERTION_CONSUMER,
+        )
+        .unwrap();
+        assert!(ep.endpoint.location.contains("acs"));
+    }
 
     fn make_sso_base() -> SsoDescriptorBase {
         SsoDescriptorBase {

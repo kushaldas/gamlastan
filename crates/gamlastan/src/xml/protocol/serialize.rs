@@ -207,6 +207,12 @@ impl SamlSerialize for AuthnRequest {
         write_issuer(w, &self.base.issuer)?;
         // Note: Signature is NOT serialized here - it's added by the signing layer
 
+        // Extensions come after Issuer/Signature per the protocol schema.
+        // The raw XML must be namespace self-contained.
+        if let Some(ref extensions) = self.extensions {
+            w.raw(extensions);
+        }
+
         if let Some(ref subject) = self.subject {
             subject.to_xml(w)?;
         }

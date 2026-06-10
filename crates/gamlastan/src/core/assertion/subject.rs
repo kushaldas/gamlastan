@@ -84,6 +84,9 @@ pub struct SubjectConfirmationDataRef<'a> {
     pub in_response_to: Option<&'a str>,
     /// The network address from which the assertion subject is expected.
     pub address: Option<&'a str>,
+    /// X.509 certificates from `ds:KeyInfo` children (KeyInfoConfirmationDataType,
+    /// used by Holder-of-Key). Base64 DER with whitespace removed.
+    pub key_info_x509_certs: Vec<String>,
 }
 
 impl<'a> SubjectConfirmationDataRef<'a> {
@@ -95,6 +98,7 @@ impl<'a> SubjectConfirmationDataRef<'a> {
             recipient: self.recipient.map(str::to_string),
             in_response_to: self.in_response_to.map(str::to_string),
             address: self.address.map(str::to_string),
+            key_info_x509_certs: self.key_info_x509_certs.clone(),
         }
     }
 }
@@ -112,6 +116,9 @@ pub struct SubjectConfirmationData {
     pub in_response_to: Option<String>,
     /// The network address from which the assertion subject is expected.
     pub address: Option<String>,
+    /// X.509 certificates from `ds:KeyInfo` children (KeyInfoConfirmationDataType,
+    /// used by Holder-of-Key). Base64 DER with whitespace removed.
+    pub key_info_x509_certs: Vec<String>,
 }
 
 #[cfg(test)]
@@ -132,6 +139,7 @@ mod tests {
                     recipient: Some("https://sp.example.com/acs"),
                     in_response_to: Some("_abc123"),
                     address: None,
+                    key_info_x509_certs: vec![],
                 }),
             }],
         };

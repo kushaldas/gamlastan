@@ -193,6 +193,10 @@ pub struct AuthnRequestRef<'a> {
     pub attribute_consuming_service_index: Option<u16>,
     /// Human-readable name of the SP.
     pub provider_name: Option<&'a str>,
+    /// Raw XML of the `samlp:Extensions` element (including the wrapper),
+    /// if present. Extension content is opaque to the core processor; see
+    /// `profiles::pefim` for a consumer.
+    pub extensions: Option<&'a str>,
 }
 
 impl<'a> AuthnRequestRef<'a> {
@@ -212,6 +216,7 @@ impl<'a> AuthnRequestRef<'a> {
             protocol_binding: self.protocol_binding.map(str::to_string),
             attribute_consuming_service_index: self.attribute_consuming_service_index,
             provider_name: self.provider_name.map(str::to_string),
+            extensions: self.extensions.map(str::to_string),
         }
     }
 }
@@ -245,6 +250,10 @@ pub struct AuthnRequest {
     pub attribute_consuming_service_index: Option<u16>,
     /// Human-readable name of the SP.
     pub provider_name: Option<String>,
+    /// Raw XML of the `samlp:Extensions` element (including the wrapper).
+    /// When set, it is emitted verbatim; the content must be namespace
+    /// self-contained (declare its own prefixes).
+    pub extensions: Option<String>,
 }
 
 #[cfg(test)]
@@ -286,6 +295,7 @@ mod tests {
             protocol_binding: Some(BINDING_HTTP_POST),
             attribute_consuming_service_index: None,
             provider_name: Some("Example SP"),
+            extensions: None,
         };
 
         let owned = req.to_owned();

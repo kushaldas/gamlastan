@@ -21,6 +21,7 @@ pub mod idp_discovery;
 pub mod logout;
 pub mod name_id_mapping;
 pub mod name_id_mgmt;
+pub mod pefim;
 pub mod session;
 pub mod sso;
 pub mod swedenconnect;

@@ -100,6 +100,7 @@ pub fn create_authn_request(options: &AuthnRequestOptions) -> Result<AuthnReques
         protocol_binding: options.protocol_binding.clone(),
         attribute_consuming_service_index: options.attribute_consuming_service_index,
         provider_name: options.provider_name.clone(),
+        extensions: options.extensions.clone(),
     })
 }
 
@@ -328,6 +329,7 @@ mod tests {
                         recipient: Some(acs_url.to_string()),
                         in_response_to: request_id.map(|s| s.to_string()),
                         address: None,
+                        key_info_x509_certs: vec![],
                     }),
                 }],
             }),

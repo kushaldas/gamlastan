@@ -105,6 +105,10 @@ pub struct AuthnRequestOptions {
 
     /// AttributeConsumingServiceIndex.
     pub attribute_consuming_service_index: Option<u16>,
+
+    /// Raw XML of the `samlp:Extensions` element (including the wrapper).
+    /// Must be namespace self-contained; see `profiles::pefim` for a builder.
+    pub extensions: Option<String>,
 }
 
 /// Options for creating a Response (IdP-side).

@@ -61,6 +61,10 @@ pub struct ProcessedAuthnRequest {
 
     /// AttributeConsumingServiceIndex.
     pub attribute_consuming_service_index: Option<u16>,
+
+    /// Raw XML of the request's `samlp:Extensions` element, if present
+    /// (e.g. PEFIM SPCertEnc; see `profiles::pefim`).
+    pub extensions: Option<String>,
 }
 
 /// Process an incoming AuthnRequest on the IdP side.
@@ -117,6 +121,7 @@ pub fn process_authn_request(
         requested_authn_context_class_refs,
         authn_context_comparison,
         attribute_consuming_service_index: request.attribute_consuming_service_index,
+        extensions: request.extensions.clone(),
     })
 }
 
@@ -208,6 +213,7 @@ pub fn create_response(
             recipient: Some(options.acs_url.clone()),
             in_response_to: options.in_response_to.clone(),
             address: options.client_address.clone(),
+            key_info_x509_certs: vec![],
         }),
     };
 
@@ -426,6 +432,7 @@ mod tests {
             protocol_binding: Some("urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST".to_string()),
             attribute_consuming_service_index: None,
             provider_name: Some("Test SP".to_string()),
+            extensions: None,
         }
     }
 
