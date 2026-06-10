@@ -9,9 +9,15 @@
 // Rule modifiers (per pysaml2):
 // - `only_required`: release only the subset of the list the SP also marks
 //   as required in its AttributeConsumingService (CoCo semantics).
-// - `no_aggregation`: when the rule matches, its list *replaces* everything
-//   accumulated so far instead of adding to it (REFEDS anonymous /
-//   pseudonymous / personalized access semantics).
+// - `conflicts`: the rule does *not* match if any of these category URIs is
+//   also present on the SP. This is how the REFEDS Access categories
+//   (personalized / pseudonymous / anonymous) are expressed: each may be
+//   combined with *other* categories (R&S, CoCo, …), and if an SP publishes
+//   multiple access categories the most restrictive declared rule wins.
+//   pysaml2 introduced this `required` + `conflicts` matcher on its
+//   `ft-typing` / `ft-refeds_ec` branches after finding that the previous
+//   "replace the accumulated set" model could not express these categories
+//   (commit 04f841cb temporarily disabled them). See ADR 0014.
 
 use std::collections::HashSet;
 
@@ -22,10 +28,23 @@ pub struct EntityCategoryRule {
     pub categories: &'static [&'static str],
     /// Local (friendly) attribute names released by this rule.
     pub attributes: &'static [&'static str],
+    /// Category URIs that must *not* be present on the SP for this rule to
+    /// match (pysaml2's `EntityCategoryMatcher.conflicts`).
+    pub conflicts: &'static [&'static str],
     /// Release only attributes the SP also requires (CoCo).
     pub only_required: bool,
-    /// On match, replace the accumulated release set instead of extending it.
-    pub no_aggregation: bool,
+}
+
+impl EntityCategoryRule {
+    /// Whether this rule matches the SP's set of entity categories: every
+    /// `categories` URI present and no `conflicts` URI present
+    /// (pysaml2 `EntityCategoryMatcher.matches`).
+    fn matches(&self, sp_categories: &HashSet<&str>) -> bool {
+        if self.conflicts.iter().any(|c| sp_categories.contains(c)) {
+            return false;
+        }
+        self.categories.iter().all(|c| sp_categories.contains(c))
+    }
 }
 
 /// A federation's set of release rules.
@@ -72,6 +91,69 @@ pub const SWAMID_HEI: &str = "http://www.swamid.se/category/hei-service";
 pub const AT_EGOV_PVP2: &str = "http://www.ref.gv.at/ns/names/agiz/pvp/egovtoken";
 /// Austrian e-government PVP2 charge token.
 pub const AT_EGOV_PVP2_CHARGE: &str = "http://www.ref.gv.at/ns/names/agiz/pvp/egovtoken-charge";
+
+// ── Subject identifier profile (subject-id / pairwise-id) ────────────────────
+
+/// The `subject-id` attribute (OASIS Subject Identifiers profile).
+pub const SUBJECT_ID_ATTR: &str = "urn:oasis:names:tc:SAML:attribute:subject-id";
+/// The `pairwise-id` attribute (OASIS Subject Identifiers profile).
+pub const PAIRWISE_ID_ATTR: &str = "urn:oasis:names:tc:SAML:attribute:pairwise-id";
+/// The `subject-id:req` SP metadata entity attribute that declares which
+/// subject identifier(s) an SP requests.
+pub const SUBJECT_ID_REQ_ATTR: &str = "urn:oasis:names:tc:SAML:profiles:subject-id:req";
+
+/// An SP's requested subject identifier, read from the `subject-id:req`
+/// entity attribute in its metadata (pysaml2 `subject_id_requirement_type`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SubjectIdReq {
+    /// No subject identifier requested: either no `subject-id:req` entity
+    /// attribute was declared or the SP explicitly used the metadata value
+    /// `none`.
+    #[default]
+    None,
+    /// `subject-id` — only the non-pairwise subject identifier.
+    SubjectId,
+    /// `pairwise-id` — only the pairwise subject identifier.
+    PairwiseId,
+    /// `any` — either subject identifier is acceptable.
+    Any,
+}
+
+impl SubjectIdReq {
+    /// Parse the `subject-id:req` value as published in SP metadata. Unknown
+    /// values (and the empty set) map to [`SubjectIdReq::None`]; the first
+    /// recognized value wins, case-insensitively. The metadata value `none`
+    /// also maps to [`SubjectIdReq::None`].
+    pub fn from_metadata_values(values: &[String]) -> Self {
+        for value in values {
+            let normalized = value.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "any" => return SubjectIdReq::Any,
+                "none" => return SubjectIdReq::None,
+                "subject-id" => return SubjectIdReq::SubjectId,
+                "pairwise-id" => return SubjectIdReq::PairwiseId,
+                _ => continue,
+            }
+        }
+        SubjectIdReq::None
+    }
+}
+
+/// pysaml2 PR #987 ("do not assert both subject-id and pairwise-id"): when an
+/// SP requests subject-id with requirement `any` and *both* `subject-id` and
+/// `pairwise-id` would be released, drop `subject-id` and keep only the more
+/// privacy-preserving `pairwise-id`. Operates on the lowercased local-name
+/// release set. This is intentionally scoped to `subject-id:req=any`; the
+/// profile standardizes the metadata signal but does not define asserting-party
+/// behavior for other values. See ADR 0015.
+pub fn prefer_pairwise_over_subject_id(req: SubjectIdReq, released: &mut HashSet<String>) {
+    if req != SubjectIdReq::Any {
+        return;
+    }
+    if released.contains("pairwise-id") && released.contains("subject-id") {
+        released.remove("subject-id");
+    }
+}
 
 // ── Attribute lists ─────────────────────────────────────────────────────────
 
@@ -237,13 +319,13 @@ pub static EDUGAIN: EntityCategoryPolicy = EntityCategoryPolicy {
             categories: &[],
             attributes: &["eduPersonTargetedID"],
             only_required: false,
-            no_aggregation: false,
+            conflicts: &[],
         },
         EntityCategoryRule {
             categories: &[COCO_V1],
             attributes: COCO_V1_ATTRIBUTES,
             only_required: true,
-            no_aggregation: false,
+            conflicts: &[],
         },
     ],
 };
@@ -256,13 +338,13 @@ pub static REFEDS: EntityCategoryPolicy = EntityCategoryPolicy {
             categories: &[],
             attributes: &["eduPersonTargetedID"],
             only_required: false,
-            no_aggregation: false,
+            conflicts: &[],
         },
         EntityCategoryRule {
             categories: &[REFEDS_RESEARCH_AND_SCHOLARSHIP],
             attributes: REFEDS_RS_ATTRIBUTES,
             only_required: false,
-            no_aggregation: false,
+            conflicts: &[],
         },
     ],
 };
@@ -275,22 +357,25 @@ pub static INCOMMON: EntityCategoryPolicy = EntityCategoryPolicy {
             categories: &[],
             attributes: &["eduPersonTargetedID"],
             only_required: false,
-            no_aggregation: false,
+            conflicts: &[],
         },
         EntityCategoryRule {
             categories: &[INCOMMON_RESEARCH_AND_SCHOLARSHIP],
             attributes: REFEDS_RS_ATTRIBUTES,
             only_required: false,
-            no_aggregation: false,
+            conflicts: &[],
         },
     ],
 };
 
 /// SWAMID release policy (ported from pysaml2's swamid policy).
 ///
-/// Like pysaml2, the REFEDS personalized/pseudonymous/anonymous access
-/// no-aggregation rules are *not* part of the default rule set; see
-/// [`REFEDS_ACCESS_RULES`] to opt in.
+/// As on pysaml2's `ft-typing` / `ft-refeds_ec` branches, the REFEDS
+/// personalized/pseudonymous/anonymous access rules are part of the default
+/// rule set. They are conflict-aware, so they never combine with one another;
+/// if an SP publishes multiple REFEDS Access categories, the most restrictive
+/// declared rule wins. [`REFEDS_ACCESS_RULES`] exposes just those three for
+/// deployments that want them in isolation.
 pub static SWAMID: EntityCategoryPolicy = EntityCategoryPolicy {
     name: "swamid",
     rules: &[
@@ -298,92 +383,115 @@ pub static SWAMID: EntityCategoryPolicy = EntityCategoryPolicy {
             categories: &[SWAMID_SFS_1993_1153],
             attributes: &["norEduPersonNIN", "eduPersonAssurance"],
             only_required: false,
-            no_aggregation: false,
+            conflicts: &[],
         },
         EntityCategoryRule {
             categories: &[SWAMID_RESEARCH_AND_EDUCATION, SWAMID_EU],
             attributes: SWAMID_NAME_ORG_OTHER,
             only_required: false,
-            no_aggregation: false,
+            conflicts: &[],
         },
         EntityCategoryRule {
             categories: &[SWAMID_RESEARCH_AND_EDUCATION, SWAMID_NREN],
             attributes: SWAMID_NAME_ORG_OTHER,
             only_required: false,
-            no_aggregation: false,
+            conflicts: &[],
         },
         EntityCategoryRule {
             categories: &[SWAMID_RESEARCH_AND_EDUCATION, SWAMID_HEI],
             attributes: SWAMID_NAME_ORG_OTHER,
             only_required: false,
-            no_aggregation: false,
+            conflicts: &[],
         },
         EntityCategoryRule {
             categories: &[REFEDS_RESEARCH_AND_SCHOLARSHIP],
             attributes: SWAMID_R_AND_S,
             only_required: false,
-            no_aggregation: false,
+            conflicts: &[],
         },
         EntityCategoryRule {
             categories: &[COCO_V1],
             attributes: GEANT_COCO,
             only_required: true,
-            no_aggregation: false,
+            conflicts: &[],
         },
         EntityCategoryRule {
             categories: &[COCO_V2],
             attributes: GEANT_COCO,
             only_required: true,
-            no_aggregation: false,
+            conflicts: &[],
         },
         EntityCategoryRule {
             categories: &[MYACADEMICID_ESI],
             attributes: ESI_ATTRIBUTES,
             only_required: false,
-            no_aggregation: false,
+            conflicts: &[],
         },
         EntityCategoryRule {
             categories: &[MYACADEMICID_ESI, COCO_V1],
             attributes: ESI_AND_COCO,
             only_required: true,
-            no_aggregation: false,
+            conflicts: &[],
         },
         EntityCategoryRule {
             categories: &[MYACADEMICID_ESI, COCO_V2],
             attributes: ESI_AND_COCO,
             only_required: true,
-            no_aggregation: false,
+            conflicts: &[],
         },
+        // REFEDS Access categories (pysaml2 swamid `RESTRICTIONS`): active by
+        // default now that the matcher understands `conflicts`.
+        REFEDS_PERSONALIZED_RULE,
+        REFEDS_PSEUDONYMOUS_RULE,
+        REFEDS_ANONYMOUS_RULE,
     ],
 };
 
-/// REFEDS personalized / pseudonymous / anonymous access rules.
+// REFEDS Access category rules (pysaml2 swamid `RESTRICTIONS`). Each requires
+// its own category and *conflicts* with the more restrictive ones, so at most
+// one access rule contributes even if an SP publishes multiple access
+// categories, while each still combines with R&S, CoCo, etc. (see ADR 0014).
+// Defined as shared consts so they appear both standalone in
+// [`REFEDS_ACCESS_RULES`] and folded into the default [`SWAMID`] policy.
+const REFEDS_PERSONALIZED_RULE: EntityCategoryRule = EntityCategoryRule {
+    categories: &[REFEDS_PERSONALIZED],
+    attributes: REFEDS_PERSONALIZED_ACCESS,
+    conflicts: &[REFEDS_PSEUDONYMOUS, REFEDS_ANONYMOUS],
+    only_required: false,
+};
+
+const REFEDS_PSEUDONYMOUS_RULE: EntityCategoryRule = EntityCategoryRule {
+    categories: &[REFEDS_PSEUDONYMOUS],
+    attributes: REFEDS_PSEUDONYMOUS_ACCESS,
+    conflicts: &[REFEDS_ANONYMOUS],
+    only_required: false,
+};
+
+const REFEDS_ANONYMOUS_RULE: EntityCategoryRule = EntityCategoryRule {
+    categories: &[REFEDS_ANONYMOUS],
+    attributes: REFEDS_ANONYMOUS_ACCESS,
+    conflicts: &[],
+    only_required: false,
+};
+
+/// REFEDS personalized / pseudonymous / anonymous access rules as a standalone
+/// policy.
 ///
-/// pysaml2 ships these disabled inside the swamid module ("until we can
-/// figure out how to handle them"); they are exposed here as a standalone
-/// policy so deployments can opt in. Ordered least to most restrictive; each
-/// is a no-aggregation rule (on match it replaces the accumulated set).
+/// pysaml2 originally shipped these disabled inside the swamid module ("until
+/// we can figure out how to handle them") because its old model could not
+/// combine them with other categories without also combining them with each
+/// other. With the conflict-aware matcher they are now active by default in
+/// [`SWAMID`]; this standalone policy remains for deployments that want only
+/// the REFEDS Access rules. If an SP publishes multiple REFEDS Access
+/// categories, the most restrictive declared rule wins (personalized yields to
+/// pseudonymous/anonymous; pseudonymous yields to anonymous), and the winning
+/// rule still aggregates with non-conflicting categories.
 pub static REFEDS_ACCESS_RULES: EntityCategoryPolicy = EntityCategoryPolicy {
     name: "refeds-access",
     rules: &[
-        EntityCategoryRule {
-            categories: &[REFEDS_PERSONALIZED],
-            attributes: REFEDS_PERSONALIZED_ACCESS,
-            only_required: false,
-            no_aggregation: true,
-        },
-        EntityCategoryRule {
-            categories: &[REFEDS_PSEUDONYMOUS],
-            attributes: REFEDS_PSEUDONYMOUS_ACCESS,
-            only_required: false,
-            no_aggregation: true,
-        },
-        EntityCategoryRule {
-            categories: &[REFEDS_ANONYMOUS],
-            attributes: REFEDS_ANONYMOUS_ACCESS,
-            only_required: false,
-            no_aggregation: true,
-        },
+        REFEDS_PERSONALIZED_RULE,
+        REFEDS_PSEUDONYMOUS_RULE,
+        REFEDS_ANONYMOUS_RULE,
     ],
 };
 
@@ -395,13 +503,13 @@ pub static AT_EGOV_PVP2_POLICY: EntityCategoryPolicy = EntityCategoryPolicy {
             categories: &[AT_EGOV_PVP2],
             attributes: EGOVTOKEN,
             only_required: false,
-            no_aggregation: false,
+            conflicts: &[],
         },
         EntityCategoryRule {
             categories: &[AT_EGOV_PVP2_CHARGE],
             attributes: CHARGEATTR,
             only_required: false,
-            no_aggregation: false,
+            conflicts: &[],
         },
     ],
 };
@@ -425,11 +533,10 @@ pub fn releasable_attributes(
 
     for policy in policies {
         for rule in policy.rules {
-            let matches = rule.categories.iter().all(|c| ecs.contains(c));
-            if !matches {
+            if !rule.matches(&ecs) {
                 continue;
             }
-            let attrs: Vec<String> = rule
+            let attrs = rule
                 .attributes
                 .iter()
                 .map(|a| a.to_lowercase())
@@ -439,11 +546,7 @@ pub fn releasable_attributes(
                     !rule.only_required
                         || rule.categories.is_empty()
                         || required_local_names.contains(a)
-                })
-                .collect();
-            if !attrs.is_empty() && rule.no_aggregation {
-                released.clear();
-            }
+                });
             released.extend(attrs);
         }
     }
@@ -511,21 +614,131 @@ mod tests {
     }
 
     #[test]
-    fn test_no_aggregation_replaces() {
-        // R&S plus anonymous access: the no-aggregation anonymous rule wipes
-        // the accumulated R&S attributes.
+    fn test_refeds_access_combines_with_other_categories() {
+        // R&S plus anonymous access: anonymous does *not* conflict with R&S,
+        // so both rules contribute (it no longer wipes the R&S attributes).
         let released = releasable_attributes(
             &[&REFEDS, &REFEDS_ACCESS_RULES],
             &cats(&[REFEDS_RESEARCH_AND_SCHOLARSHIP, REFEDS_ANONYMOUS]),
             &[],
         );
-        assert_eq!(
-            released,
-            ["edupersonscopedaffiliation", "schachomeorganization"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect()
+        // anonymous access attributes
+        assert!(released.contains("edupersonscopedaffiliation"));
+        assert!(released.contains("schachomeorganization"));
+        // R&S attributes are still present (aggregated, not replaced)
+        assert!(released.contains("mail"));
+        assert!(released.contains("givenname"));
+    }
+
+    #[test]
+    fn test_refeds_access_prefers_more_restrictive_category() {
+        // personalized yields to pseudonymous: only the pseudonymous rule
+        // contributes.
+        let released = releasable_attributes(
+            &[&REFEDS_ACCESS_RULES],
+            &cats(&[REFEDS_PERSONALIZED, REFEDS_PSEUDONYMOUS]),
+            &[],
         );
+        assert!(!released.contains("subject-id"));
+        assert!(!released.contains("displayname"));
+        assert!(released.contains("pairwise-id"));
+        assert!(released.contains("edupersonscopedaffiliation"));
+
+        // personalized also yields to anonymous.
+        let released = releasable_attributes(
+            &[&REFEDS_ACCESS_RULES],
+            &cats(&[REFEDS_PERSONALIZED, REFEDS_ANONYMOUS]),
+            &[],
+        );
+        // personalized-only attributes must not leak.
+        assert!(!released.contains("subject-id"));
+        assert!(!released.contains("displayname"));
+        assert!(!released.contains("givenname"));
+        // anonymous attributes are released.
+        assert!(released.contains("edupersonscopedaffiliation"));
+        assert!(released.contains("schachomeorganization"));
+
+        // pseudonymous yields to anonymous.
+        let released = releasable_attributes(
+            &[&REFEDS_ACCESS_RULES],
+            &cats(&[REFEDS_PSEUDONYMOUS, REFEDS_ANONYMOUS]),
+            &[],
+        );
+        assert!(!released.contains("pairwise-id"));
+        assert!(released.contains("edupersonscopedaffiliation"));
+    }
+
+    #[test]
+    fn test_refeds_personalized_alone_releases_its_attributes() {
+        let released =
+            releasable_attributes(&[&REFEDS_ACCESS_RULES], &cats(&[REFEDS_PERSONALIZED]), &[]);
+        assert!(released.contains("subject-id"));
+        assert!(released.contains("displayname"));
+        assert!(released.contains("edupersonscopedaffiliation"));
+    }
+
+    #[test]
+    fn test_swamid_default_includes_refeds_access() {
+        // The REFEDS access rules are now part of the default SWAMID policy.
+        let released = releasable_attributes(&[&SWAMID], &cats(&[REFEDS_PSEUDONYMOUS]), &[]);
+        assert!(released.contains("pairwise-id"));
+        assert!(released.contains("schachomeorganization"));
+    }
+
+    #[test]
+    fn test_subject_id_req_parsing() {
+        assert_eq!(
+            SubjectIdReq::from_metadata_values(&["any".to_string()]),
+            SubjectIdReq::Any
+        );
+        assert_eq!(
+            SubjectIdReq::from_metadata_values(&[" Any ".to_string()]),
+            SubjectIdReq::Any
+        );
+        assert_eq!(
+            SubjectIdReq::from_metadata_values(&["none".to_string()]),
+            SubjectIdReq::None
+        );
+        assert_eq!(
+            SubjectIdReq::from_metadata_values(&["pairwise-id".to_string()]),
+            SubjectIdReq::PairwiseId
+        );
+        assert_eq!(
+            SubjectIdReq::from_metadata_values(&["SUBJECT-ID".to_string()]),
+            SubjectIdReq::SubjectId
+        );
+        assert_eq!(SubjectIdReq::from_metadata_values(&[]), SubjectIdReq::None);
+        assert_eq!(
+            SubjectIdReq::from_metadata_values(&["bogus".to_string()]),
+            SubjectIdReq::None
+        );
+    }
+
+    #[test]
+    fn test_prefer_pairwise_over_subject_id() {
+        // req == any and both present: subject-id dropped.
+        let mut set: HashSet<String> = ["subject-id", "pairwise-id", "mail"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        prefer_pairwise_over_subject_id(SubjectIdReq::Any, &mut set);
+        assert!(!set.contains("subject-id"));
+        assert!(set.contains("pairwise-id"));
+        assert!(set.contains("mail"));
+
+        // req != any: no change even if both present.
+        let mut set: HashSet<String> = ["subject-id", "pairwise-id"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        prefer_pairwise_over_subject_id(SubjectIdReq::None, &mut set);
+        assert!(set.contains("subject-id"));
+        assert!(set.contains("pairwise-id"));
+
+        // only subject-id present: kept (nothing to prefer).
+        let mut set: HashSet<String> = ["subject-id"].iter().map(|s| s.to_string()).collect();
+        prefer_pairwise_over_subject_id(SubjectIdReq::Any, &mut set);
+        assert!(set.contains("subject-id"));
     }
 
     #[test]
