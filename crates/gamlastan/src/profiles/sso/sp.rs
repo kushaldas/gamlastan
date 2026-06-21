@@ -207,8 +207,13 @@ pub fn process_response_with_verified_signatures(
         ));
     }
 
-    // Must have at least one assertion
-    if response.assertions.is_empty() && response.encrypted_assertions.is_empty() {
+    ensure_processable_assertions(response, config)?;
+
+    // Must have at least one plaintext assertion. EncryptedAssertion elements
+    // are opaque at this layer and are intentionally not treated as usable
+    // assertions until a profile-specific decryption step has produced
+    // plaintext Assertion values.
+    if response.assertions.is_empty() {
         return Err(ProfileError::NoAssertions);
     }
 
@@ -303,6 +308,33 @@ pub fn process_response_with_verified_signatures(
     })
 }
 
+/// Ensure this generic SP processor is not asked to validate opaque encrypted data.
+///
+/// `process_response` validates and extracts identity from plaintext
+/// `Assertion` values. It does not decrypt `EncryptedAssertion` elements and
+/// it also does not track whether a later plaintext assertion originally came
+/// from encryption. Failing here prevents `require_encrypted_assertions` from
+/// being satisfied by mere encrypted markup that this function cannot inspect.
+fn ensure_processable_assertions(
+    response: &Response,
+    config: &SecurityConfig,
+) -> Result<(), ProfileError> {
+    if config.require_encrypted_assertions {
+        return Err(ProfileError::Other(
+            "require_encrypted_assertions is enabled, but process_response does not decrypt or prove EncryptedAssertion provenance".to_string(),
+        ));
+    }
+
+    if response.assertions.is_empty() && !response.encrypted_assertions.is_empty() {
+        return Err(ProfileError::Other(
+            "response contains EncryptedAssertion elements but no decrypted plaintext Assertion"
+                .to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
 /// Extract NameID from assertion's Subject.
 fn extract_name_id(
     assertion: &crate::core::assertion::types::Assertion,
@@ -333,7 +365,7 @@ mod tests {
     use crate::core::assertion::conditions::{AudienceRestriction, Conditions};
     use crate::core::assertion::name_id::NameId;
     use crate::core::assertion::subject::{Subject, SubjectConfirmation, SubjectConfirmationData};
-    use crate::core::assertion::types::Assertion;
+    use crate::core::assertion::types::{Assertion, EncryptedAssertion};
     use crate::core::constants;
     use crate::core::protocol::response::ResponseBase;
     use crate::core::protocol::status::{Status, StatusCode};
@@ -623,6 +655,80 @@ mod tests {
             Utc::now(),
         );
         assert!(matches!(result, Err(ProfileError::NoAssertions)));
+    }
+
+    #[test]
+    fn test_process_response_rejects_encrypted_only_response() {
+        let response = Response {
+            base: ResponseBase {
+                id: "_resp1".to_string(),
+                version: SamlVersion::V2_0,
+                issue_instant: Utc::now(),
+                destination: None,
+                consent: None,
+                issuer: None,
+                has_signature: false,
+                in_response_to: None,
+                status: Status::success(),
+            },
+            assertions: vec![],
+            encrypted_assertions: vec![EncryptedAssertion {
+                raw: b"<saml:EncryptedAssertion/>".to_vec(),
+            }],
+        };
+
+        let config = SecurityConfig::permissive();
+        let result = process_response(
+            &response,
+            &config,
+            None,
+            "https://sp.example.com",
+            "https://sp.example.com/acs",
+            None,
+            "https://idp.example.com",
+            Utc::now(),
+        );
+
+        match result.unwrap_err() {
+            ProfileError::Other(message) => {
+                assert!(message.contains("EncryptedAssertion"));
+                assert!(message.contains("decrypted plaintext Assertion"));
+            }
+            e => panic!("unexpected error: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_process_response_rejects_require_encrypted_assertions_without_provenance() {
+        let now = Utc::now();
+        let assertion = make_test_assertion(
+            "https://sp.example.com",
+            "https://sp.example.com/acs",
+            None,
+            now,
+        );
+        let response = make_test_response(assertion, None);
+        let mut config = SecurityConfig::permissive();
+        config.require_encrypted_assertions = true;
+
+        let result = process_response(
+            &response,
+            &config,
+            None,
+            "https://sp.example.com",
+            "https://sp.example.com/acs",
+            None,
+            "https://idp.example.com",
+            now,
+        );
+
+        match result.unwrap_err() {
+            ProfileError::Other(message) => {
+                assert!(message.contains("require_encrypted_assertions"));
+                assert!(message.contains("does not decrypt"));
+            }
+            e => panic!("unexpected error: {e}"),
+        }
     }
 
     #[test]
