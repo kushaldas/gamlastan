@@ -309,6 +309,7 @@ pub fn process_response(
     // threading the externally-performed response signature verification.
     let security = cfg.security_config();
     let validator = AssertionValidator::new(&security).with_replay_cache(params.replay_cache);
+    let verified_signed_ids = [response.base.id.as_str()];
     let validation_params = ValidationParams {
         received_url: params.received_url,
         expected_idp_entity_id: params.expected_idp_entity_id,
@@ -319,6 +320,7 @@ pub fn process_response(
         relay_state: params.relay_state,
         response_signature_xml: None,
         response_signature_verified: Some(true),
+        verified_signed_ids: &verified_signed_ids,
         current_proxy_depth: 0,
         now: params.now,
     };

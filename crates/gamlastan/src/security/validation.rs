@@ -92,6 +92,12 @@ pub struct ValidationParams<'a> {
     pub response_signature_xml: Option<&'a str>,
     /// Whether the response-level signature was cryptographically verified.
     pub response_signature_verified: Option<bool>,
+    /// IDs whose XML-DSig references were cryptographically verified.
+    ///
+    /// These IDs must come from trusted XML-DSig verification over the exact
+    /// response XML being validated. Signature element presence alone is not
+    /// sufficient for this list.
+    pub verified_signed_ids: &'a [&'a str],
     /// Current proxy depth (for ProxyRestriction check).
     pub current_proxy_depth: u32,
     /// The current time (allows injection for testing).
@@ -143,7 +149,7 @@ impl<'a> AssertionValidator<'a> {
 
         // === Assertion-level checks ===
         for assertion in &response.assertions {
-            self.check_assertion_level(assertion, params, &mut result);
+            self.check_assertion_level(response, assertion, params, &mut result);
         }
 
         // === RelayState checks (31-32) ===
@@ -281,6 +287,7 @@ impl<'a> AssertionValidator<'a> {
     /// Run assertion-level checks (5-27) for a single assertion.
     fn check_assertion_level(
         &self,
+        response: &Response,
         assertion: &Assertion,
         params: &ValidationParams<'_>,
         result: &mut ValidationResult,
@@ -301,18 +308,47 @@ impl<'a> AssertionValidator<'a> {
 
         // Check 6: Signature valid (MUST for POST)
         if assertion.has_signature {
-            // Signature presence is noted; actual cryptographic verification
-            // is delegated to gamlastan crypto and is expected to be done before
-            // calling this validator.
-            result.add(ValidationCheck::pass(6, "Assertion signature present"));
+            // A forged assertion can include a syntactically valid-looking
+            // `<ds:Signature>` element. Accept it only when XML-DSig verification
+            // proved that either this assertion ID or the enclosing response ID
+            // was actually signed by a trusted key.
+            if params.verified_signed_ids.contains(&assertion.id.as_str())
+                || params
+                    .verified_signed_ids
+                    .contains(&response.base.id.as_str())
+            {
+                result.add(ValidationCheck::pass(
+                    6,
+                    "Assertion protected by verified signature",
+                ));
+            } else {
+                result.add(ValidationCheck::fail(
+                    6,
+                    "Assertion protected by verified signature",
+                    "Assertion has signature markup but no verified signature references this assertion or its enclosing response",
+                ));
+            }
         } else if self.config.require_signed_assertions {
-            result.add(ValidationCheck::fail(
-                6,
-                "Assertion signature present",
-                "Assertion signature required but not present",
-            ));
+            if params
+                .verified_signed_ids
+                .contains(&response.base.id.as_str())
+            {
+                result.add(ValidationCheck::pass(
+                    6,
+                    "Assertion protected by verified signature",
+                ));
+            } else {
+                result.add(ValidationCheck::fail(
+                    6,
+                    "Assertion protected by verified signature",
+                    "Assertion signature required but neither assertion nor response signature was verified",
+                ));
+            }
         } else {
-            result.add(ValidationCheck::pass(6, "Assertion signature present"));
+            result.add(ValidationCheck::pass(
+                6,
+                "Assertion protected by verified signature",
+            ));
         }
 
         // Check 7: No ds:Object (E91) - handled at response level if response sig present
@@ -931,6 +967,7 @@ mod tests {
             relay_state: None,
             response_signature_xml: None,
             response_signature_verified: None,
+            verified_signed_ids: &[],
             current_proxy_depth: 0,
             now,
         }

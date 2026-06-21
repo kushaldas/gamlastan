@@ -24,3 +24,4 @@ rewriting history (mark the old one `Superseded by NNNN`).
 | [0013](0013-logout-response-requires-issuer.md) | LogoutResponse without an Issuer is rejected | Accepted |
 | [0014](0014-entity-category-conflict-matcher.md) | Conflict-aware entity-category matcher for REFEDS Access | Accepted |
 | [0015](0015-subject-id-pairwise-id-mutual-exclusion.md) | Prefer pairwise-id when subject-id:req is any | Accepted |
+| [0016](0016-acs-signature-verification-before-claims.md) | Verify ACS signatures before consuming claims | Accepted |
