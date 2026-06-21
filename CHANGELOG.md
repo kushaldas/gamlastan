@@ -7,6 +7,75 @@ where needed to correct protocol handling.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-06-21
+
+### Security
+
+- `gamlastan-actix` ACS processing now verifies SAML Response / Assertion
+  XML signatures with trusted IdP metadata keys before profile validation or
+  claim extraction. Signature markup alone no longer satisfies signed-assertion
+  requirements; verified XML-DSig reference IDs are bound to the parsed Response
+  or Assertion used for authentication. Added regression coverage for tampered
+  signed responses, signature wrapping, and hostile inline `KeyInfo`. See
+  ADR 0016.
+- Web SSO assertion validation now fails closed when required bearer controls
+  are missing: no `Conditions` means the assertion expiry and audience checks
+  fail, and bearer `SubjectConfirmationData` without `NotOnOrAfter` fails. See
+  ADR 0017.
+- SOAP unwrap now validates the SOAP 1.1 namespace, rejects duplicate Header /
+  Body elements, and requires exactly one Body element child, closing an
+  element-smuggling / wrapping confusion path. See ADR 0018.
+- `gamlastan-actix` SP SLO handling now requires trusted signed LogoutRequest
+  and LogoutResponse messages, verifies Redirect or XML signatures against IdP
+  metadata keys, validates Issuer and Destination, and requires LogoutResponse
+  `InResponseTo` to match an outstanding SP-issued LogoutRequest. See ADR 0019.
+- XML Signature `ds:Object` rejection is now namespace-aware and shared by the
+  verifier and security helper, so alternate XMLDSig prefixes no longer bypass
+  SAML errata E91 enforcement. See ADR 0020.
+- HTTP Redirect and POST bindings now reject duplicate or ambiguous
+  security-sensitive parameters before decoding: duplicate `SAMLRequest`,
+  `SAMLResponse`, `RelayState`, Redirect `SigAlg`, Redirect `Signature`, mixed
+  request/response parameters, and Redirect `Signature` without `SigAlg`. POST
+  decoding now also fails closed on invalid UTF-8 bodies and malformed
+  `RelayState` URL encoding. See ADR 0021.
+- Generic SP response processing now rejects opaque encrypted-only responses
+  and rejects `require_encrypted_assertions` in the generic processor, which
+  cannot decrypt or prove encrypted-assertion provenance. See ADR 0022.
+
+### Changed
+
+- `profiles::sso::sp::process_response_with_verified_signatures()` was added
+  for callers that perform XML-DSig verification outside the generic SP
+  processor and need to pass verified Response / Assertion IDs into validation.
+- `SecurityConfig::strict()` and the ready-to-use Actix SP paths are stricter
+  about signed messages, SSO bearer validity, and SLO trust/correlation.
+
+### Fixed
+
+- Metadata KeyDescriptor certificate extraction now handles real-world
+  `KeyInfo` fragments that rely on inherited XMLDSig namespace declarations.
+  The test fixture coverage includes `edugain-v2.xml`.
+- POST binding `RelayState` decoding now treats `+` as a form-encoded space and
+  returns URL decoding errors instead of falling back to malformed raw values.
+
+### Documentation
+
+- Added ADRs `0016` through `0022` documenting the security decisions from the
+  SAML security audit.
+
+### Upgrade Notes
+
+- Direct callers of `profiles::sso::sp::process_response()` that require signed
+  assertions or signed responses must either disable those requirements for a
+  trusted unsigned deployment or verify the exact XML response with
+  `SamlVerifier` and call `process_response_with_verified_signatures()`.
+- IdP metadata used by `gamlastan-actix` SP ACS/SLO handlers must contain usable
+  signing certificates for signed incoming messages.
+- Tests or adapters that previously accepted duplicate SAML binding parameters,
+  malformed POST bodies, malformed `RelayState`, missing Web SSO audience /
+  expiry controls, unsigned SLO messages, or opaque encrypted-only generic SP
+  responses must be updated to expect rejection.
+
 ## [0.4.1] - 2026-06-10
 
 ### Changed
@@ -151,7 +220,10 @@ Historical release recorded before changelog adoption.
 
 Historical release recorded before changelog adoption.
 
-[Unreleased]: https://github.com/kushaldas/gamlastan/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/kushaldas/gamlastan/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/kushaldas/gamlastan/compare/v0.4.1...v0.5.0
+[0.4.1]: https://github.com/kushaldas/gamlastan/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/kushaldas/gamlastan/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/kushaldas/gamlastan/releases/tag/v0.3.0
 [0.2.0]: https://github.com/kushaldas/gamlastan/releases/tag/v0.2.0
 [0.1.0]: https://github.com/kushaldas/gamlastan/releases/tag/v0.1.0

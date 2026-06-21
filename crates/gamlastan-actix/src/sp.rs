@@ -819,13 +819,33 @@ fn extract_query_param(query: &str, name: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::extractors::SamlBinding;
+    use base64::Engine;
+    use chrono::TimeDelta;
+    use gamlastan::core::assertion::authn::{AuthnContext, AuthnStatement};
+    use gamlastan::core::assertion::conditions::{AudienceRestriction, Conditions};
     use gamlastan::core::assertion::issuer::Issuer;
+    use gamlastan::core::assertion::name_id::{NameId, NameIdOrEncryptedId};
+    use gamlastan::core::assertion::subject::{
+        Subject, SubjectConfirmation, SubjectConfirmationData,
+    };
+    use gamlastan::core::assertion::types::Assertion;
+    use gamlastan::core::constants;
+    use gamlastan::core::identifiers::SamlVersion;
     use gamlastan::core::protocol::status::Status;
+    use gamlastan::core::protocol::{response::Response, response::ResponseBase};
+    use gamlastan::crypto::KeyUsage;
     use gamlastan::metadata::types::endpoint::Endpoint;
     use gamlastan::metadata::types::entity_descriptor::{EntityDescriptor, EntityRoles};
     use gamlastan::metadata::types::idp::IdpSsoDescriptor;
     use gamlastan::metadata::types::key_descriptor::KeyDescriptor;
     use gamlastan::metadata::types::role_descriptor::{RoleDescriptorBase, SsoDescriptorBase};
+    use gamlastan::profiles::sso::sp as core_sp_profile;
+    use gamlastan::security::config::SecurityConfig;
+    use gamlastan::xml::deserialize::parse_saml;
+
+    const SIGN_CERT_PEM: &str = include_str!("../../gamlastan-mdq/tests/fixtures/sign-cert.pem");
+    const SIGN_KEY_PEM: &[u8] = include_bytes!("../../gamlastan-mdq/tests/fixtures/sign-key.pem");
+    const OTHER_CERT_PEM: &str = include_str!("../tests/fixtures/other-cert.pem");
 
     fn test_sp_config() -> SpConfig {
         let idp = IdpSsoDescriptor {
@@ -872,6 +892,157 @@ mod tests {
             metadata,
         )
         .with_slo_url("https://sp.example.com/slo")
+    }
+
+    fn cert_b64(pem: &str) -> String {
+        pem.lines()
+            .filter(|line| !line.contains("CERTIFICATE"))
+            .collect::<String>()
+    }
+
+    fn key_info_with_cert(cert: &str) -> String {
+        format!(
+            r#"<ds:KeyInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:X509Data><ds:X509Certificate>{cert}</ds:X509Certificate></ds:X509Data></ds:KeyInfo>"#
+        )
+    }
+
+    fn test_sp_config_with_signing_cert(cert: &str) -> SpConfig {
+        let mut config = test_sp_config();
+        let EntityRoles::Roles { idp_sso, .. } = &mut config.idp_metadata.roles else {
+            panic!("test metadata should contain IdP SSO role");
+        };
+        idp_sso[0]
+            .sso_base
+            .base
+            .key_descriptors
+            .push(KeyDescriptor::signing(key_info_with_cert(cert)));
+        config
+    }
+
+    fn test_signer() -> SamlSigner {
+        let cert_der = base64::engine::general_purpose::STANDARD
+            .decode(cert_b64(SIGN_CERT_PEM))
+            .unwrap();
+        let mut key = loader::load_pem_auto(SIGN_KEY_PEM, None).unwrap();
+        key.usage = KeyUsage::Sign;
+        key.x509_chain = vec![cert_der];
+
+        let mut keys = KeysManager::new();
+        keys.add_key(key);
+        SamlSigner::new(keys)
+    }
+
+    fn test_signature_template(reference_id: &str, cert: &str) -> String {
+        format!(
+            r##"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#{reference_id}"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{cert}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></ds:Signature>"##
+        )
+    }
+
+    fn insert_response_signature_template(xml: &str, response_id: &str) -> String {
+        let marker = "</saml:Issuer>";
+        let pos = xml.find(marker).expect("response issuer marker") + marker.len();
+        let template = test_signature_template(response_id, &cert_b64(SIGN_CERT_PEM));
+        format!("{}{}{}", &xml[..pos], template, &xml[pos..])
+    }
+
+    fn insert_assertion_signature_template(
+        xml: &str,
+        assertion_id: &str,
+        reference_id: &str,
+    ) -> String {
+        let id_attr = format!(r#"ID="{assertion_id}""#);
+        let assertion_pos = xml.find(&id_attr).expect("assertion ID marker");
+        let marker = "</saml:Issuer>";
+        let issuer_end = assertion_pos
+            + xml[assertion_pos..]
+                .find(marker)
+                .expect("assertion issuer marker")
+            + marker.len();
+        let template = test_signature_template(reference_id, &cert_b64(SIGN_CERT_PEM));
+        format!("{}{}{}", &xml[..issuer_end], template, &xml[issuer_end..])
+    }
+
+    fn make_test_assertion(id: &str, name_id: &str, now: chrono::DateTime<Utc>) -> Assertion {
+        Assertion {
+            id: id.to_string(),
+            version: SamlVersion::V2_0,
+            issue_instant: now,
+            issuer: Issuer::entity("https://idp.example.com"),
+            has_signature: false,
+            subject: Some(Subject {
+                name_id: Some(NameIdOrEncryptedId::NameId(NameId {
+                    value: name_id.to_string(),
+                    format: Some(constants::NAMEID_EMAIL.to_string()),
+                    name_qualifier: None,
+                    sp_name_qualifier: None,
+                    sp_provided_id: None,
+                })),
+                subject_confirmations: vec![SubjectConfirmation {
+                    method: constants::CM_BEARER.to_string(),
+                    name_id: None,
+                    subject_confirmation_data: Some(SubjectConfirmationData {
+                        not_before: None,
+                        not_on_or_after: Some(now + TimeDelta::minutes(5)),
+                        recipient: Some("https://sp.example.com/acs".to_string()),
+                        in_response_to: None,
+                        address: None,
+                        key_info_x509_certs: vec![],
+                    }),
+                }],
+            }),
+            conditions: Some(Conditions {
+                not_before: Some(now - TimeDelta::seconds(5)),
+                not_on_or_after: Some(now + TimeDelta::minutes(5)),
+                audience_restrictions: vec![AudienceRestriction {
+                    audiences: vec!["https://sp.example.com".to_string()],
+                }],
+                one_time_use: false,
+                proxy_restriction: None,
+            }),
+            advice: None,
+            authn_statements: vec![AuthnStatement {
+                authn_instant: now,
+                session_index: Some("_session".to_string()),
+                session_not_on_or_after: Some(now + TimeDelta::hours(8)),
+                subject_locality: None,
+                authn_context: AuthnContext {
+                    authn_context_class_ref: Some(constants::AUTHN_CONTEXT_PASSWORD.to_string()),
+                    authn_context_decl_ref: None,
+                    authenticating_authorities: vec![],
+                },
+            }],
+            authz_decision_statements: vec![],
+            attribute_statements: vec![],
+        }
+    }
+
+    fn make_test_response(
+        response_id: &str,
+        assertions: Vec<Assertion>,
+        now: chrono::DateTime<Utc>,
+    ) -> Response {
+        Response {
+            base: ResponseBase {
+                id: response_id.to_string(),
+                version: SamlVersion::V2_0,
+                issue_instant: now,
+                destination: Some("https://sp.example.com/acs".to_string()),
+                consent: None,
+                issuer: Some(Issuer::entity("https://idp.example.com")),
+                has_signature: false,
+                in_response_to: None,
+                status: Status::success(),
+            },
+            assertions,
+            encrypted_assertions: vec![],
+        }
+    }
+
+    fn parse_response_xml(xml: &str) -> Response {
+        let doc = uppsala::parse(xml).unwrap();
+        parse_saml::<gamlastan::core::protocol::response::ResponseRef<'_>>(&doc)
+            .unwrap()
+            .to_owned()
     }
 
     #[test]
@@ -931,6 +1102,97 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.to_string().contains("cannot be used for verification"));
+    }
+
+    #[test]
+    fn test_acs_rejects_tampered_response_signature() {
+        let now = Utc::now();
+        let response = make_test_response(
+            "_response",
+            vec![make_test_assertion("_assertion", "user@example.com", now)],
+            now,
+        );
+        let unsigned_xml = response.to_xml_string().unwrap();
+        let templated_xml = insert_response_signature_template(&unsigned_xml, "_response");
+        let signed_xml = test_signer().sign_enveloped(&templated_xml).unwrap();
+        let tampered_xml = signed_xml.replace("user@example.com", "attacker@example.com");
+        let parsed_response = parse_response_xml(&tampered_xml);
+        let config = test_sp_config_with_signing_cert(&cert_b64(SIGN_CERT_PEM));
+
+        let err = verify_acs_response_signatures(&tampered_xml, &parsed_response, &config)
+            .expect_err("tampered signed response should be rejected");
+
+        assert!(err.to_string().contains("signature verification failed"));
+    }
+
+    #[test]
+    fn test_acs_wrapping_rejects_unsigned_consumed_assertion() {
+        let now = Utc::now();
+        let response = make_test_response(
+            "_response",
+            vec![
+                make_test_assertion("_attacker_assertion", "attacker@example.com", now),
+                make_test_assertion("_signed_assertion", "user@example.com", now),
+            ],
+            now,
+        );
+        let unsigned_xml = response.to_xml_string().unwrap();
+        let templated_xml = insert_assertion_signature_template(
+            &unsigned_xml,
+            "_signed_assertion",
+            "_signed_assertion",
+        );
+        let signed_xml = test_signer().sign_enveloped(&templated_xml).unwrap();
+        let parsed_response = parse_response_xml(&signed_xml);
+        let config = test_sp_config_with_signing_cert(&cert_b64(SIGN_CERT_PEM));
+
+        let verified_ids =
+            verify_acs_response_signatures(&signed_xml, &parsed_response, &config).unwrap();
+        assert_eq!(verified_ids, vec!["_signed_assertion".to_string()]);
+        let verified_id_refs: Vec<&str> = verified_ids.iter().map(String::as_str).collect();
+
+        let result = core_sp_profile::process_response_with_verified_signatures(
+            &parsed_response,
+            &SecurityConfig::default(),
+            None,
+            "https://sp.example.com",
+            "https://sp.example.com/acs",
+            None,
+            "https://idp.example.com",
+            &verified_id_refs,
+            now,
+        );
+
+        let err = result.expect_err("unsigned attacker assertion must not be consumable");
+        assert!(err
+            .to_string()
+            .contains("Assertion signature required but neither assertion nor response signature was verified"));
+    }
+
+    #[test]
+    fn test_acs_ignores_inline_key_info_without_matching_metadata_trust() {
+        let now = Utc::now();
+        let response = make_test_response(
+            "_response",
+            vec![make_test_assertion("_assertion", "user@example.com", now)],
+            now,
+        );
+        let unsigned_xml = response.to_xml_string().unwrap();
+        let templated_xml = insert_response_signature_template(&unsigned_xml, "_response");
+        let signed_xml = test_signer().sign_enveloped(&templated_xml).unwrap();
+        let parsed_response = parse_response_xml(&signed_xml);
+
+        let wrong_trust_config = test_sp_config_with_signing_cert(&cert_b64(OTHER_CERT_PEM));
+        let err =
+            verify_acs_response_signatures(&signed_xml, &parsed_response, &wrong_trust_config)
+                .expect_err("inline KeyInfo must not override metadata trust");
+        assert!(!err.to_string().is_empty());
+
+        let matching_trust_config = test_sp_config_with_signing_cert(&cert_b64(SIGN_CERT_PEM));
+        let verified_ids =
+            verify_acs_response_signatures(&signed_xml, &parsed_response, &matching_trust_config)
+                .unwrap();
+        assert_eq!(verified_ids, vec!["_response".to_string()]);
     }
 
     #[test]

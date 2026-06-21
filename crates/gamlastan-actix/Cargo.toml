@@ -19,3 +19,4 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 actix-rt = "2"
+base64 = { workspace = true }
