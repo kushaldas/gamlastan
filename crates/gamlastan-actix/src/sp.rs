@@ -19,6 +19,7 @@ use gamlastan::bindings::relay_state::RelayState;
 use gamlastan::core::assertion::name_id::NameId;
 use gamlastan::core::protocol::response::Response as SamlResponse;
 use gamlastan::crypto::signer::SamlSigner;
+use gamlastan::crypto::{KeysManager, SamlVerifier, VerifyResult};
 use gamlastan::profiles::logout;
 use gamlastan::profiles::sso::sp as sp_profile;
 use gamlastan::profiles::sso::web_browser::{AuthnRequestOptions, AuthnResult};
@@ -192,6 +193,13 @@ async fn sp_acs(
     >(&doc)?;
     let response: SamlResponse = response_ref.to_owned();
 
+    // Signature trust is established before profile validation or claim
+    // extraction. The validator receives only the IDs that were actually
+    // covered by a verified XML-DSig reference.
+    let verified_signed_ids = verify_acs_response_signatures(xml_str, &response, &config)?;
+    let verified_signed_id_refs: Vec<&str> =
+        verified_signed_ids.iter().map(String::as_str).collect();
+
     // Get the IdP entity ID from metadata
     let expected_idp_entity_id = &config.idp_metadata.entity_id;
 
@@ -205,7 +213,7 @@ async fn sp_acs(
 
     // Validate the Response
     let now = Utc::now();
-    let authn_result = sp_profile::process_response(
+    let authn_result = sp_profile::process_response_with_verified_signatures(
         &response,
         &config.security,
         Some(config.replay_cache.as_ref()),
@@ -213,6 +221,7 @@ async fn sp_acs(
         &config.acs_url,
         expected_request_id.as_deref(),
         expected_idp_entity_id,
+        &verified_signed_id_refs,
         now,
     )
     .map_err(|e| SamlActixError::Internal(format!("response validation failed: {e}")))?;
@@ -235,6 +244,140 @@ async fn sp_acs(
     Ok(HttpResponse::Ok()
         .content_type("text/html; charset=utf-8")
         .body(body))
+}
+
+/// Verify the XML signatures carried by an ACS response and return the signed IDs.
+///
+/// This function deliberately verifies against IdP certificates from metadata
+/// and never treats inline `KeyInfo` as trust. The returned IDs are later matched
+/// to the parsed `Response`/`Assertion` objects, which prevents accepting claims
+/// from an XML object that merely contains signature markup.
+fn verify_acs_response_signatures(
+    xml: &str,
+    response: &SamlResponse,
+    config: &SpConfig,
+) -> Result<Vec<String>, SamlActixError> {
+    // Step 1: Determine whether the parsed response contains any XML Signature
+    // element that the deserializer recognized on the Response or Assertions.
+    // This is only a routing signal; it is not evidence that the signature is
+    // valid or trusted.
+    let has_signature = response.base.has_signature
+        || response
+            .assertions
+            .iter()
+            .any(|assertion| assertion.has_signature);
+
+    // Step 2: Work out whether this deployment requires a signature at all.
+    // Either policy means ACS must have cryptographic proof before it can
+    // accept the response.
+    let signature_required =
+        config.security.require_signed_assertions || config.security.require_signed_responses;
+
+    if !has_signature {
+        if signature_required {
+            // Required signatures must fail here rather than relying on later
+            // parsing paths to notice that verification never happened.
+            return Err(SamlActixError::Profile(
+                gamlastan::profiles::ProfileError::AssertionValidation(
+                    "signed response or assertion required but no signature is present".into(),
+                ),
+            ));
+        }
+
+        // Unsigned responses are only allowed when both response and assertion
+        // signature requirements are disabled. Return an empty verified-ID set
+        // so later validation cannot accidentally treat anything as signed.
+        return Ok(Vec::new());
+    }
+
+    // Step 3: Build a verifier from trusted IdP metadata. This fails closed if
+    // no usable signing certificate is configured, because a signed SAML
+    // response without a trusted verification key is not authentic.
+    let verifier = trusted_idp_verifier(config)?;
+
+    // Step 4: Verify the exact XML string received by the ACS endpoint, before
+    // any authentication result is constructed. The verifier is configured to
+    // use trusted metadata keys only, so attacker-controlled inline KeyInfo does
+    // not become a trust anchor.
+    //
+    // `verify_enveloped` validates the signature value and all digest
+    // references. A syntactically present but forged `<ds:Signature>` becomes
+    // `Invalid` or an error and is rejected before claims are consumed.
+    let verify_result = verifier.verify_enveloped(xml).map_err(|e| {
+        SamlActixError::Profile(gamlastan::profiles::ProfileError::AssertionValidation(
+            format!("signature verification failed: {e}"),
+        ))
+    })?;
+
+    let VerifyResult::Valid { references, .. } = verify_result else {
+        let reason = match verify_result {
+            VerifyResult::Invalid { reason } => reason,
+            VerifyResult::Valid { .. } => unreachable!(),
+        };
+        return Err(SamlActixError::Profile(
+            gamlastan::profiles::ProfileError::AssertionValidation(format!(
+                "signature verification failed: {reason}"
+            )),
+        ));
+    };
+
+    // Step 5: Convert verified XML-DSig references into SAML object IDs. The
+    // core validator compares these IDs against the parsed Response and
+    // Assertion IDs, binding cryptographic verification to the objects that
+    // provide the user's identity and attributes.
+    let mut ids = Vec::new();
+    for reference in references {
+        // Same-document references are normally "#ID". An empty URI signs the
+        // document root, which in the ACS path is the SAML Response we parsed.
+        let id = if reference.uri.is_empty() {
+            Some(response.base.id.as_str())
+        } else {
+            reference.uri.strip_prefix('#')
+        };
+        if let Some(id) = id {
+            if !ids.iter().any(|existing| existing == id) {
+                ids.push(id.to_string());
+            }
+        }
+    }
+
+    // Step 6: A valid signature that does not identify a response/assertion
+    // target is not useful for SAML Web SSO. Reject it instead of falling back
+    // to signature-presence checks.
+    if ids.is_empty() {
+        return Err(SamlActixError::Profile(
+            gamlastan::profiles::ProfileError::AssertionValidation(
+                "signature verified but did not reference a SAML response or assertion ID".into(),
+            ),
+        ));
+    }
+
+    Ok(ids)
+}
+
+/// Build a verifier from trusted IdP signing certificates in metadata.
+///
+/// Metadata without a usable signing certificate is a configuration error for
+/// signed ACS responses: accepting the response would otherwise mean trusting
+/// attacker-supplied inline keys or skipping cryptographic verification.
+fn trusted_idp_verifier(config: &SpConfig) -> Result<SamlVerifier, SamlActixError> {
+    let mut keys = KeysManager::new();
+    for idp in config.idp_metadata.idp_sso_descriptors() {
+        for cert in idp.signing_certificates_der() {
+            keys.add_trusted_cert(cert);
+        }
+    }
+
+    if !keys.has_trusted_certs() {
+        return Err(SamlActixError::Configuration(
+            "no IdP signing certificate in metadata".into(),
+        ));
+    }
+
+    Ok(SamlVerifier::with_ds_object_rejection(
+        keys,
+        config.security.reject_signatures_with_ds_object,
+    ))
 }
 
 /// SP logout initiation handler: create a LogoutRequest and send to IdP.

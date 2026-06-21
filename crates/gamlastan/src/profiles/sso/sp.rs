@@ -164,6 +164,37 @@ pub fn process_response(
     expected_idp_entity_id: &str,
     now: DateTime<Utc>,
 ) -> Result<AuthnResult, ProfileError> {
+    process_response_with_verified_signatures(
+        response,
+        config,
+        replay_cache,
+        sp_entity_id,
+        acs_url,
+        expected_request_id,
+        expected_idp_entity_id,
+        &[],
+        now,
+    )
+}
+
+/// Process and validate a SAML Response with cryptographically verified
+/// XML-DSig reference targets supplied by the caller.
+///
+/// `verified_signed_ids` must contain only IDs returned by a trusted
+/// [`crate::crypto::SamlVerifier`] verification of the exact XML response
+/// being processed.
+#[allow(clippy::too_many_arguments)]
+pub fn process_response_with_verified_signatures(
+    response: &Response,
+    config: &SecurityConfig,
+    replay_cache: Option<&dyn ReplayCache>,
+    sp_entity_id: &str,
+    acs_url: &str,
+    expected_request_id: Option<&str>,
+    expected_idp_entity_id: &str,
+    verified_signed_ids: &[&str],
+    now: DateTime<Utc>,
+) -> Result<AuthnResult, ProfileError> {
     // Check response status
     if !response.base.status.is_success() {
         return Err(ProfileError::ResponseFailure(
@@ -197,7 +228,16 @@ pub fn process_response(
         client_address: None,
         relay_state: None,
         response_signature_xml: None,
-        response_signature_verified: None,
+        response_signature_verified: if response.base.has_signature {
+            if verified_signed_ids.is_empty() {
+                None
+            } else {
+                Some(verified_signed_ids.contains(&response.base.id.as_str()))
+            }
+        } else {
+            None
+        },
+        verified_signed_ids,
         current_proxy_depth: 0,
         now,
     };
@@ -583,5 +623,46 @@ mod tests {
             Utc::now(),
         );
         assert!(matches!(result, Err(ProfileError::NoAssertions)));
+    }
+
+    #[test]
+    fn test_process_response_rejects_unverified_assertion_signature_markup() {
+        let now = Utc::now();
+        let mut assertion = make_test_assertion(
+            "https://sp.example.com",
+            "https://sp.example.com/acs",
+            None,
+            now,
+        );
+        assertion.has_signature = true;
+        let assertion_id = assertion.id.clone();
+        let response = make_test_response(assertion, None);
+        let config = SecurityConfig::default();
+
+        let result = process_response(
+            &response,
+            &config,
+            None,
+            "https://sp.example.com",
+            "https://sp.example.com/acs",
+            None,
+            "https://idp.example.com",
+            now,
+        );
+        assert!(matches!(result, Err(ProfileError::AssertionValidation(_))));
+
+        let verified_ids = [assertion_id.as_str()];
+        let result = process_response_with_verified_signatures(
+            &response,
+            &config,
+            None,
+            "https://sp.example.com",
+            "https://sp.example.com/acs",
+            None,
+            "https://idp.example.com",
+            &verified_ids,
+            now,
+        );
+        assert!(result.is_ok());
     }
 }
