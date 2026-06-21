@@ -114,8 +114,10 @@ impl SamlVerifier {
     /// Per E91: checks for and rejects `<ds:Object>` elements in the signature
     /// if `reject_ds_object` is enabled.
     pub fn verify_enveloped(&self, signed_xml: &str) -> Result<VerifyResult, CryptoError> {
-        // E91 check: scan for ds:Object before verifying
-        if self.reject_ds_object && signed_xml.contains("<ds:Object") {
+        // E91 check: reject XMLDSig Object elements before handing the
+        // document to the verifier. The helper parses XML and compares
+        // expanded names, so attackers cannot bypass it by changing prefixes.
+        if self.reject_ds_object && crate::security::signature::contains_ds_object(signed_xml) {
             return Err(CryptoError::SignatureContainsDsObject);
         }
 

@@ -12,7 +12,9 @@
 // CRITICAL: verify signature using original URL-encoded param values, NOT re-encoded.
 
 use crate::bindings::deflate::{deflate_compress, deflate_decompress};
-use crate::bindings::encoding::{base64_decode, base64_encode, url_decode, url_encode};
+use crate::bindings::encoding::{
+    base64_decode, base64_encode, parse_query_string_raw, url_decode, url_encode,
+};
 use crate::bindings::error::BindingError;
 use crate::bindings::relay_state::RelayState;
 use crate::bindings::traits::HttpRequest;
@@ -107,8 +109,18 @@ pub fn redirect_encode(params: &RedirectEncodeParams<'_>) -> Result<String, Bind
 /// CRITICAL: the signature_input field preserves the original URL-encoded
 /// query string for signature verification (not re-encoded).
 pub fn redirect_decode(request: &impl HttpRequest) -> Result<RedirectDecoded, BindingError> {
+    let raw_query = request.url().split_once('?').map(|(_, query)| query);
+    if let Some(query) = raw_query {
+        validate_unique_redirect_params(query)?;
+    }
+
     // Determine if this is a request or response
     let (encoded_value, is_request) = if let Some(val) = request.query_param("SAMLRequest") {
+        if request.query_param("SAMLResponse").is_some() {
+            return Err(BindingError::InvalidSamlParams(
+                "request contains both SAMLRequest and SAMLResponse".to_string(),
+            ));
+        }
         (val, true)
     } else if let Some(val) = request.query_param("SAMLResponse") {
         (val, false)
@@ -138,35 +150,24 @@ pub fn redirect_decode(request: &impl HttpRequest) -> Result<RedirectDecoded, Bi
         None
     };
 
-    // Build signature input string from raw URL-encoded params
-    // Must be: SAMLRequest=value&RelayState=value&SigAlg=value (exact encoded values)
+    if signature.is_some() && sig_alg.is_none() {
+        return Err(BindingError::InvalidSamlParams(
+            "Signature parameter present without SigAlg".to_string(),
+        ));
+    }
+
+    // Build signature input string from raw URL-encoded params. The detached
+    // signature covers exactly SAMLRequest/SAMLResponse, optional RelayState,
+    // and SigAlg in that order. Duplicate checks above ensure an attacker
+    // cannot make us verify one value and consume another.
     let signature_input = if sig_alg.is_some() {
-        let url = request.url();
-        // Extract query string from URL
-        if let Some(qs_start) = url.find('?') {
-            let qs = &url[qs_start + 1..];
-            // Build the signature input from the relevant params in order
-            let mut sig_input = String::new();
+        if let Some(query) = raw_query {
             let param_name = if is_request {
                 "SAMLRequest"
             } else {
                 "SAMLResponse"
             };
-
-            // Find each param in the raw query string
-            let saml_prefix = format!("{}=", param_name);
-            for pair in qs.split('&') {
-                if pair.starts_with(&saml_prefix)
-                    || pair.starts_with("RelayState=")
-                    || pair.starts_with("SigAlg=")
-                {
-                    if !sig_input.is_empty() {
-                        sig_input.push('&');
-                    }
-                    sig_input.push_str(pair);
-                }
-            }
-            Some(sig_input)
+            Some(build_redirect_signature_input(query, param_name)?)
         } else {
             None
         }
@@ -182,6 +183,81 @@ pub fn redirect_decode(request: &impl HttpRequest) -> Result<RedirectDecoded, Bi
         signature,
         signature_input,
     })
+}
+
+/// Reject duplicate Redirect binding parameters before any decoding.
+///
+/// SAML Redirect signatures bind exact query parameter bytes. If duplicate
+/// security-sensitive parameters are accepted, one component can verify the
+/// first value while another consumes a later value. This helper therefore
+/// decodes only parameter names, keeps values untouched, and fails closed.
+fn validate_unique_redirect_params(query: &str) -> Result<(), BindingError> {
+    let request_count = raw_param_count(query, "SAMLRequest")?;
+    let response_count = raw_param_count(query, "SAMLResponse")?;
+
+    if request_count > 0 && response_count > 0 {
+        return Err(BindingError::InvalidSamlParams(
+            "request contains both SAMLRequest and SAMLResponse".to_string(),
+        ));
+    }
+
+    for name in [
+        "SAMLRequest",
+        "SAMLResponse",
+        "RelayState",
+        "SigAlg",
+        "Signature",
+    ] {
+        if raw_param_count(query, name)? > 1 {
+            return Err(BindingError::DuplicateSamlParam(name));
+        }
+    }
+
+    Ok(())
+}
+
+/// Count query parameters by decoded name while preserving raw values.
+fn raw_param_count(query: &str, wanted: &'static str) -> Result<usize, BindingError> {
+    parse_query_string_raw(query)
+        .into_iter()
+        .map(|(key, _)| url_decode(key))
+        .try_fold(0, |count, decoded| {
+            decoded.map(|key| count + usize::from(key == wanted))
+        })
+}
+
+/// Return the original `key=value` pair for a decoded parameter name.
+fn raw_pair_by_decoded_name<'a>(
+    query: &'a str,
+    wanted: &'static str,
+) -> Result<Option<&'a str>, BindingError> {
+    for pair in query.split('&').filter(|s| !s.is_empty()) {
+        let key = pair.split_once('=').map(|(key, _)| key).unwrap_or(pair);
+        if url_decode(key)? == wanted {
+            return Ok(Some(pair));
+        }
+    }
+    Ok(None)
+}
+
+/// Reconstruct the Redirect binding signature input in spec order.
+fn build_redirect_signature_input(
+    query: &str,
+    saml_param_name: &'static str,
+) -> Result<String, BindingError> {
+    let mut pairs = Vec::with_capacity(3);
+    pairs.push(
+        raw_pair_by_decoded_name(query, saml_param_name)?
+            .ok_or(BindingError::MissingSamlParam(saml_param_name))?,
+    );
+    if let Some(relay_state) = raw_pair_by_decoded_name(query, "RelayState")? {
+        pairs.push(relay_state);
+    }
+    pairs.push(
+        raw_pair_by_decoded_name(query, "SigAlg")?
+            .ok_or(BindingError::MissingSamlParam("SigAlg"))?,
+    );
+    Ok(pairs.join("&"))
 }
 
 /// Verify the signature on a decoded HTTP Redirect binding message.
@@ -211,6 +287,68 @@ pub fn redirect_verify_signature(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bindings::traits::HttpRequest;
+
+    struct TestRequest {
+        url: String,
+        query: Vec<(String, String)>,
+    }
+
+    impl TestRequest {
+        fn from_url(url: &str) -> Self {
+            let query = url
+                .split_once('?')
+                .map(|(_, query)| {
+                    parse_query_string_raw(query)
+                        .into_iter()
+                        .map(|(key, value)| {
+                            (
+                                url_decode(key).unwrap_or_else(|_| key.to_string()),
+                                value.to_string(),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Self {
+                url: url.to_string(),
+                query,
+            }
+        }
+    }
+
+    impl HttpRequest for TestRequest {
+        fn method(&self) -> &str {
+            "GET"
+        }
+
+        fn url(&self) -> &str {
+            &self.url
+        }
+
+        fn query_param(&self, name: &str) -> Option<&str> {
+            self.query
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.as_str())
+        }
+
+        fn form_param(&self, _name: &str) -> Option<&str> {
+            None
+        }
+
+        fn header(&self, _name: &str) -> Option<&str> {
+            None
+        }
+
+        fn body(&self) -> &[u8] {
+            &[]
+        }
+
+        fn remote_addr(&self) -> Option<&str> {
+            None
+        }
+    }
 
     #[test]
     fn test_redirect_encode_decode_roundtrip() {
@@ -280,5 +418,108 @@ mod tests {
 
         // Should use & instead of ? since destination already has query params
         assert!(url.starts_with("https://idp.example.com/sso?existing=param&SAMLRequest="));
+    }
+
+    #[test]
+    fn test_redirect_decode_rejects_duplicate_saml_message_param() {
+        let url = "https://idp.example.com/sso?SAMLRequest=first&SAMLRequest=second";
+        let request = TestRequest::from_url(url);
+
+        let result = redirect_decode(&request);
+
+        assert!(matches!(
+            result,
+            Err(BindingError::DuplicateSamlParam("SAMLRequest"))
+        ));
+    }
+
+    #[test]
+    fn test_redirect_decode_rejects_encoded_duplicate_param_name() {
+        let url = "https://idp.example.com/sso?SAMLRequest=first&SAML%52equest=second";
+        let request = TestRequest::from_url(url);
+
+        let result = redirect_decode(&request);
+
+        assert!(matches!(
+            result,
+            Err(BindingError::DuplicateSamlParam("SAMLRequest"))
+        ));
+    }
+
+    #[test]
+    fn test_redirect_decode_rejects_request_and_response_together() {
+        let url = "https://idp.example.com/sso?SAMLRequest=req&SAMLResponse=resp";
+        let request = TestRequest::from_url(url);
+
+        let result = redirect_decode(&request);
+
+        assert!(matches!(result, Err(BindingError::InvalidSamlParams(_))));
+    }
+
+    #[test]
+    fn test_redirect_decode_rejects_duplicate_relay_state() {
+        let url = "https://idp.example.com/sso?SAMLRequest=req&RelayState=one&RelayState=two";
+        let request = TestRequest::from_url(url);
+
+        let result = redirect_decode(&request);
+
+        assert!(matches!(
+            result,
+            Err(BindingError::DuplicateSamlParam("RelayState"))
+        ));
+    }
+
+    #[test]
+    fn test_redirect_decode_rejects_duplicate_sig_alg() {
+        let url = "https://idp.example.com/sso?SAMLRequest=req&SigAlg=one&SigAlg=two";
+        let request = TestRequest::from_url(url);
+
+        let result = redirect_decode(&request);
+
+        assert!(matches!(
+            result,
+            Err(BindingError::DuplicateSamlParam("SigAlg"))
+        ));
+    }
+
+    #[test]
+    fn test_redirect_decode_rejects_duplicate_signature() {
+        let url = "https://idp.example.com/sso?SAMLRequest=req&Signature=one&Signature=two";
+        let request = TestRequest::from_url(url);
+
+        let result = redirect_decode(&request);
+
+        assert!(matches!(
+            result,
+            Err(BindingError::DuplicateSamlParam("Signature"))
+        ));
+    }
+
+    #[test]
+    fn test_redirect_decode_rejects_signature_without_sig_alg() {
+        let xml = b"<samlp:AuthnRequest/>";
+        let mut url = redirect_encode(&RedirectEncodeParams {
+            saml_xml: xml,
+            is_request: true,
+            destination: "https://idp.example.com/sso",
+            relay_state: None,
+            signer: None,
+        })
+        .unwrap();
+        url.push_str("&Signature=ZmFrZQ%3D%3D");
+        let request = TestRequest::from_url(&url);
+
+        let result = redirect_decode(&request);
+
+        assert!(matches!(result, Err(BindingError::InvalidSamlParams(_))));
+    }
+
+    #[test]
+    fn test_redirect_signature_input_uses_spec_order() {
+        let query = "RelayState=relay&SAMLRequest=req&Signature=sig&SigAlg=alg";
+
+        let input = build_redirect_signature_input(query, "SAMLRequest").unwrap();
+
+        assert_eq!(input, "SAMLRequest=req&RelayState=relay&SigAlg=alg");
     }
 }

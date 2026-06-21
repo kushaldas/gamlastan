@@ -7,27 +7,46 @@
 // This module provides functions to validate signature properties
 // before/after cryptographic verification.
 
-/// Check whether a signature XML fragment contains a ds:Object element (E91).
+/// Check whether XML contains an XMLDSig `Object` element (E91).
 ///
 /// Per E91, SAML signatures MUST NOT contain ds:Object elements. This is a
 /// security requirement to prevent signature wrapping attacks.
 ///
-/// The `signature_xml` parameter should be the raw XML of the `<ds:Signature>` element.
+/// The `signature_xml` parameter may be either the raw XML of a
+/// `<ds:Signature>` element or a complete signed XML document. The check walks
+/// the parsed XML tree and compares expanded names, so it is independent of the
+/// XML Signature prefix used by the input.
 ///
 /// Returns `true` if a ds:Object is found (meaning the signature should be rejected).
 pub fn contains_ds_object(signature_xml: &str) -> bool {
-    // Look for ds:Object or Object element in the dsig namespace
-    // We check for common representations:
-    // - <ds:Object
-    // - <dsig:Object
-    // - <Object xmlns="http://www.w3.org/2000/09/xmldsig#"
-    // Note: a proper implementation would use XML parsing, but for a quick
-    // security check, string matching on the signature fragment is sufficient
-    // and avoids re-parsing overhead.
-    signature_xml.contains("<ds:Object")
-        || signature_xml.contains("<dsig:Object")
-        || signature_xml.contains("<Object ")
-        || signature_xml.contains("<Object>")
+    const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
+
+    let Ok(doc) = uppsala::parse(signature_xml) else {
+        // The caller's XML verifier will report malformed XML later. This
+        // helper only answers "is there a real XMLDSig Object element?" and
+        // avoids guessing from text when the fragment is not parseable XML.
+        return false;
+    };
+
+    let Some(root) = doc.document_element() else {
+        return false;
+    };
+
+    for node in doc.descendants(root) {
+        let Some(elem) = doc.element(node) else {
+            continue;
+        };
+
+        // E91 is namespace based: any element whose expanded name is
+        // {XMLDSig}Object is forbidden, independent of prefix choice.
+        if elem.name.local_name == "Object"
+            && elem.name.namespace_uri.as_deref() == Some(XMLDSIG_NS)
+        {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Known signature algorithm URIs.
@@ -138,7 +157,7 @@ mod tests {
 
     #[test]
     fn test_dsig_prefix_object() {
-        let xml = r#"<dsig:Signature>
+        let xml = r#"<dsig:Signature xmlns:dsig="http://www.w3.org/2000/09/xmldsig#">
             <dsig:Object>content</dsig:Object>
         </dsig:Signature>"#;
         assert!(contains_ds_object(xml));
@@ -146,9 +165,25 @@ mod tests {
 
     #[test]
     fn test_self_closing_object() {
-        let xml = r#"<ds:Signature>
+        let xml = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
             <ds:Object />
         </ds:Signature>"#;
+        assert!(contains_ds_object(xml));
+    }
+
+    #[test]
+    fn test_ignores_non_dsig_object() {
+        let xml = r#"<Signature xmlns="urn:example:not-dsig">
+            <Object>application content</Object>
+        </Signature>"#;
+        assert!(!contains_ds_object(xml));
+    }
+
+    #[test]
+    fn test_dsig_object_with_unusual_prefix() {
+        let xml = r#"<sig:Signature xmlns:sig="http://www.w3.org/2000/09/xmldsig#">
+            <sig:Object>content</sig:Object>
+        </sig:Signature>"#;
         assert!(contains_ds_object(xml));
     }
 

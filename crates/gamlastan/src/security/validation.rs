@@ -1400,7 +1400,7 @@ mod tests {
         let mut response = make_valid_response(now);
         response.base.has_signature = true;
 
-        let sig_xml = r#"<ds:Signature><ds:Object>evil</ds:Object></ds:Signature>"#;
+        let sig_xml = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:Object>evil</ds:Object></ds:Signature>"#;
         let params = ValidationParams {
             response_signature_xml: Some(sig_xml),
             response_signature_verified: Some(true),

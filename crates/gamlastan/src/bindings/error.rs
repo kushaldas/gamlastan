@@ -21,6 +21,14 @@ pub enum BindingError {
     #[error("missing SAML parameter: {0}")]
     MissingSamlParam(&'static str),
 
+    /// A binding request supplied the same security-sensitive parameter more than once.
+    #[error("duplicate SAML parameter: {0}")]
+    DuplicateSamlParam(&'static str),
+
+    /// A binding request contains an ambiguous or inconsistent SAML parameter set.
+    #[error("invalid SAML parameters: {0}")]
+    InvalidSamlParams(String),
+
     /// Invalid artifact format.
     #[error("invalid artifact: {0}")]
     InvalidArtifact(String),
