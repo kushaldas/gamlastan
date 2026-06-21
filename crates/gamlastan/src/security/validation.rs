@@ -345,10 +345,7 @@ impl<'a> AssertionValidator<'a> {
                 ));
             }
         } else {
-            result.add(ValidationCheck::pass(
-                6,
-                "Assertion protected by verified signature",
-            ));
+            result.add(ValidationCheck::pass(6, "Assertion signature not required"));
         }
 
         // Check 7: No ds:Object (E91) - handled at response level if response sig present

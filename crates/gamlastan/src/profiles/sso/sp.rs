@@ -228,10 +228,15 @@ pub fn process_response_with_verified_signatures(
         client_address: None,
         relay_state: None,
         response_signature_xml: None,
-        response_signature_verified: response
-            .base
-            .has_signature
-            .then(|| verified_signed_ids.contains(&response.base.id.as_str())),
+        response_signature_verified: if response.base.has_signature {
+            if verified_signed_ids.is_empty() {
+                None
+            } else {
+                Some(verified_signed_ids.contains(&response.base.id.as_str()))
+            }
+        } else {
+            None
+        },
         verified_signed_ids,
         current_proxy_depth: 0,
         now,
