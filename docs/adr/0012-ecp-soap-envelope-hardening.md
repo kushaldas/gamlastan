@@ -65,6 +65,3 @@ Make the ECP phase-2 envelope parser enforce the SOAP 1.1 structure it depends o
   + real `samlp:Response` in one Body).
 - `cargo test -p gamlastan` — passing.
 
-## Publication status
-
-Unreleased.

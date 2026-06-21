@@ -17,7 +17,9 @@ use chrono::Utc;
 use gamlastan::bindings::redirect::RedirectEncodeParams;
 use gamlastan::bindings::relay_state::RelayState;
 use gamlastan::core::assertion::name_id::NameId;
+use gamlastan::core::protocol::logout::{LogoutRequest, LogoutResponse};
 use gamlastan::core::protocol::response::Response as SamlResponse;
+use gamlastan::crypto::keys::loader;
 use gamlastan::crypto::signer::SamlSigner;
 use gamlastan::crypto::{KeysManager, SamlVerifier, VerifyResult};
 use gamlastan::profiles::logout;
@@ -364,6 +366,18 @@ fn trusted_idp_verifier(config: &SpConfig) -> Result<SamlVerifier, SamlActixErro
     let mut keys = KeysManager::new();
     for idp in config.idp_metadata.idp_sso_descriptors() {
         for cert in idp.signing_certificates_der() {
+            // XML-DSig enveloped verification uses trusted certs for
+            // certificate-chain trust decisions. Redirect binding verification
+            // needs an actual public verification key, so add both views of the
+            // same metadata certificate. If the certificate cannot be parsed
+            // into a public verification key, fail here with a configuration
+            // error instead of surfacing a later "No verification key found".
+            let key = loader::load_x509_cert_der(&cert).map_err(|e| {
+                SamlActixError::Configuration(format!(
+                    "IdP signing certificate cannot be used for verification: {e}"
+                ))
+            })?;
+            keys.add_key(key);
             keys.add_trusted_cert(cert);
         }
     }
@@ -378,6 +392,182 @@ fn trusted_idp_verifier(config: &SpConfig) -> Result<SamlVerifier, SamlActixErro
         keys,
         config.security.reject_signatures_with_ds_object,
     ))
+}
+
+/// Verify an incoming SLO message signature and bind it to the parsed message ID.
+///
+/// SLO can arrive through HTTP Redirect, where the signature covers the query
+/// string, or through POST/SOAP-style XML with an enveloped XML-DSig signature.
+/// This helper accepts either form but never accepts unsigned SLO messages in
+/// the ready-to-use SP handler.
+fn verify_slo_message_signature(
+    msg: &SamlMessage,
+    xml: &str,
+    message_id: &str,
+    has_xml_signature: bool,
+    config: &SpConfig,
+) -> Result<(), SamlActixError> {
+    let verifier = if msg.redirect_signature.is_some() || has_xml_signature {
+        Some(trusted_idp_verifier(config)?)
+    } else {
+        None
+    };
+
+    if let (Some(sig), Some(verifier)) = (&msg.redirect_signature, verifier.as_ref()) {
+        let valid = verifier
+            .verify_redirect_query(sig.signature_input.as_bytes(), &sig.signature, &sig.sig_alg)
+            .map_err(|e| {
+                SamlActixError::Profile(gamlastan::profiles::ProfileError::AssertionValidation(
+                    format!("SLO redirect signature verification failed: {e}"),
+                ))
+            })?;
+        if valid {
+            return Ok(());
+        }
+        return Err(SamlActixError::Profile(
+            gamlastan::profiles::ProfileError::AssertionValidation(
+                "SLO redirect signature verification failed".into(),
+            ),
+        ));
+    }
+
+    if !has_xml_signature {
+        return Err(SamlActixError::Profile(
+            gamlastan::profiles::ProfileError::AssertionValidation(
+                "SLO message must be signed".into(),
+            ),
+        ));
+    }
+
+    // For XML signatures, require the verified same-document reference to name
+    // the LogoutRequest/LogoutResponse ID parsed above. That keeps signature
+    // verification bound to the object used for logout decisions.
+    let verifier = verifier.as_ref().ok_or_else(|| {
+        SamlActixError::Profile(gamlastan::profiles::ProfileError::AssertionValidation(
+            "SLO message must be signed".into(),
+        ))
+    })?;
+    let verify_result = verifier.verify_enveloped(xml).map_err(|e| {
+        SamlActixError::Profile(gamlastan::profiles::ProfileError::AssertionValidation(
+            format!("SLO XML signature verification failed: {e}"),
+        ))
+    })?;
+    match verify_result {
+        VerifyResult::Valid { references, .. } => {
+            if references
+                .iter()
+                .any(|reference| reference.uri.strip_prefix('#') == Some(message_id))
+            {
+                Ok(())
+            } else {
+                Err(SamlActixError::Profile(
+                    gamlastan::profiles::ProfileError::AssertionValidation(
+                        "SLO XML signature did not reference the parsed message ID".into(),
+                    ),
+                ))
+            }
+        }
+        VerifyResult::Invalid { reason } => Err(SamlActixError::Profile(
+            gamlastan::profiles::ProfileError::AssertionValidation(format!(
+                "SLO XML signature verification failed: {reason}"
+            )),
+        )),
+    }
+}
+
+/// Validate issuer and Destination on an IdP-originated LogoutRequest.
+fn validate_slo_logout_request(
+    request: &LogoutRequest,
+    config: &SpConfig,
+) -> Result<(), SamlActixError> {
+    validate_slo_common(
+        request.issuer.as_ref().map(|issuer| issuer.value.as_str()),
+        request.destination.as_deref(),
+        config,
+    )
+}
+
+/// Validate issuer, Destination, and InResponseTo on an IdP LogoutResponse.
+fn validate_slo_logout_response(
+    response: &LogoutResponse,
+    config: &SpConfig,
+) -> Result<(), SamlActixError> {
+    validate_slo_common(
+        response.issuer.as_ref().map(|issuer| issuer.value.as_str()),
+        response.destination.as_deref(),
+        config,
+    )?;
+
+    let in_response_to = response.in_response_to.as_deref().ok_or_else(|| {
+        SamlActixError::Profile(gamlastan::profiles::ProfileError::AssertionValidation(
+            "LogoutResponse missing InResponseTo".into(),
+        ))
+    })?;
+    if !config.request_id_tracker.consume(in_response_to) {
+        return Err(SamlActixError::Profile(
+            gamlastan::profiles::ProfileError::AssertionValidation(format!(
+                "LogoutResponse InResponseTo {in_response_to} matches no outstanding LogoutRequest"
+            )),
+        ));
+    }
+
+    if !response.status.is_success() {
+        return Err(SamlActixError::Profile(
+            gamlastan::profiles::ProfileError::ResponseFailure(
+                response
+                    .status
+                    .status_message
+                    .clone()
+                    .unwrap_or_else(|| response.status.status_code.value.clone()),
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Validate common SLO trust fields before acting on the message.
+fn validate_slo_common(
+    issuer: Option<&str>,
+    destination: Option<&str>,
+    config: &SpConfig,
+) -> Result<(), SamlActixError> {
+    let issuer = issuer.ok_or_else(|| {
+        SamlActixError::Profile(gamlastan::profiles::ProfileError::AssertionValidation(
+            "SLO message missing Issuer".into(),
+        ))
+    })?;
+    if issuer != config.idp_metadata.entity_id {
+        return Err(SamlActixError::Profile(
+            gamlastan::profiles::ProfileError::AssertionValidation(format!(
+                "SLO issuer {issuer} does not match IdP {}",
+                config.idp_metadata.entity_id
+            )),
+        ));
+    }
+
+    if config.security.verify_destination {
+        match destination {
+            Some(dest) if dest == config.slo_url => {}
+            Some(dest) => {
+                return Err(SamlActixError::Profile(
+                    gamlastan::profiles::ProfileError::AssertionValidation(format!(
+                        "SLO Destination {dest} does not match {}",
+                        config.slo_url
+                    )),
+                ));
+            }
+            None => {
+                return Err(SamlActixError::Profile(
+                    gamlastan::profiles::ProfileError::AssertionValidation(
+                        "SLO message missing Destination".into(),
+                    ),
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// SP logout initiation handler: create a LogoutRequest and send to IdP.
@@ -422,6 +612,7 @@ async fn sp_logout(
 
     let logout_request = logout::create_sp_logout_request(&options)
         .map_err(|e| SamlActixError::Internal(format!("failed to create LogoutRequest: {e}")))?;
+    config.request_id_tracker.store(&logout_request.id);
 
     let xml = logout_request
         .to_xml_string()
@@ -467,6 +658,14 @@ async fn sp_slo(
             let logout_req = req_ref.to_owned();
 
             let now = Utc::now();
+            verify_slo_message_signature(
+                &msg,
+                xml_str,
+                &logout_req.id,
+                logout_req.has_signature,
+                &config,
+            )?;
+            validate_slo_logout_request(&logout_req, &config)?;
             logout::validate_logout_request(&logout_req, now, config.security.clock_skew_seconds)
                 .map_err(|e| SamlActixError::Internal(format!("invalid LogoutRequest: {e}")))?;
 
@@ -508,8 +707,21 @@ async fn sp_slo(
             Ok(HttpResponse::Ok().body("Logout completed"))
         }
         "LogoutResponse" => {
-            // Process the IdP's response to our LogoutRequest
-            // For now, just acknowledge it
+            // A LogoutResponse completes an SP-initiated logout only if it is
+            // signed by the IdP, targets this SLO endpoint, and correlates to a
+            // LogoutRequest ID that this SP actually issued.
+            let resp_ref = gamlastan::xml::deserialize::parse_saml::<
+                gamlastan::core::protocol::logout::LogoutResponseRef<'_>,
+            >(&doc)?;
+            let logout_resp = resp_ref.to_owned();
+            verify_slo_message_signature(
+                &msg,
+                xml_str,
+                &logout_resp.id,
+                logout_resp.has_signature,
+                &config,
+            )?;
+            validate_slo_logout_response(&logout_resp, &config)?;
             Ok(HttpResponse::Ok().body("Logout completed"))
         }
         other => Err(SamlActixError::UnsupportedBinding(format!(
@@ -606,6 +818,61 @@ fn extract_query_param(query: &str, name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extractors::SamlBinding;
+    use gamlastan::core::assertion::issuer::Issuer;
+    use gamlastan::core::protocol::status::Status;
+    use gamlastan::metadata::types::endpoint::Endpoint;
+    use gamlastan::metadata::types::entity_descriptor::{EntityDescriptor, EntityRoles};
+    use gamlastan::metadata::types::idp::IdpSsoDescriptor;
+    use gamlastan::metadata::types::key_descriptor::KeyDescriptor;
+    use gamlastan::metadata::types::role_descriptor::{RoleDescriptorBase, SsoDescriptorBase};
+
+    fn test_sp_config() -> SpConfig {
+        let idp = IdpSsoDescriptor {
+            sso_base: SsoDescriptorBase {
+                base: RoleDescriptorBase::new(vec![
+                    "urn:oasis:names:tc:SAML:2.0:protocol".to_string()
+                ]),
+                artifact_resolution_services: vec![],
+                single_logout_services: vec![Endpoint::new(
+                    gamlastan::profiles::sso::web_browser::bindings::HTTP_REDIRECT,
+                    "https://idp.example.com/slo",
+                )],
+                manage_name_id_services: vec![],
+                name_id_formats: vec![],
+            },
+            want_authn_requests_signed: None,
+            single_sign_on_services: vec![],
+            name_id_mapping_services: vec![],
+            assertion_id_request_services: vec![],
+            attribute_profiles: vec![],
+            attributes: vec![],
+        };
+        let metadata = EntityDescriptor {
+            entity_id: "https://idp.example.com".to_string(),
+            id: None,
+            valid_until: None,
+            cache_duration: None,
+            has_signature: false,
+            extensions: None,
+            roles: EntityRoles::Roles {
+                idp_sso: vec![idp],
+                sp_sso: vec![],
+                authn_authority: vec![],
+                attr_authority: vec![],
+                pdp: vec![],
+            },
+            organization: None,
+            contact_persons: vec![],
+            additional_metadata_locations: vec![],
+        };
+        SpConfig::new(
+            "https://sp.example.com",
+            "https://sp.example.com/acs",
+            metadata,
+        )
+        .with_slo_url("https://sp.example.com/slo")
+    }
 
     #[test]
     fn test_extract_query_param() {
@@ -643,5 +910,88 @@ mod tests {
         let _sig_alg = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
         // SpSigningContext is a public struct with signer and sig_algorithm fields
         assert!(std::mem::size_of::<SpSigningContext>() > 0);
+    }
+
+    #[test]
+    fn test_trusted_idp_verifier_rejects_unusable_signing_cert() {
+        let mut config = test_sp_config();
+        let EntityRoles::Roles { idp_sso, .. } = &mut config.idp_metadata.roles else {
+            panic!("test metadata should contain IdP SSO role");
+        };
+        idp_sso[0]
+            .sso_base
+            .base
+            .key_descriptors
+            .push(KeyDescriptor::signing(
+                r#"<ds:KeyInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:X509Data><ds:X509Certificate>AAAA</ds:X509Certificate></ds:X509Data></ds:KeyInfo>"#,
+            ));
+
+        let err = match trusted_idp_verifier(&config) {
+            Ok(_) => panic!("invalid signing certificate should be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("cannot be used for verification"));
+    }
+
+    #[test]
+    fn test_slo_unsigned_message_is_rejected_before_metadata_key_lookup() {
+        let config = test_sp_config();
+        let msg = SamlMessage {
+            saml_xml: b"<samlp:LogoutRequest/>".to_vec(),
+            relay_state: None,
+            is_request: true,
+            binding: SamlBinding::HttpRedirect,
+            redirect_signature: None,
+        };
+
+        let err =
+            verify_slo_message_signature(&msg, "<samlp:LogoutRequest/>", "_id", false, &config)
+                .unwrap_err();
+        assert!(err.to_string().contains("SLO message must be signed"));
+    }
+
+    #[test]
+    fn test_slo_common_rejects_issuer_and_destination_mismatch() {
+        let config = test_sp_config();
+
+        let issuer_err = validate_slo_common(
+            Some("https://evil.example.com"),
+            Some(&config.slo_url),
+            &config,
+        )
+        .unwrap_err();
+        assert!(issuer_err.to_string().contains("does not match IdP"));
+
+        let destination_err = validate_slo_common(
+            Some("https://idp.example.com"),
+            Some("https://sp.example.com/other"),
+            &config,
+        )
+        .unwrap_err();
+        assert!(destination_err.to_string().contains("Destination"));
+    }
+
+    #[test]
+    fn test_slo_logout_response_requires_matching_in_response_to() {
+        let config = test_sp_config();
+        config.request_id_tracker.store("_logout_req");
+        let response = LogoutResponse {
+            id: "_logout_resp".to_string(),
+            version: gamlastan::core::identifiers::SamlVersion::V2_0,
+            issue_instant: Utc::now(),
+            destination: Some(config.slo_url.clone()),
+            consent: None,
+            issuer: Some(Issuer::entity("https://idp.example.com")),
+            has_signature: false,
+            in_response_to: Some("_logout_req".to_string()),
+            status: Status::success(),
+        };
+
+        validate_slo_logout_response(&response, &config).unwrap();
+
+        let replay = validate_slo_logout_response(&response, &config).unwrap_err();
+        assert!(replay
+            .to_string()
+            .contains("matches no outstanding LogoutRequest"));
     }
 }

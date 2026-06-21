@@ -85,7 +85,3 @@ pattern and full round-trip through `SamlSerialize` / `SamlDeserialize`.
   (`test_encrypted_advice_roundtrip` via `eptid_attribute`) and an `Advice`
   carrying an encrypted assertion.
 
-## Publication status
-
-Unreleased; the new field and variant may still change shape before a tagged
-release.

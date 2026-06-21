@@ -87,6 +87,3 @@ should use `process_response_with_verified_signatures`.
 - `cargo test -p gamlastan -p gamlastan-actix` passed.
 - `cargo test --workspace` passed.
 
-## Publication status
-
-Unreleased.

@@ -89,7 +89,3 @@ these functions propagate failures with `?` instead of stringly-typed `Other`.
   round-trip. All pass.
 - `cargo test -p gamlastan` — 592 unit + 3 integration passing.
 
-## Publication status
-
-Unreleased; the encryption helper signatures and `CertEncryptionOptions` may still
-change.

@@ -108,7 +108,3 @@ intentional:
   CoCo `only_required`) and the eptid/ident/authn_broker/assertion_store tests.
 - `cargo clippy -p gamlastan` (gated on `-D warnings`) — clean.
 
-## Publication status
-
-Unreleased. Implemented and tested but not yet wired into a production handler;
-the store traits and policy API are still free to change.

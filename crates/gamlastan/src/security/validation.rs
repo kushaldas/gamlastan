@@ -431,10 +431,22 @@ impl<'a> AssertionValidator<'a> {
                 params.current_proxy_depth,
             ));
         } else {
-            // No conditions - all condition checks pass
+            // Web Browser SSO bearer assertions must be scoped to this SP and
+            // have an assertion-level expiry. Without Conditions, a stolen
+            // assertion is harder to bind to an audience or lifetime, so fail
+            // the security-significant checks and leave optional conditions as
+            // informational passes.
             result.add(ValidationCheck::pass(9, "NotBefore valid"));
-            result.add(ValidationCheck::pass(10, "NotOnOrAfter valid"));
-            result.add(ValidationCheck::pass(11, "AudienceRestriction satisfied"));
+            result.add(ValidationCheck::fail(
+                10,
+                "NotOnOrAfter valid",
+                "Assertion Conditions with NotOnOrAfter are required",
+            ));
+            result.add(ValidationCheck::fail(
+                11,
+                "AudienceRestriction satisfied",
+                "Assertion Conditions with AudienceRestriction are required",
+            ));
             result.add(ValidationCheck::pass(12, "OneTimeUse condition"));
             result.add(ValidationCheck::pass(13, "ProxyRestriction count"));
         }
@@ -541,9 +553,10 @@ impl<'a> AssertionValidator<'a> {
                 ));
             }
         } else {
-            result.add(ValidationCheck::pass(
+            result.add(ValidationCheck::fail(
                 16,
                 "SubjectConfirmation NotOnOrAfter",
+                "Bearer SubjectConfirmationData NotOnOrAfter is required",
             ));
         }
 
@@ -1067,6 +1080,49 @@ mod tests {
         let result = validator.validate_response(&response, &params);
         let failures = result.failures();
         assert!(failures.iter().any(|c| c.check_number == 10));
+    }
+
+    #[test]
+    fn test_missing_conditions_fails_audience_and_expiry() {
+        let now = Utc::now();
+        let config = SecurityConfig {
+            require_signed_assertions: false,
+            ..SecurityConfig::default()
+        };
+        let validator = AssertionValidator::new(&config);
+        let mut response = make_valid_response(now);
+        response.assertions[0].conditions = None;
+        let params = make_params(now);
+
+        let result = validator.validate_response(&response, &params);
+        let failures = result.failures();
+        assert!(failures.iter().any(|c| c.check_number == 10));
+        assert!(failures.iter().any(|c| c.check_number == 11));
+    }
+
+    #[test]
+    fn test_missing_bearer_not_on_or_after_fails() {
+        let now = Utc::now();
+        let config = SecurityConfig {
+            require_signed_assertions: false,
+            ..SecurityConfig::default()
+        };
+        let validator = AssertionValidator::new(&config);
+        let mut response = make_valid_response(now);
+        response.assertions[0]
+            .subject
+            .as_mut()
+            .unwrap()
+            .subject_confirmations[0]
+            .subject_confirmation_data
+            .as_mut()
+            .unwrap()
+            .not_on_or_after = None;
+        let params = make_params(now);
+
+        let result = validator.validate_response(&response, &params);
+        let failures = result.failures();
+        assert!(failures.iter().any(|c| c.check_number == 16));
     }
 
     #[test]

@@ -195,13 +195,6 @@ Recorded so the profile's coverage is unambiguous:
   (cleartext-assertion rejection, exactly-one-assertion, response-Issuer
   binding, dangling-`InResponseTo` rejection, encrypted `SignMessage` body).
 
-## Publication status
-
-Unreleased. The profile is implemented and tested but not yet wired into any
-production handler (`gamlastan-actix`, `example-idp`) and has no external
-consumers, so its API — including the post-review breaking changes in #6 — is
-still free to change.
-
 ## Alternatives considered
 
 - **Extend core protocol/metadata types** with Sweden Connect fields/extensions.

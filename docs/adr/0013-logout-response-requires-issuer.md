@@ -62,6 +62,3 @@ if issuer.value != target.entity_id { /* reject */ }
   `issuer = None` is rejected).
 - `cargo test -p gamlastan test_orchestrator` — passing.
 
-## Publication status
-
-Unreleased.

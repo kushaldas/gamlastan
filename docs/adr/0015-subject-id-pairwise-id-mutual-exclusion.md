@@ -107,6 +107,3 @@ role-level `SpSsoDescriptor` that `restrict()` receives, and this matches how
 - `test_subject_id_req_parsing`, `test_prefer_pairwise_over_subject_id`.
 - `cargo test -p gamlastan` — 605 passing.
 
-## Publication status
-
-Unreleased.

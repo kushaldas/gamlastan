@@ -39,8 +39,10 @@ pub fn soap_envelope_wrap(saml_xml: &str, header_blocks: Option<&str>) -> String
 
 /// Extract the SAML element from a SOAP 1.1 envelope body.
 ///
-/// Returns the raw XML content of the `<soap:Body>` element.
-/// Uses the uppsala XML parser for reliable extraction.
+/// The binding requires one SOAP 1.1 `Envelope`, exactly one SOAP 1.1 `Body`,
+/// and exactly one element child inside that body. Rejecting extra body
+/// elements prevents SOAP wrapping/confusion attacks where one element is
+/// verified but a different sibling is consumed by application code.
 pub fn soap_envelope_unwrap(soap_xml: &[u8]) -> Result<SoapUnwrapped, BindingError> {
     let xml_str = std::str::from_utf8(soap_xml)
         .map_err(|e| BindingError::InvalidSoapEnvelope(format!("not valid UTF-8: {}", e)))?;
@@ -56,22 +58,39 @@ pub fn soap_envelope_unwrap(soap_xml: &[u8]) -> Result<SoapUnwrapped, BindingErr
         .element(root)
         .ok_or_else(|| BindingError::InvalidSoapEnvelope("invalid root element".to_string()))?;
 
-    // Verify this is a SOAP Envelope
-    if root_elem.name.local_name != "Envelope" {
+    // Verify this is a SOAP 1.1 Envelope by expanded name. Local-name-only
+    // checks would allow a non-SOAP element named Envelope to be accepted.
+    if root_elem.name.local_name != "Envelope"
+        || root_elem.name.namespace_uri.as_deref() != Some(SOAP11_NS)
+    {
         return Err(BindingError::InvalidSoapEnvelope(format!(
-            "expected Envelope, got {}",
-            root_elem.name.local_name
+            "expected SOAP 1.1 Envelope, got {{{}}}{}",
+            root_elem.name.namespace_uri.as_deref().unwrap_or(""),
+            root_elem.name.local_name,
         )));
     }
 
-    // Find Body element
-    let mut body_content = None;
+    // SOAP 1.1 allows at most one optional Header followed by one Body. We
+    // collect those elements explicitly so duplicate containers fail instead of
+    // being merged or having the later one overwrite the earlier one.
+    let mut body_node = None;
+    let mut header_seen = false;
     let mut header_content = None;
 
     for child in doc.children_iter(root) {
         if let Some(elem) = doc.element(child) {
-            match elem.name.local_name.as_ref() {
-                "Header" => {
+            match (
+                elem.name.namespace_uri.as_deref(),
+                elem.name.local_name.as_ref(),
+            ) {
+                (Some(SOAP11_NS), "Header") => {
+                    if header_seen {
+                        return Err(BindingError::InvalidSoapEnvelope(
+                            "multiple SOAP Header elements".to_string(),
+                        ));
+                    }
+                    header_seen = true;
+
                     // Extract header blocks as raw XML
                     let header_children: Vec<_> = doc.children_iter(child).collect();
                     if !header_children.is_empty() {
@@ -82,21 +101,14 @@ pub fn soap_envelope_unwrap(soap_xml: &[u8]) -> Result<SoapUnwrapped, BindingErr
                         header_content = Some(headers);
                     }
                 }
-                "Body" => {
-                    // Extract the first child element of Body, checking for Fault first
-                    for bc in doc.children_iter(child) {
-                        if let Some(bc_elem) = doc.element(bc) {
-                            // Check for SOAP Fault before treating as body content
-                            if bc_elem.name.local_name == "Fault" {
-                                return parse_soap_fault(&doc, bc);
-                            }
-                            if body_content.is_none() {
-                                body_content = Some(doc.node_to_xml(bc));
-                            }
-                        }
+                (Some(SOAP11_NS), "Body") => {
+                    if body_node.replace(child).is_some() {
+                        return Err(BindingError::InvalidSoapEnvelope(
+                            "multiple SOAP Body elements".to_string(),
+                        ));
                     }
                 }
-                "Fault" => {
+                (Some(SOAP11_NS), "Fault") => {
                     // SOAP Fault at top level (shouldn't happen but handle)
                     return parse_soap_fault(&doc, child);
                 }
@@ -105,9 +117,40 @@ pub fn soap_envelope_unwrap(soap_xml: &[u8]) -> Result<SoapUnwrapped, BindingErr
         }
     }
 
-    let body_xml = body_content.ok_or_else(|| {
-        BindingError::InvalidSoapEnvelope("no SAML element in SOAP Body".to_string())
-    })?;
+    let body_node = body_node
+        .ok_or_else(|| BindingError::InvalidSoapEnvelope("no SOAP Body element".to_string()))?;
+
+    let mut body_children = Vec::new();
+    for child in doc.children_iter(body_node) {
+        if doc.element(child).is_some() {
+            body_children.push(child);
+        }
+    }
+
+    match body_children.as_slice() {
+        [only] => {
+            let elem = doc.element(*only).ok_or_else(|| {
+                BindingError::InvalidSoapEnvelope("invalid SOAP Body child".to_string())
+            })?;
+            if elem.name.namespace_uri.as_deref() == Some(SOAP11_NS)
+                && elem.name.local_name == "Fault"
+            {
+                return parse_soap_fault(&doc, *only);
+            }
+        }
+        [] => {
+            return Err(BindingError::InvalidSoapEnvelope(
+                "no SAML element in SOAP Body".to_string(),
+            ));
+        }
+        _ => {
+            return Err(BindingError::InvalidSoapEnvelope(
+                "multiple element children in SOAP Body".to_string(),
+            ));
+        }
+    }
+
+    let body_xml = doc.node_to_xml(body_children[0]);
 
     Ok(SoapUnwrapped {
         body_xml,
@@ -257,6 +300,34 @@ mod tests {
     #[test]
     fn test_soap_unwrap_not_envelope() {
         let result = soap_envelope_unwrap(b"<NotEnvelope/>");
+        assert!(matches!(result, Err(BindingError::InvalidSoapEnvelope(_))));
+    }
+
+    #[test]
+    fn test_soap_unwrap_rejects_non_soap_envelope_namespace() {
+        let xml = br#"<Envelope xmlns="urn:not-soap"><Body><samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"/></Body></Envelope>"#;
+        let result = soap_envelope_unwrap(xml);
+        assert!(matches!(result, Err(BindingError::InvalidSoapEnvelope(_))));
+    }
+
+    #[test]
+    fn test_soap_unwrap_rejects_duplicate_body() {
+        let xml = br#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><a:One xmlns:a="urn:test"/></soap:Body><soap:Body><a:Two xmlns:a="urn:test"/></soap:Body></soap:Envelope>"#;
+        let result = soap_envelope_unwrap(xml);
+        assert!(matches!(result, Err(BindingError::InvalidSoapEnvelope(_))));
+    }
+
+    #[test]
+    fn test_soap_unwrap_rejects_duplicate_header() {
+        let xml = br#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Header><a:One xmlns:a="urn:test"/></soap:Header><soap:Header><a:Two xmlns:a="urn:test"/></soap:Header><soap:Body><a:Msg xmlns:a="urn:test"/></soap:Body></soap:Envelope>"#;
+        let result = soap_envelope_unwrap(xml);
+        assert!(matches!(result, Err(BindingError::InvalidSoapEnvelope(_))));
+    }
+
+    #[test]
+    fn test_soap_unwrap_rejects_multiple_body_element_children() {
+        let xml = br#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><a:One xmlns:a="urn:test"/><a:Two xmlns:a="urn:test"/></soap:Body></soap:Envelope>"#;
+        let result = soap_envelope_unwrap(xml);
         assert!(matches!(result, Err(BindingError::InvalidSoapEnvelope(_))));
     }
 }
