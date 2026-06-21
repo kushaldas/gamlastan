@@ -82,7 +82,3 @@ generator script reads pysaml2's authoritative maps and emits the `IDENTIFIER` /
   within the 592-test suite.
 - The EPTID roundtrip in `tests/cert_encryption.rs` exercises `eptid_attribute`.
 
-## Publication status
-
-Unreleased. Map contents and converter API may still change (e.g. map refresh from
-upstream pysaml2).

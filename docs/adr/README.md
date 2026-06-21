@@ -25,3 +25,6 @@ rewriting history (mark the old one `Superseded by NNNN`).
 | [0014](0014-entity-category-conflict-matcher.md) | Conflict-aware entity-category matcher for REFEDS Access | Accepted |
 | [0015](0015-subject-id-pairwise-id-mutual-exclusion.md) | Prefer pairwise-id when subject-id:req is any | Accepted |
 | [0016](0016-acs-signature-verification-before-claims.md) | Verify ACS signatures before consuming claims | Accepted |
+| [0017](0017-web-sso-requires-audience-and-expiry.md) | Web SSO requires audience and bearer expiry | Accepted |
+| [0018](0018-soap-body-single-child-enforcement.md) | Enforce a single SOAP Body child | Accepted |
+| [0019](0019-sp-slo-requires-trust-and-correlation.md) | SP SLO requires trust and correlation | Accepted |

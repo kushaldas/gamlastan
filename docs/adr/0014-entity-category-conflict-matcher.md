@@ -119,6 +119,3 @@ once as shared `const`s
   `test_swamid_default_includes_refeds_access`.
 - `cargo test -p gamlastan` — 605 passing.
 
-## Publication status
-
-Unreleased.

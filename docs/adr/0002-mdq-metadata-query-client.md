@@ -184,14 +184,6 @@ Recorded so the crate's coverage is unambiguous:
   rejected (not panicking).
 - `cargo build --workspace` — clean.
 
-## Publication status
-
-Unreleased. The crate is registered in the workspace but not yet wired into any
-production handler and has no external consumers, so its API — including the
-post-review breaking change in #7 (no-cert clients now error by default) — is
-still free to change. The intended first consumer is the `translateid` identity
-proxy.
-
 ## Alternatives considered
 
 - **An in-crate `metadata::mdq` module** (as ADR 0001 did for Sweden Connect).
