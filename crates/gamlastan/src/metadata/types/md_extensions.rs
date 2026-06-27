@@ -71,7 +71,7 @@ impl MdExtensions {
         let Some(root) = doc.document_element() else {
             return out;
         };
-        walk(&doc, root, &mut out);
+        walk(&doc, root, false, &mut out);
         out
     }
 
@@ -92,7 +92,18 @@ impl MdExtensions {
     }
 }
 
-fn walk(doc: &crate::xml::Document<'_>, node: crate::xml::NodeId, out: &mut MdExtensions) {
+/// Recursively collect the registration authority and entity attributes.
+///
+/// `in_entity_attributes` tracks whether the current node is a descendant of an
+/// `mdattr:EntityAttributes` element. Only `saml:Attribute` elements inside one
+/// are treated as entity attributes; a `saml:Attribute` that appears in some
+/// other extension fragment is ignored.
+fn walk(
+    doc: &crate::xml::Document<'_>,
+    node: crate::xml::NodeId,
+    in_entity_attributes: bool,
+    out: &mut MdExtensions,
+) {
     for child in doc.children_iter(node) {
         let Some(elem) = doc.element(child) else {
             continue;
@@ -100,20 +111,23 @@ fn walk(doc: &crate::xml::Document<'_>, node: crate::xml::NodeId, out: &mut MdEx
         let ns = elem.name.namespace_uri.as_deref();
         let local: &str = &elem.name.local_name;
 
+        let mut child_in_entity_attributes = in_entity_attributes;
         if ns == Some(MDRPI_NS) && local == "RegistrationInfo" {
             if out.registration_authority.is_none() {
                 if let Some(ra) = elem.get_attribute("registrationAuthority") {
                     out.registration_authority = Some(ra.to_string());
                 }
             }
-        } else if ns == Some(SAML_ASSERTION_NS) && local == "Attribute" {
+        } else if ns == Some(MDATTR_NS) && local == "EntityAttributes" {
+            child_in_entity_attributes = true;
+        } else if in_entity_attributes && ns == Some(SAML_ASSERTION_NS) && local == "Attribute" {
             if let Some(name) = elem.get_attribute("Name") {
                 let values = attribute_values(doc, child);
                 out.entity_attributes.push((name.to_string(), values));
             }
         }
 
-        walk(doc, child, out);
+        walk(doc, child, child_in_entity_attributes, out);
     }
 }
 
@@ -194,6 +208,37 @@ mod tests {
         );
         assert!(ext.registration_authority.is_none());
         assert!(ext.entity_categories().is_empty());
+    }
+
+    #[test]
+    fn test_stray_saml_attribute_outside_entity_attributes_is_ignored() {
+        // A saml:Attribute that is NOT inside mdattr:EntityAttributes (here in
+        // an unrelated requested-attributes fragment) must not be picked up as
+        // an entity attribute.
+        let ext = MdExtensions::parse(
+            r#"
+            <mdattr:EntityAttributes xmlns:mdattr="urn:oasis:names:tc:SAML:metadata:attribute"
+                xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">
+              <saml:Attribute Name="http://macedir.org/entity-category">
+                <saml:AttributeValue>http://refeds.org/category/research-and-scholarship</saml:AttributeValue>
+              </saml:Attribute>
+            </mdattr:EntityAttributes>
+            <somens:Other xmlns:somens="urn:example:other"
+                xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">
+              <saml:Attribute Name="urn:example:should-be-ignored">
+                <saml:AttributeValue>nope</saml:AttributeValue>
+              </saml:Attribute>
+            </somens:Other>
+            "#,
+        );
+        assert_eq!(ext.entity_attributes.len(), 1);
+        assert_eq!(
+            ext.entity_attributes[0].0,
+            "http://macedir.org/entity-category"
+        );
+        assert!(ext
+            .entity_attribute_values("urn:example:should-be-ignored")
+            .is_empty());
     }
 
     #[test]

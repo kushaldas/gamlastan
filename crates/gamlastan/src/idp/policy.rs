@@ -270,6 +270,19 @@ impl ReleasePolicy {
     /// Resolve a knob: SP entry first, then the SP's registration-authority
     /// entry, then `default` (pysaml2 `Policy.get` precedence).
     fn get<T, F: Fn(&PolicyEntry) -> Option<T>>(&self, sp_entity_id: &str, f: F) -> Option<T> {
+        self.get_ref(sp_entity_id, f)
+    }
+
+    /// Borrowing form of [`ReleasePolicy::get`]: resolves with the same
+    /// SP > registration authority > default precedence but lets `f` return a
+    /// borrow into the resolved [`PolicyEntry`], so large fields (the owned
+    /// entity-category policies, the restriction map) are read by reference
+    /// instead of cloned on every request.
+    fn get_ref<'a, T, F: Fn(&'a PolicyEntry) -> Option<T>>(
+        &'a self,
+        sp_entity_id: &str,
+        f: F,
+    ) -> Option<T> {
         self.entries
             .get(sp_entity_id)
             .and_then(&f)
@@ -412,8 +425,9 @@ impl ReleasePolicy {
         let fail_on_missing_requested = self.fail_on_missing_requested(sp_entity_id);
 
         // Step 1: entity-category release rules take precedence over
-        // per-attribute requested/optional matching when configured.
-        let categories = self.get(sp_entity_id, |e| e.entity_categories.clone());
+        // per-attribute requested/optional matching when configured. Borrow the
+        // resolved policy set rather than cloning it on every request.
+        let categories = self.get_ref(sp_entity_id, |e| e.entity_categories.as_deref());
         if let Some(policies) = categories {
             let required_local: Vec<String> = required
                 .iter()
@@ -431,8 +445,10 @@ impl ReleasePolicy {
         }
 
         // Step 3: the IdP's own attribute/value restrictions always apply.
-        if let Some(restrictions) = self.get(sp_entity_id, |e| e.attribute_restrictions.clone()) {
-            result = self.filter_attribute_value_assertions(result, &restrictions);
+        if let Some(restrictions) =
+            self.get_ref(sp_entity_id, |e| e.attribute_restrictions.as_ref())
+        {
+            result = self.filter_attribute_value_assertions(result, restrictions);
         }
 
         // Step 4: pysaml2 PR #987 — when the SP requests subject-id with

@@ -7,6 +7,8 @@ where needed to correct protocol handling.
 
 [Unreleased]
 
+## [0.6.0] - unreleased
+
 ### Added
 
 - `idp::entity_category`: owned, runtime-constructible entity categories.
@@ -26,7 +28,6 @@ where needed to correct protocol handling.
   `set_registration_authority` / `with_registration_authority` /
   `register_sp_metadata`, resolving SP entity ID > registration authority >
   default (pysaml2 `Policy.get` precedence). See ADR 0027.
-
 
 ### Security
 
