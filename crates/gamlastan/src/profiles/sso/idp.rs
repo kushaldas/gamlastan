@@ -27,7 +27,7 @@ use crate::crypto::encryptor::{
 use crate::metadata::types::sp::SpSsoDescriptor;
 
 use crate::profiles::error::ProfileError;
-use crate::profiles::sso::web_browser::ResponseOptions;
+use crate::profiles::sso::web_browser::{ResponseOptions, ResponseTimes};
 
 /// Result of processing an AuthnRequest on the IdP side.
 #[derive(Debug, Clone)]
@@ -201,8 +201,10 @@ fn resolve_acs_endpoint(
 pub fn create_response(
     options: &ResponseOptions,
     principal_name_id: &NameId,
-    now: DateTime<Utc>,
+    times: ResponseTimes,
 ) -> Response {
+    // Everything except AuthnInstant derives from the document issue instant.
+    let now = times.issue_instant;
     let assertion_lifetime = TimeDelta::seconds(options.assertion_lifetime_seconds as i64);
     let not_on_or_after = now + assertion_lifetime;
 
@@ -239,7 +241,7 @@ pub fn create_response(
 
     // Build AuthnStatement
     let authn_statement = AuthnStatement {
-        authn_instant: now,
+        authn_instant: times.authn_instant,
         session_index: options.session_index.clone(),
         session_not_on_or_after: options.session_not_on_or_after,
         subject_locality: options.client_address.as_ref().map(|addr| SubjectLocality {
@@ -436,7 +438,7 @@ pub fn create_unsolicited_response(
     session_index: Option<&str>,
     session_not_on_or_after: Option<DateTime<Utc>>,
     client_address: Option<&str>,
-    now: DateTime<Utc>,
+    times: ResponseTimes,
 ) -> Response {
     let options = ResponseOptions {
         idp_entity_id: idp_entity_id.to_string(),
@@ -451,7 +453,7 @@ pub fn create_unsolicited_response(
         attributes: attributes.to_vec(),
     };
 
-    create_response(&options, principal_name_id, now)
+    create_response(&options, principal_name_id, times)
 }
 
 #[cfg(test)]
@@ -618,7 +620,7 @@ mod tests {
             sp_provided_id: None,
         };
 
-        let response = create_response(&options, &name_id, now);
+        let response = create_response(&options, &name_id, ResponseTimes::at(now));
 
         // Check Response
         assert!(response.base.status.is_success());
@@ -669,6 +671,60 @@ mod tests {
         // Check AttributeStatement
         assert_eq!(assertion.attribute_statements.len(), 1);
         assert_eq!(assertion.attribute_statements[0].attributes.len(), 1);
+
+        // ResponseTimes::at collapses both instants to `now`.
+        assert_eq!(stmt.authn_instant, now);
+        assert_eq!(assertion.issue_instant, now);
+    }
+
+    #[test]
+    fn test_create_response_distinct_authn_instant() {
+        // A reused SSO session: the principal authenticated earlier than the
+        // response is generated. AuthnInstant must reflect the earlier time
+        // while every issue/validity instant tracks document generation.
+        let issued = Utc::now();
+        let authenticated = issued - TimeDelta::hours(2);
+        let options = ResponseOptions {
+            idp_entity_id: "https://idp.example.com".to_string(),
+            in_response_to: Some("_req123".to_string()),
+            sp_entity_id: "https://sp.example.com".to_string(),
+            acs_url: "https://sp.example.com/acs".to_string(),
+            assertion_lifetime_seconds: 300,
+            session_index: Some("_sess1".to_string()),
+            session_not_on_or_after: None,
+            authn_context_class_ref: Some(constants::AUTHN_CONTEXT_PASSWORD.to_string()),
+            client_address: None,
+            attributes: vec![],
+        };
+        let name_id = NameId {
+            value: "user@example.com".to_string(),
+            format: Some(constants::NAMEID_EMAIL.to_string()),
+            name_qualifier: None,
+            sp_name_qualifier: None,
+            sp_provided_id: None,
+        };
+
+        let response = create_response(
+            &options,
+            &name_id,
+            ResponseTimes {
+                issue_instant: issued,
+                authn_instant: authenticated,
+            },
+        );
+
+        let assertion = &response.assertions[0];
+        // Document/validity instants track generation time.
+        assert_eq!(response.base.issue_instant, issued);
+        assert_eq!(assertion.issue_instant, issued);
+        let conditions = assertion.conditions.as_ref().unwrap();
+        assert_eq!(conditions.not_before, Some(issued));
+        assert_eq!(
+            conditions.not_on_or_after,
+            Some(issued + TimeDelta::seconds(300))
+        );
+        // AuthnInstant reflects the (earlier) authentication time.
+        assert_eq!(assertion.authn_statements[0].authn_instant, authenticated);
     }
 
     #[test]
@@ -733,7 +789,7 @@ mod tests {
             Some("_sess1"),
             None,
             None,
-            now,
+            ResponseTimes::at(now),
         );
 
         // No InResponseTo for unsolicited

@@ -20,7 +20,7 @@ use crate::core::protocol::response::Response;
 use crate::core::protocol::status::Status;
 use crate::crypto::SamlEncryptor;
 use crate::profiles::sso::idp as idp_profile;
-use crate::profiles::sso::web_browser::ResponseOptions;
+use crate::profiles::sso::web_browser::{ResponseOptions, ResponseTimes};
 use crate::xml::serialize::SamlSerialize;
 
 use super::config::SwedenConnectConfig;
@@ -38,14 +38,14 @@ pub fn create_response(
     cfg: &SwedenConnectConfig,
     options: &ResponseOptions,
     principal_name_id: &NameId,
-    now: DateTime<Utc>,
+    times: ResponseTimes,
 ) -> Response {
     let mut options = options.clone();
     if options.authn_context_class_ref.is_none() {
         options.authn_context_class_ref = cfg.requested_loas.first().cloned();
     }
 
-    let mut response = idp_profile::create_response(&options, principal_name_id, now);
+    let mut response = idp_profile::create_response(&options, principal_name_id, times);
 
     // Section 6.2: a successful response MUST contain exactly one
     // AttributeStatement. The base builder omits it when there are no
@@ -176,7 +176,7 @@ mod tests {
     #[test]
     fn test_create_response_fills_loa_and_attr_statement() {
         let now = Utc::now();
-        let resp = create_response(&idp_cfg(), &options(), &name_id(), now);
+        let resp = create_response(&idp_cfg(), &options(), &name_id(), ResponseTimes::at(now));
         let assertion = &resp.assertions[0];
         // Exactly one AttributeStatement even though none were supplied.
         assert_eq!(assertion.attribute_statements.len(), 1);
