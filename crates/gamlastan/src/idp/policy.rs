@@ -20,7 +20,10 @@ use regex::Regex;
 use crate::attribute_map::AttributeConverterSet;
 use crate::core::assertion::attribute::{Attribute, AttributeValue};
 use crate::core::constants;
-use crate::idp::entity_category::{releasable_attributes, EntityCategoryPolicy, SubjectIdReq};
+use crate::idp::entity_category::{
+    releasable_attributes_owned, EntityCategoryPolicy, OwnedEntityCategoryPolicy, SubjectIdReq,
+};
+use crate::metadata::types::entity_descriptor::EntityDescriptor;
 use crate::metadata::types::sp::{RequestedAttribute, SpSsoDescriptor};
 
 /// Errors raised by policy evaluation.
@@ -92,7 +95,7 @@ pub struct PolicyEntry {
     name_form: Option<String>,
     sign: Option<SignTargets>,
     fail_on_missing_requested: Option<bool>,
-    entity_categories: Option<Vec<&'static EntityCategoryPolicy>>,
+    entity_categories: Option<Vec<OwnedEntityCategoryPolicy>>,
 }
 
 impl PolicyEntry {
@@ -163,9 +166,24 @@ impl PolicyEntry {
         self
     }
 
-    /// Enable entity-category based release with the given policies
-    /// (see [`crate::idp::entity_category`]).
+    /// Enable entity-category based release with the given shipped policies
+    /// (e.g. [`crate::idp::entity_category::SWAMID`]). Each is cloned into its
+    /// owned form; to mix in deployment-defined categories use
+    /// [`PolicyEntry::with_owned_entity_categories`].
     pub fn with_entity_categories(mut self, policies: Vec<&'static EntityCategoryPolicy>) -> Self {
+        self.entity_categories = Some(policies.iter().map(|p| p.as_owned()).collect());
+        self
+    }
+
+    /// Enable entity-category based release with caller-built, runtime
+    /// [`OwnedEntityCategoryPolicy`] values - the path for developer-defined
+    /// custom entity categories. Start from scratch with
+    /// [`OwnedEntityCategoryPolicy::new`], or extend a shipped policy with
+    /// [`OwnedEntityCategoryPolicy::extend_from_static`].
+    pub fn with_owned_entity_categories(
+        mut self,
+        policies: Vec<OwnedEntityCategoryPolicy>,
+    ) -> Self {
         self.entity_categories = Some(policies);
         self
     }
@@ -173,13 +191,21 @@ impl PolicyEntry {
 
 /// The IdP-side attribute release policy (pysaml2 `Policy`).
 ///
-/// Entry resolution per knob: the SP-specific entry, then `"default"`,
-/// then a built-in default (transient NameID, URI name format, 1h
-/// lifetime, no signing, fail on missing required attributes).
+/// Entry resolution per knob: the SP-specific entry first; if the SP has no
+/// entry of its own, the entry keyed on its registration authority (when one is
+/// recorded, see [`ReleasePolicy::set_registration_authority`]); then
+/// `"default"`; then a built-in default (transient NameID, URI name format, 1h
+/// lifetime, no signing, fail on missing required attributes). An SP that has
+/// its own entry is unaffected by the registration-authority entry (ADR 0027).
 #[derive(Debug, Default)]
 pub struct ReleasePolicy {
     entries: HashMap<String, PolicyEntry>,
     converters: AttributeConverterSet,
+    /// SP entity ID -> its `registrationAuthority`. When an SP has no entry of
+    /// its own, policy resolution falls back to the entry keyed on its
+    /// registration authority (pysaml2 `Policy.get`: SP > registration
+    /// authority > default) before the global `default`.
+    registration_authorities: HashMap<String, String>,
 }
 
 /// The key under which the fallback entry is stored.
@@ -191,6 +217,7 @@ impl ReleasePolicy {
         ReleasePolicy {
             entries: HashMap::new(),
             converters: AttributeConverterSet::with_default_maps(),
+            registration_authorities: HashMap::new(),
         }
     }
 
@@ -212,10 +239,71 @@ impl ReleasePolicy {
         self
     }
 
-    /// Resolve a knob: SP entry first, then `default`.
+    /// Record an SP's `registrationAuthority` so policy resolution can fall back
+    /// to a per-registration-authority entry (keyed on the authority URI) when
+    /// the SP has no entry of its own.
+    pub fn set_registration_authority(
+        &mut self,
+        sp_entity_id: impl Into<String>,
+        registration_authority: impl Into<String>,
+    ) {
+        self.registration_authorities
+            .insert(sp_entity_id.into(), registration_authority.into());
+    }
+
+    /// Builder form of [`ReleasePolicy::set_registration_authority`].
+    pub fn with_registration_authority(
+        mut self,
+        sp_entity_id: impl Into<String>,
+        registration_authority: impl Into<String>,
+    ) -> Self {
+        self.set_registration_authority(sp_entity_id, registration_authority);
+        self
+    }
+
+    /// Record an SP's registration authority straight from its metadata (reads
+    /// `mdrpi:RegistrationInfo/@registrationAuthority`). No-op when the metadata
+    /// declares none.
+    pub fn register_sp_metadata(&mut self, entity: &EntityDescriptor) {
+        if let Some(ra) = entity.registration_authority() {
+            self.set_registration_authority(entity.entity_id.clone(), ra);
+        }
+    }
+
+    /// Resolve a knob: SP entry first, then the SP's registration-authority
+    /// entry, then `default` (pysaml2 `Policy.get` precedence).
     fn get<T, F: Fn(&PolicyEntry) -> Option<T>>(&self, sp_entity_id: &str, f: F) -> Option<T> {
-        self.entries
-            .get(sp_entity_id)
+        self.get_ref(sp_entity_id, f)
+    }
+
+    /// Borrowing form of [`ReleasePolicy::get`]: resolves with the same
+    /// SP > registration authority > default precedence but lets `f` return a
+    /// borrow into the resolved [`PolicyEntry`], so large fields (the owned
+    /// entity-category policies, the restriction map) are read by reference
+    /// instead of cloned on every request.
+    fn get_ref<'a, T, F: Fn(&'a PolicyEntry) -> Option<T>>(
+        &'a self,
+        sp_entity_id: &str,
+        f: F,
+    ) -> Option<T> {
+        let sp_entry = self.entries.get(sp_entity_id);
+
+        // The registration-authority entry is consulted only when the SP has
+        // *no entry of its own* - an SP with its own entry is unaffected by it
+        // (ADR 0027), so a knob the SP leaves unset falls straight through to
+        // `default`/built-in rather than to the registration-authority entry.
+        if sp_entry.is_none() {
+            if let Some(value) = self
+                .registration_authorities
+                .get(sp_entity_id)
+                .and_then(|ra| self.entries.get(ra))
+                .and_then(&f)
+            {
+                return Some(value);
+            }
+        }
+
+        sp_entry
             .and_then(&f)
             .or_else(|| self.entries.get(DEFAULT_ENTRY).and_then(&f))
     }
@@ -350,14 +438,16 @@ impl ReleasePolicy {
         let fail_on_missing_requested = self.fail_on_missing_requested(sp_entity_id);
 
         // Step 1: entity-category release rules take precedence over
-        // per-attribute requested/optional matching when configured.
-        let categories = self.get(sp_entity_id, |e| e.entity_categories.clone());
+        // per-attribute requested/optional matching when configured. Borrow the
+        // resolved policy set rather than cloning it on every request.
+        let categories = self.get_ref(sp_entity_id, |e| e.entity_categories.as_deref());
         if let Some(policies) = categories {
             let required_local: Vec<String> = required
                 .iter()
                 .map(|r| self.local_key(&r.attribute))
                 .collect();
-            let released = releasable_attributes(&policies, sp_entity_categories, &required_local);
+            let released =
+                releasable_attributes_owned(policies, sp_entity_categories, &required_local);
             result.retain(|attr| released.contains(&self.local_key(attr)));
         } else if !required.is_empty() || !optional.is_empty() {
             // Step 2: release only what the SP asked for in its
@@ -367,8 +457,10 @@ impl ReleasePolicy {
         }
 
         // Step 3: the IdP's own attribute/value restrictions always apply.
-        if let Some(restrictions) = self.get(sp_entity_id, |e| e.attribute_restrictions.clone()) {
-            result = self.filter_attribute_value_assertions(result, &restrictions);
+        if let Some(restrictions) =
+            self.get_ref(sp_entity_id, |e| e.attribute_restrictions.as_ref())
+        {
+            result = self.filter_attribute_value_assertions(result, restrictions);
         }
 
         // Step 4: pysaml2 PR #987 — when the SP requests subject-id with
@@ -987,6 +1079,147 @@ mod tests {
             )
             .unwrap();
         // CoCo + only_required: eppn (not required by the SP) is withheld
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].friendly_name.as_deref(), Some("mail"));
+    }
+
+    #[test]
+    fn test_registration_authority_resolution_precedence() {
+        // default releases nothing extra; the registration-authority entry
+        // signs responses; the SP-specific entry overrides the RA entry.
+        let mut policy = ReleasePolicy::new();
+        policy.insert(
+            DEFAULT_ENTRY,
+            PolicyEntry::new().with_lifetime(TimeDelta::hours(1)),
+        );
+        policy.insert(
+            "http://www.swamid.se/",
+            PolicyEntry::new().with_lifetime(TimeDelta::minutes(10)),
+        );
+        policy.insert(
+            "https://special.example.com",
+            PolicyEntry::new().with_lifetime(TimeDelta::minutes(5)),
+        );
+
+        // SP with a SWAMID registration authority but no own entry -> RA entry.
+        policy.set_registration_authority("https://sp.swamid.example", "http://www.swamid.se/");
+        assert_eq!(
+            policy.lifetime("https://sp.swamid.example"),
+            TimeDelta::minutes(10)
+        );
+
+        // SP with its own entry -> own entry wins over the RA entry.
+        policy.set_registration_authority("https://special.example.com", "http://www.swamid.se/");
+        assert_eq!(
+            policy.lifetime("https://special.example.com"),
+            TimeDelta::minutes(5)
+        );
+
+        // SP with an unknown registration authority -> falls through to default.
+        policy.set_registration_authority("https://other.example", "http://other.federation/");
+        assert_eq!(
+            policy.lifetime("https://other.example"),
+            TimeDelta::hours(1)
+        );
+    }
+
+    #[test]
+    fn test_registration_authority_not_consulted_when_sp_has_entry() {
+        // An SP with its own entry is unaffected by the registration-authority
+        // entry (ADR 0027): a knob it leaves unset falls through to `default`,
+        // not to the RA entry, even though the SP is mapped to that authority.
+        let mut policy = ReleasePolicy::new();
+        policy.insert(
+            DEFAULT_ENTRY,
+            PolicyEntry::new().with_lifetime(TimeDelta::hours(1)),
+        );
+        policy.insert(
+            "http://www.swamid.se/",
+            PolicyEntry::new().with_lifetime(TimeDelta::minutes(10)),
+        );
+        // SP entry exists but sets only the NameID format, not the lifetime.
+        policy.insert(
+            "https://sp.swamid.example",
+            PolicyEntry::new().with_nameid_format(constants::NAMEID_PERSISTENT),
+        );
+        policy.set_registration_authority("https://sp.swamid.example", "http://www.swamid.se/");
+
+        // Its own knob is honored.
+        assert_eq!(
+            policy.nameid_format("https://sp.swamid.example"),
+            constants::NAMEID_PERSISTENT
+        );
+        // The unset lifetime falls through to `default` (1h), NOT the RA's 10m.
+        assert_eq!(
+            policy.lifetime("https://sp.swamid.example"),
+            TimeDelta::hours(1)
+        );
+    }
+
+    #[test]
+    fn test_register_sp_metadata_reads_registration_authority() {
+        use crate::metadata::types::entity_descriptor::{EntityDescriptor, EntityRoles};
+        use crate::metadata::types::extensions::Extensions;
+
+        let entity = EntityDescriptor {
+            entity_id: "https://sp.swamid.example".to_string(),
+            id: None,
+            valid_until: None,
+            cache_duration: None,
+            has_signature: false,
+            extensions: Some(Extensions::new(
+                r#"<mdrpi:RegistrationInfo xmlns:mdrpi="urn:oasis:names:tc:SAML:metadata:rpi" registrationAuthority="http://www.swamid.se/"/>"#
+                    .to_string(),
+            )),
+            roles: EntityRoles::Roles {
+                idp_sso: vec![],
+                sp_sso: vec![],
+                authn_authority: vec![],
+                attr_authority: vec![],
+                pdp: vec![],
+            },
+            organization: None,
+            contact_persons: vec![],
+            additional_metadata_locations: vec![],
+        };
+
+        let mut policy = ReleasePolicy::new();
+        policy.insert(
+            "http://www.swamid.se/",
+            PolicyEntry::new().with_lifetime(TimeDelta::minutes(10)),
+        );
+        policy.register_sp_metadata(&entity);
+        assert_eq!(
+            policy.lifetime("https://sp.swamid.example"),
+            TimeDelta::minutes(10)
+        );
+    }
+
+    #[test]
+    fn test_custom_owned_entity_category_release() {
+        use crate::idp::entity_category::{OwnedEntityCategoryPolicy, OwnedEntityCategoryRule};
+
+        // A deployment-defined entity category, built entirely at runtime.
+        let custom = OwnedEntityCategoryPolicy::new("eduid-local").with_rule(
+            OwnedEntityCategoryRule::new(["https://eduid.se/category/staff"], ["mail"]),
+        );
+        let policy = ReleasePolicy::with_default(
+            PolicyEntry::new().with_owned_entity_categories(vec![custom]),
+        );
+        let attrs = vec![
+            mail_attribute(&["a@example.com"]),
+            crate::profiles::attribute::x500::cn_attribute(&["Alice"]),
+        ];
+        let out = policy
+            .filter(
+                attrs,
+                "https://sp.example.com",
+                &["https://eduid.se/category/staff".to_string()],
+                &[],
+                &[],
+                SubjectIdReq::None,
+            )
+            .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].friendly_name.as_deref(), Some("mail"));
     }

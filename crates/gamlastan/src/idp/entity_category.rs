@@ -56,6 +56,140 @@ pub struct EntityCategoryPolicy {
     pub rules: &'static [EntityCategoryRule],
 }
 
+impl EntityCategoryRule {
+    /// Clone this static rule into an owned, runtime-mutable
+    /// [`OwnedEntityCategoryRule`].
+    pub fn as_owned(&self) -> OwnedEntityCategoryRule {
+        OwnedEntityCategoryRule {
+            categories: self.categories.iter().map(|s| s.to_string()).collect(),
+            attributes: self.attributes.iter().map(|s| s.to_string()).collect(),
+            conflicts: self.conflicts.iter().map(|s| s.to_string()).collect(),
+            only_required: self.only_required,
+        }
+    }
+}
+
+impl EntityCategoryPolicy {
+    /// Clone this static policy into an owned, runtime-mutable
+    /// [`OwnedEntityCategoryPolicy`] (e.g. to extend a shipped policy such as
+    /// [`SWAMID`] with deployment-specific rules).
+    pub fn as_owned(&self) -> OwnedEntityCategoryPolicy {
+        OwnedEntityCategoryPolicy {
+            name: self.name.to_string(),
+            rules: self
+                .rules
+                .iter()
+                .map(EntityCategoryRule::as_owned)
+                .collect(),
+        }
+    }
+}
+
+/// Owned, runtime-constructible counterpart of [`EntityCategoryRule`].
+///
+/// The shipped rules and policies are `&'static` so they can live in `const`
+/// data with zero allocation. Callers that need to define their *own* entity
+/// categories at runtime - notably language bindings that receive the rule from
+/// outside Rust - build this owned form instead. Matching and release semantics
+/// are identical to [`EntityCategoryRule`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedEntityCategoryRule {
+    /// Category URIs that must *all* be present on the SP. Empty = always.
+    pub categories: Vec<String>,
+    /// Local (friendly) attribute names released by this rule.
+    pub attributes: Vec<String>,
+    /// Category URIs that must *not* be present on the SP for this rule to match.
+    pub conflicts: Vec<String>,
+    /// Release only attributes the SP also requires (CoCo).
+    pub only_required: bool,
+}
+
+impl OwnedEntityCategoryRule {
+    /// A rule releasing `attributes` when all of `categories` are present.
+    pub fn new(
+        categories: impl IntoIterator<Item = impl Into<String>>,
+        attributes: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        OwnedEntityCategoryRule {
+            categories: categories.into_iter().map(Into::into).collect(),
+            attributes: attributes.into_iter().map(Into::into).collect(),
+            conflicts: Vec::new(),
+            only_required: false,
+        }
+    }
+
+    /// Set the conflicting categories (rule does not match if any is present).
+    pub fn with_conflicts(
+        mut self,
+        conflicts: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.conflicts = conflicts.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Release only the subset of `attributes` the SP also marks as required.
+    pub fn with_only_required(mut self, only_required: bool) -> Self {
+        self.only_required = only_required;
+        self
+    }
+
+    fn matches(&self, sp_categories: &HashSet<&str>) -> bool {
+        if self
+            .conflicts
+            .iter()
+            .any(|c| sp_categories.contains(c.as_str()))
+        {
+            return false;
+        }
+        self.categories
+            .iter()
+            .all(|c| sp_categories.contains(c.as_str()))
+    }
+}
+
+/// Owned, runtime-constructible counterpart of [`EntityCategoryPolicy`].
+///
+/// Build one with [`OwnedEntityCategoryPolicy::new`] plus
+/// [`OwnedEntityCategoryPolicy::with_rule`], or start from a shipped policy via
+/// [`EntityCategoryPolicy::as_owned`] and append rules. Evaluate with
+/// [`releasable_attributes_owned`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct OwnedEntityCategoryPolicy {
+    /// Short name of the policy (e.g. `"swamid-local"`).
+    pub name: String,
+    /// The rules, evaluated in order.
+    pub rules: Vec<OwnedEntityCategoryRule>,
+}
+
+impl OwnedEntityCategoryPolicy {
+    /// An empty policy with the given name.
+    pub fn new(name: impl Into<String>) -> Self {
+        OwnedEntityCategoryPolicy {
+            name: name.into(),
+            rules: Vec::new(),
+        }
+    }
+
+    /// Append a rule (builder form).
+    pub fn with_rule(mut self, rule: OwnedEntityCategoryRule) -> Self {
+        self.rules.push(rule);
+        self
+    }
+
+    /// Append a rule (mutating form).
+    pub fn push_rule(&mut self, rule: OwnedEntityCategoryRule) {
+        self.rules.push(rule);
+    }
+
+    /// Append every rule from a shipped static policy, so a deployment can start
+    /// from e.g. [`SWAMID`] and add its own categories on top.
+    pub fn extend_from_static(mut self, policy: &EntityCategoryPolicy) -> Self {
+        self.rules
+            .extend(policy.rules.iter().map(EntityCategoryRule::as_owned));
+        self
+    }
+}
+
 // ── Category URIs ───────────────────────────────────────────────────────────
 
 /// GÉANT Data Protection Code of Conduct v1.
@@ -536,22 +670,71 @@ pub fn releasable_attributes(
             if !rule.matches(&ecs) {
                 continue;
             }
-            let attrs = rule
-                .attributes
-                .iter()
-                .map(|a| a.to_lowercase())
-                .filter(|a| {
-                    // The always-release rule (empty category list) is not
-                    // subject to only_required in pysaml2.
-                    !rule.only_required
-                        || rule.categories.is_empty()
-                        || required_local_names.contains(a)
-                });
-            released.extend(attrs);
+            release_rule_attributes(
+                rule.attributes.iter().copied(),
+                rule.categories.is_empty(),
+                rule.only_required,
+                required_local_names,
+                &mut released,
+            );
         }
     }
 
     released
+}
+
+/// As [`releasable_attributes`], but over owned, runtime-built policies
+/// ([`OwnedEntityCategoryPolicy`]). Mix shipped policies in by converting them
+/// with [`EntityCategoryPolicy::as_owned`].
+///
+/// Accepts anything iterable over `&OwnedEntityCategoryPolicy`, so a caller
+/// holding a `&[OwnedEntityCategoryPolicy]` (e.g. the resolved policy set in
+/// `ReleasePolicy::filter`) passes it directly with no per-call allocation.
+pub fn releasable_attributes_owned<'a, I>(
+    policies: I,
+    sp_entity_categories: &[String],
+    required_local_names: &[String],
+) -> HashSet<String>
+where
+    I: IntoIterator<Item = &'a OwnedEntityCategoryPolicy>,
+{
+    let ecs: HashSet<&str> = sp_entity_categories.iter().map(String::as_str).collect();
+    let mut released: HashSet<String> = HashSet::new();
+
+    for policy in policies {
+        for rule in &policy.rules {
+            if !rule.matches(&ecs) {
+                continue;
+            }
+            release_rule_attributes(
+                rule.attributes.iter().map(String::as_str),
+                rule.categories.is_empty(),
+                rule.only_required,
+                required_local_names,
+                &mut released,
+            );
+        }
+    }
+
+    released
+}
+
+/// Shared release step for a matched rule: insert the lowercased attribute
+/// names, honoring `only_required` (the always-release rule with an empty
+/// category list is exempt, per pysaml2).
+fn release_rule_attributes<'a>(
+    attributes: impl Iterator<Item = &'a str>,
+    categories_empty: bool,
+    only_required: bool,
+    required_local_names: &[String],
+    released: &mut HashSet<String>,
+) {
+    for attr in attributes {
+        let attr = attr.to_lowercase();
+        if !only_required || categories_empty || required_local_names.contains(&attr) {
+            released.insert(attr);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -746,5 +929,76 @@ mod tests {
         let released = releasable_attributes(&[&AT_EGOV_PVP2_POLICY], &cats(&[AT_EGOV_PVP2]), &[]);
         assert!(released.contains("pvp-mail"));
         assert!(!released.contains("pvp-charge-code"));
+    }
+
+    #[test]
+    fn test_owned_custom_category() {
+        let policy =
+            OwnedEntityCategoryPolicy::new("custom").with_rule(OwnedEntityCategoryRule::new(
+                ["https://example.org/category/staff"],
+                ["mail", "displayName"],
+            ));
+        let released = releasable_attributes_owned(
+            [&policy],
+            &cats(&["https://example.org/category/staff"]),
+            &[],
+        );
+        assert!(released.contains("mail"));
+        assert!(released.contains("displayname"));
+
+        // Category absent: nothing released.
+        let released = releasable_attributes_owned([&policy], &[], &[]);
+        assert!(released.is_empty());
+    }
+
+    #[test]
+    fn test_owned_matches_static_swamid() {
+        // Converting a shipped policy to owned yields identical releases.
+        let owned = SWAMID.as_owned();
+        let cats_v = cats(&[REFEDS_PSEUDONYMOUS]);
+        let from_static = releasable_attributes(&[&SWAMID], &cats_v, &[]);
+        let from_owned = releasable_attributes_owned([&owned], &cats_v, &[]);
+        assert_eq!(from_static, from_owned);
+        assert!(from_owned.contains("pairwise-id"));
+    }
+
+    #[test]
+    fn test_owned_conflicts_and_only_required() {
+        let policy = OwnedEntityCategoryPolicy::new("c")
+            .with_rule(OwnedEntityCategoryRule::new(["A"], ["mail", "sn"]).with_only_required(true))
+            .with_rule(OwnedEntityCategoryRule::new(["A"], ["displayName"]).with_conflicts(["B"]));
+
+        // only_required keeps just the requested "mail"; conflict B absent so
+        // the displayName rule fires.
+        let released = releasable_attributes_owned([&policy], &cats(&["A"]), &lower(&["mail"]));
+        assert!(released.contains("mail"));
+        assert!(!released.contains("sn"));
+        assert!(released.contains("displayname"));
+
+        // Conflict B present suppresses the displayName rule.
+        let released =
+            releasable_attributes_owned([&policy], &cats(&["A", "B"]), &lower(&["mail"]));
+        assert!(released.contains("mail"));
+        assert!(!released.contains("displayname"));
+    }
+
+    #[test]
+    fn test_extend_from_static_then_custom() {
+        let policy = OwnedEntityCategoryPolicy::new("swamid-local")
+            .extend_from_static(&SWAMID)
+            .with_rule(OwnedEntityCategoryRule::new(
+                ["https://eduid.se/category/local"],
+                ["eduidLocalAttr"],
+            ));
+        let released = releasable_attributes_owned(
+            [&policy],
+            &cats(&[
+                REFEDS_RESEARCH_AND_SCHOLARSHIP,
+                "https://eduid.se/category/local",
+            ]),
+            &[],
+        );
+        assert!(released.contains("mail")); // inherited from SWAMID R&S
+        assert!(released.contains("eduidlocalattr")); // from the custom rule
     }
 }

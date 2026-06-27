@@ -11,6 +11,7 @@ use super::authn_authority::{AuthnAuthorityDescriptor, AuthnAuthorityDescriptorR
 use super::contact::{ContactPerson, ContactPersonRef};
 use super::extensions::{Extensions, ExtensionsRef};
 use super::idp::{IdpSsoDescriptor, IdpSsoDescriptorRef};
+use super::md_extensions::MdExtensions;
 use super::organization::{Organization, OrganizationRef};
 use super::pdp::{PdpDescriptor, PdpDescriptorRef};
 use super::sp::{SpSsoDescriptor, SpSsoDescriptorRef};
@@ -193,6 +194,34 @@ impl EntityDescriptor {
     pub fn is_sp(&self) -> bool {
         !self.sp_sso_descriptors().is_empty()
     }
+
+    /// Parse the attribute-release-relevant metadata extensions
+    /// (`mdrpi:RegistrationInfo`, `mdattr:EntityAttributes`) out of this
+    /// entity's `Extensions`. Returns an empty value when there are none.
+    pub fn md_extensions(&self) -> MdExtensions {
+        self.extensions
+            .as_ref()
+            .map(MdExtensions::from_extensions)
+            .unwrap_or_default()
+    }
+
+    /// The entity's `mdrpi:RegistrationInfo/@registrationAuthority`, if present.
+    /// Used to select an attribute-release policy by federation operator.
+    pub fn registration_authority(&self) -> Option<String> {
+        self.md_extensions().registration_authority
+    }
+
+    /// The entity's published entity-category URIs
+    /// (`mdattr:EntityAttributes`, `http://macedir.org/entity-category`).
+    pub fn entity_categories(&self) -> Vec<String> {
+        self.md_extensions().entity_categories()
+    }
+
+    /// All values of the named entity attribute from `mdattr:EntityAttributes`
+    /// (e.g. `urn:oasis:names:tc:SAML:profiles:subject-id:req`).
+    pub fn entity_attribute_values(&self, name: &str) -> Vec<String> {
+        self.md_extensions().entity_attribute_values(name)
+    }
 }
 
 /// A child of EntitiesDescriptor: either an EntityDescriptor or nested EntitiesDescriptor.
@@ -316,6 +345,52 @@ mod tests {
             contact_persons: vec![],
             additional_metadata_locations: vec![],
         }
+    }
+
+    #[test]
+    fn test_entity_descriptor_metadata_extension_accessors() {
+        use super::super::extensions::Extensions;
+
+        // No Extensions: every accessor yields an empty value, never panics.
+        let bare = simple_sp_entity("https://sp.example.com");
+        assert_eq!(bare.registration_authority(), None);
+        assert!(bare.entity_categories().is_empty());
+        assert!(bare
+            .entity_attribute_values("urn:oasis:names:tc:SAML:profiles:subject-id:req")
+            .is_empty());
+        assert_eq!(bare.md_extensions(), MdExtensions::default());
+
+        // With RegistrationInfo + EntityAttributes, the accessors round-trip
+        // through MdExtensions.
+        let mut ed = simple_sp_entity("https://sp.swamid.example");
+        ed.extensions = Some(Extensions::new(
+            r#"
+            <mdrpi:RegistrationInfo xmlns:mdrpi="urn:oasis:names:tc:SAML:metadata:rpi"
+                registrationAuthority="http://www.swamid.se/"/>
+            <mdattr:EntityAttributes xmlns:mdattr="urn:oasis:names:tc:SAML:metadata:attribute"
+                xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">
+              <saml:Attribute Name="http://macedir.org/entity-category">
+                <saml:AttributeValue>http://refeds.org/category/research-and-scholarship</saml:AttributeValue>
+              </saml:Attribute>
+              <saml:Attribute Name="urn:oasis:names:tc:SAML:profiles:subject-id:req">
+                <saml:AttributeValue>any</saml:AttributeValue>
+              </saml:Attribute>
+            </mdattr:EntityAttributes>
+            "#
+            .to_string(),
+        ));
+        assert_eq!(
+            ed.registration_authority().as_deref(),
+            Some("http://www.swamid.se/")
+        );
+        assert_eq!(
+            ed.entity_categories(),
+            vec!["http://refeds.org/category/research-and-scholarship".to_string()]
+        );
+        assert_eq!(
+            ed.entity_attribute_values("urn:oasis:names:tc:SAML:profiles:subject-id:req"),
+            vec!["any".to_string()]
+        );
     }
 
     #[test]
