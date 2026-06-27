@@ -5,7 +5,7 @@ All notable changes to this repository will be documented in this file.
 The project is still pre-1.0, so minor releases may include behavior changes
 where needed to correct protocol handling.
 
-## [Unreleased]
+[Unreleased]
 
 ## [0.6.0] - 2026-06-27
 
@@ -39,9 +39,25 @@ where needed to correct protocol handling.
 - Migrated `spid-sp-test` and `example-idp` off the unmaintained `rustls-pemfile`
   crate (RUSTSEC-2025-0134) to the `PemObject` API in `rustls-pki-types`, and
   dropped the `rustls-pemfile` dependency.
+- IdP response builders now take a `ResponseTimes { issue_instant, authn_instant }`
+  value instead of a single `now: DateTime<Utc>`. Affects
+  `profiles::sso::idp::{create_response, create_unsolicited_response}` and
+  `profiles::swedenconnect::idp::create_response`. Fresh-login callers use
+  `ResponseTimes::at(now)` to preserve the previous behaviour.
+  `gamlastan_actix::idp::AuthnCallbackResult` gains
+  `authn_instant: Option<DateTime<Utc>>` (`None` means "authenticated now"), so
+  a callback reusing a session reports its real authentication time. Breaking
+  API change. See ADR 0025 and issue #15.
 
 ### Fixed
 
+- IdP response construction no longer forces `AuthnStatement/@AuthnInstant` to
+  equal the document issue time. The previous single-`now` builders conflated
+  *when the principal authenticated* with *when the response was generated*,
+  which over-reported authentication freshness to SPs that rely on it (e.g. via
+  `RequestedAuthnContext` / `ForceAuthn` or a max-age policy) whenever an
+  existing SSO session was reused. The two instants are now independent. See
+  ADR 0025 and issue #15.
 - Cleared all `cargo audit` findings: `quinn-proto` 0.11.14 → 0.11.15
   (RUSTSEC-2026-0185, remote memory exhaustion), `rand` 0.8.5 → 0.8.6 and
   0.9.2 → 0.9.4 (RUSTSEC-2026-0097), and `crypto-bigint` off the yanked 0.7.3.
@@ -259,7 +275,6 @@ Historical release recorded before changelog adoption.
 
 Historical release recorded before changelog adoption.
 
-[Unreleased]: https://github.com/kushaldas/gamlastan/compare/v0.6.0...HEAD
 [0.6.0]: https://github.com/kushaldas/gamlastan/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/kushaldas/gamlastan/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/kushaldas/gamlastan/compare/v0.4.0...v0.4.1

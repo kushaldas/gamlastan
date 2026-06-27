@@ -145,6 +145,43 @@ pub struct ResponseOptions {
     pub attributes: Vec<Attribute>,
 }
 
+/// The two semantically-distinct instants that go into a Response.
+///
+/// SAML draws a line between *when the document was generated* and *when the
+/// principal actually authenticated* to the IdP. The latter may predate the
+/// former when an existing SSO session is reused. Conflating them mis-reports
+/// authentication freshness (`AuthnStatement/@AuthnInstant`) to SPs that
+/// enforce it (e.g. via `RequestedAuthnContext` or `ForceAuthn`).
+///
+/// Named fields are used -- rather than two positional `DateTime<Utc>`
+/// arguments on the builder -- so the two instants cannot be silently
+/// transposed at a call site. See ADR 0025.
+#[derive(Debug, Clone, Copy)]
+pub struct ResponseTimes {
+    /// When the Response/Assertion document is generated. Drives the Response
+    /// and Assertion `IssueInstant`, `Conditions/@NotBefore`, and every
+    /// `NotOnOrAfter` (computed as issue instant + lifetime).
+    pub issue_instant: DateTime<Utc>,
+
+    /// When the principal authenticated to the IdP -- possibly from a reused SSO
+    /// session, hence possibly earlier than `issue_instant`. Drives
+    /// `AuthnStatement/@AuthnInstant`.
+    pub authn_instant: DateTime<Utc>,
+}
+
+impl ResponseTimes {
+    /// Both instants equal `now`: the principal authenticated at the moment the
+    /// response is generated (a fresh login). Reproduces the historical
+    /// single-`now` behaviour for callers that do not track a separate
+    /// authentication time.
+    pub fn at(now: DateTime<Utc>) -> Self {
+        Self {
+            issue_instant: now,
+            authn_instant: now,
+        }
+    }
+}
+
 /// Extract attributes from all AttributeStatements in assertions.
 pub fn extract_attributes(attribute_statements: &[AttributeStatement]) -> Vec<Attribute> {
     attribute_statements

@@ -52,7 +52,7 @@ use gamlastan::core::identifiers::SamlId;
 use gamlastan::crypto::{KeysManager, SamlSigner, SamlVerifier, VerifyResult};
 use gamlastan::metadata::types::entity_descriptor::EntityDescriptorRef;
 use gamlastan::profiles::sso::idp as idp_profile;
-use gamlastan::profiles::sso::web_browser::ResponseOptions;
+use gamlastan::profiles::sso::web_browser::{ResponseOptions, ResponseTimes};
 use gamlastan::xml::deserialize::parse_saml;
 use gamlastan::xml::serialize::SamlSerialize;
 use gamlastan_actix::{ActixHttpRequest, IdpConfig, IdpSigningContext};
@@ -611,7 +611,10 @@ fn build_saml_response(
         attributes: user.attributes(),
     };
 
-    let response = idp_profile::create_response(&response_options, &user.name_id(), now);
+    // This example always authenticates the user fresh per request, so the
+    // authentication instant equals the response issue instant.
+    let response =
+        idp_profile::create_response(&response_options, &user.name_id(), ResponseTimes::at(now));
 
     let response_xml = match response.to_xml_string() {
         Ok(xml) => xml,
