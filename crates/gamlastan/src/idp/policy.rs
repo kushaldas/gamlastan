@@ -191,9 +191,12 @@ impl PolicyEntry {
 
 /// The IdP-side attribute release policy (pysaml2 `Policy`).
 ///
-/// Entry resolution per knob: the SP-specific entry, then `"default"`,
-/// then a built-in default (transient NameID, URI name format, 1h
-/// lifetime, no signing, fail on missing required attributes).
+/// Entry resolution per knob: the SP-specific entry first; if the SP has no
+/// entry of its own, the entry keyed on its registration authority (when one is
+/// recorded, see [`ReleasePolicy::set_registration_authority`]); then
+/// `"default"`; then a built-in default (transient NameID, URI name format, 1h
+/// lifetime, no signing, fail on missing required attributes). An SP that has
+/// its own entry is unaffected by the registration-authority entry (ADR 0027).
 #[derive(Debug, Default)]
 pub struct ReleasePolicy {
     entries: HashMap<String, PolicyEntry>,

@@ -5,8 +5,6 @@ All notable changes to this repository will be documented in this file.
 The project is still pre-1.0, so minor releases may include behavior changes
 where needed to correct protocol handling.
 
-[Unreleased]
-
 ## [0.6.0] - unreleased
 
 ### Added
