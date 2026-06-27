@@ -283,15 +283,25 @@ impl ReleasePolicy {
         sp_entity_id: &str,
         f: F,
     ) -> Option<T> {
-        self.entries
-            .get(sp_entity_id)
+        let sp_entry = self.entries.get(sp_entity_id);
+
+        // The registration-authority entry is consulted only when the SP has
+        // *no entry of its own* - an SP with its own entry is unaffected by it
+        // (ADR 0027), so a knob the SP leaves unset falls straight through to
+        // `default`/built-in rather than to the registration-authority entry.
+        if sp_entry.is_none() {
+            if let Some(value) = self
+                .registration_authorities
+                .get(sp_entity_id)
+                .and_then(|ra| self.entries.get(ra))
+                .and_then(&f)
+            {
+                return Some(value);
+            }
+        }
+
+        sp_entry
             .and_then(&f)
-            .or_else(|| {
-                self.registration_authorities
-                    .get(sp_entity_id)
-                    .and_then(|ra| self.entries.get(ra))
-                    .and_then(&f)
-            })
             .or_else(|| self.entries.get(DEFAULT_ENTRY).and_then(&f))
     }
 
@@ -1106,6 +1116,39 @@ mod tests {
         policy.set_registration_authority("https://other.example", "http://other.federation/");
         assert_eq!(
             policy.lifetime("https://other.example"),
+            TimeDelta::hours(1)
+        );
+    }
+
+    #[test]
+    fn test_registration_authority_not_consulted_when_sp_has_entry() {
+        // An SP with its own entry is unaffected by the registration-authority
+        // entry (ADR 0027): a knob it leaves unset falls through to `default`,
+        // not to the RA entry, even though the SP is mapped to that authority.
+        let mut policy = ReleasePolicy::new();
+        policy.insert(
+            DEFAULT_ENTRY,
+            PolicyEntry::new().with_lifetime(TimeDelta::hours(1)),
+        );
+        policy.insert(
+            "http://www.swamid.se/",
+            PolicyEntry::new().with_lifetime(TimeDelta::minutes(10)),
+        );
+        // SP entry exists but sets only the NameID format, not the lifetime.
+        policy.insert(
+            "https://sp.swamid.example",
+            PolicyEntry::new().with_nameid_format(constants::NAMEID_PERSISTENT),
+        );
+        policy.set_registration_authority("https://sp.swamid.example", "http://www.swamid.se/");
+
+        // Its own knob is honored.
+        assert_eq!(
+            policy.nameid_format("https://sp.swamid.example"),
+            constants::NAMEID_PERSISTENT
+        );
+        // The unset lifetime falls through to `default` (1h), NOT the RA's 10m.
+        assert_eq!(
+            policy.lifetime("https://sp.swamid.example"),
             TimeDelta::hours(1)
         );
     }
