@@ -686,11 +686,18 @@ pub fn releasable_attributes(
 /// As [`releasable_attributes`], but over owned, runtime-built policies
 /// ([`OwnedEntityCategoryPolicy`]). Mix shipped policies in by converting them
 /// with [`EntityCategoryPolicy::as_owned`].
-pub fn releasable_attributes_owned(
-    policies: &[&OwnedEntityCategoryPolicy],
+///
+/// Accepts anything iterable over `&OwnedEntityCategoryPolicy`, so a caller
+/// holding a `&[OwnedEntityCategoryPolicy]` (e.g. the resolved policy set in
+/// `ReleasePolicy::filter`) passes it directly with no per-call allocation.
+pub fn releasable_attributes_owned<'a, I>(
+    policies: I,
     sp_entity_categories: &[String],
     required_local_names: &[String],
-) -> HashSet<String> {
+) -> HashSet<String>
+where
+    I: IntoIterator<Item = &'a OwnedEntityCategoryPolicy>,
+{
     let ecs: HashSet<&str> = sp_entity_categories.iter().map(String::as_str).collect();
     let mut released: HashSet<String> = HashSet::new();
 
@@ -932,7 +939,7 @@ mod tests {
                 ["mail", "displayName"],
             ));
         let released = releasable_attributes_owned(
-            &[&policy],
+            [&policy],
             &cats(&["https://example.org/category/staff"]),
             &[],
         );
@@ -940,7 +947,7 @@ mod tests {
         assert!(released.contains("displayname"));
 
         // Category absent: nothing released.
-        let released = releasable_attributes_owned(&[&policy], &[], &[]);
+        let released = releasable_attributes_owned([&policy], &[], &[]);
         assert!(released.is_empty());
     }
 
@@ -950,7 +957,7 @@ mod tests {
         let owned = SWAMID.as_owned();
         let cats_v = cats(&[REFEDS_PSEUDONYMOUS]);
         let from_static = releasable_attributes(&[&SWAMID], &cats_v, &[]);
-        let from_owned = releasable_attributes_owned(&[&owned], &cats_v, &[]);
+        let from_owned = releasable_attributes_owned([&owned], &cats_v, &[]);
         assert_eq!(from_static, from_owned);
         assert!(from_owned.contains("pairwise-id"));
     }
@@ -963,14 +970,14 @@ mod tests {
 
         // only_required keeps just the requested "mail"; conflict B absent so
         // the displayName rule fires.
-        let released = releasable_attributes_owned(&[&policy], &cats(&["A"]), &lower(&["mail"]));
+        let released = releasable_attributes_owned([&policy], &cats(&["A"]), &lower(&["mail"]));
         assert!(released.contains("mail"));
         assert!(!released.contains("sn"));
         assert!(released.contains("displayname"));
 
         // Conflict B present suppresses the displayName rule.
         let released =
-            releasable_attributes_owned(&[&policy], &cats(&["A", "B"]), &lower(&["mail"]));
+            releasable_attributes_owned([&policy], &cats(&["A", "B"]), &lower(&["mail"]));
         assert!(released.contains("mail"));
         assert!(!released.contains("displayname"));
     }
@@ -984,7 +991,7 @@ mod tests {
                 ["eduidLocalAttr"],
             ));
         let released = releasable_attributes_owned(
-            &[&policy],
+            [&policy],
             &cats(&[
                 REFEDS_RESEARCH_AND_SCHOLARSHIP,
                 "https://eduid.se/category/local",

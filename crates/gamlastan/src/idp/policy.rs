@@ -433,9 +433,8 @@ impl ReleasePolicy {
                 .iter()
                 .map(|r| self.local_key(&r.attribute))
                 .collect();
-            let policy_refs: Vec<&OwnedEntityCategoryPolicy> = policies.iter().collect();
             let released =
-                releasable_attributes_owned(&policy_refs, sp_entity_categories, &required_local);
+                releasable_attributes_owned(policies, sp_entity_categories, &required_local);
             result.retain(|attr| released.contains(&self.local_key(attr)));
         } else if !required.is_empty() || !optional.is_empty() {
             // Step 2: release only what the SP asked for in its
