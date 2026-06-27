@@ -41,9 +41,10 @@ impl MdExtensions {
         Self::parse(&ext.raw_xml)
     }
 
-    /// Parse from the raw `Extensions` child XML. Returns an empty value on any
-    /// parse error or when nothing relevant is present (fail-soft: missing or
-    /// malformed metadata extensions simply yield "no signal", never an error).
+    /// Parse from raw `Extensions` XML (either the full `<md:Extensions>` element or just
+    /// its child elements). Returns an empty value on any parse error or when nothing relevant
+    /// is present (fail-soft: missing or malformed metadata extensions simply yield "no
+    /// signal", never an error).
     pub fn parse(raw_xml: &str) -> Self {
         let mut out = MdExtensions::default();
         let trimmed = raw_xml.trim();
