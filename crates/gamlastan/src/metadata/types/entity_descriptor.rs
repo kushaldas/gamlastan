@@ -11,6 +11,7 @@ use super::authn_authority::{AuthnAuthorityDescriptor, AuthnAuthorityDescriptorR
 use super::contact::{ContactPerson, ContactPersonRef};
 use super::extensions::{Extensions, ExtensionsRef};
 use super::idp::{IdpSsoDescriptor, IdpSsoDescriptorRef};
+use super::md_extensions::MdExtensions;
 use super::organization::{Organization, OrganizationRef};
 use super::pdp::{PdpDescriptor, PdpDescriptorRef};
 use super::sp::{SpSsoDescriptor, SpSsoDescriptorRef};
@@ -192,6 +193,34 @@ impl EntityDescriptor {
     /// Check if this entity is an SP (has at least one SPSSODescriptor).
     pub fn is_sp(&self) -> bool {
         !self.sp_sso_descriptors().is_empty()
+    }
+
+    /// Parse the attribute-release-relevant metadata extensions
+    /// (`mdrpi:RegistrationInfo`, `mdattr:EntityAttributes`) out of this
+    /// entity's `Extensions`. Returns an empty value when there are none.
+    pub fn md_extensions(&self) -> MdExtensions {
+        self.extensions
+            .as_ref()
+            .map(MdExtensions::from_extensions)
+            .unwrap_or_default()
+    }
+
+    /// The entity's `mdrpi:RegistrationInfo/@registrationAuthority`, if present.
+    /// Used to select an attribute-release policy by federation operator.
+    pub fn registration_authority(&self) -> Option<String> {
+        self.md_extensions().registration_authority
+    }
+
+    /// The entity's published entity-category URIs
+    /// (`mdattr:EntityAttributes`, `http://macedir.org/entity-category`).
+    pub fn entity_categories(&self) -> Vec<String> {
+        self.md_extensions().entity_categories()
+    }
+
+    /// All values of the named entity attribute from `mdattr:EntityAttributes`
+    /// (e.g. `urn:oasis:names:tc:SAML:profiles:subject-id:req`).
+    pub fn entity_attribute_values(&self, name: &str) -> Vec<String> {
+        self.md_extensions().entity_attribute_values(name)
     }
 }
 

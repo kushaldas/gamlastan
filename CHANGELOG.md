@@ -7,7 +7,26 @@ where needed to correct protocol handling.
 
 [Unreleased]
 
-## [0.6.0] - 2026-06-27
+### Added
+
+- `idp::entity_category`: owned, runtime-constructible entity categories.
+  `OwnedEntityCategoryRule` / `OwnedEntityCategoryPolicy` (with `new` /
+  `with_rule` / `with_conflicts` / `with_only_required` / `extend_from_static`
+  builders), `EntityCategoryRule::as_owned` / `EntityCategoryPolicy::as_owned`,
+  and `releasable_attributes_owned`. Callers (including language bindings) can
+  now define their own entity categories at runtime and mix them with the
+  shipped policies, with identical matching semantics. The shipped `&'static`
+  policies are unchanged. `PolicyEntry::with_owned_entity_categories` accepts
+  them; `with_entity_categories` keeps its signature. See ADR 0026.
+- Metadata extension accessors: `EntityDescriptor::registration_authority()`
+  (`mdrpi:RegistrationInfo`), `entity_categories()` and
+  `entity_attribute_values()` (`mdattr:EntityAttributes`), backed by the new
+  `metadata::types::md_extensions::MdExtensions` (fail-soft, `parse_secure`).
+- `idp::policy::ReleasePolicy` registration-authority-based selection:
+  `set_registration_authority` / `with_registration_authority` /
+  `register_sp_metadata`, resolving SP entity ID > registration authority >
+  default (pysaml2 `Policy.get` precedence). See ADR 0027.
+
 
 ### Security
 

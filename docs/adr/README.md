@@ -34,3 +34,5 @@ rewriting history (mark the old one `Superseded by NNNN`).
 | [0023](0023-uppsala-0.5-bergshamra-0.6-dependency-stack.md) | Adopt uppsala 0.5, bergshamra 0.6, and kryptering 0.4 | Accepted |
 | [0024](0024-reject-dtd-at-saml-parse-boundary.md) | Reject DTDs at the SAML parse boundary | Accepted |
 | [0025](0025-separate-authn-instant-from-issue-instant.md) | Separate the authentication instant from the issue instant in response construction | Accepted |
+| [0026](0026-runtime-owned-entity-category-policies.md) | Runtime, owned entity-category rules and policies | Accepted |
+| [0027](0027-registration-authority-attribute-release.md) | Registration-authority-based attribute-release policy selection | Accepted |
