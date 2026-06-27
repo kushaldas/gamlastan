@@ -187,7 +187,7 @@ async fn sp_acs(
 ) -> Result<HttpResponse, SamlActixError> {
     // Parse the SAML XML into a Response
     let xml_str = msg.saml_xml_str()?;
-    let doc = uppsala::parse(xml_str).map_err(|e: uppsala::XmlError| {
+    let doc = gamlastan::xml::parse_secure(xml_str).map_err(|e: uppsala::XmlError| {
         SamlActixError::Xml(gamlastan::xml::error::XmlError::ParseError(e))
     })?;
     let response_ref = gamlastan::xml::deserialize::parse_saml::<
@@ -638,7 +638,7 @@ async fn sp_slo(
     config: web::Data<SpConfig>,
 ) -> Result<HttpResponse, SamlActixError> {
     let xml_str = msg.saml_xml_str()?;
-    let doc = uppsala::parse(xml_str).map_err(|e: uppsala::XmlError| {
+    let doc = gamlastan::xml::parse_secure(xml_str).map_err(|e: uppsala::XmlError| {
         SamlActixError::Xml(gamlastan::xml::error::XmlError::ParseError(e))
     })?;
 

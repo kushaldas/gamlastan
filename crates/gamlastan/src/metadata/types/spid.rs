@@ -263,7 +263,7 @@ impl SpidContactExtensions {
             r#"<root xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" xmlns:spid="{SPID_EXTENSIONS_NS}">{xml_to_parse}</root>"#
         );
 
-        let doc = crate::xml::uppsala::parse(&full_xml)
+        let doc = crate::xml::parse_secure(&full_xml)
             .map_err(|e| SpidExtensionError::ParseError(e.to_string()))?;
 
         let mut sp_type: Option<SpidSpType> = None;

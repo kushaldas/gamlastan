@@ -271,7 +271,7 @@ async fn idp_sso(
 
     // Parse the AuthnRequest
     let xml_str = msg.saml_xml_str()?;
-    let doc = uppsala::parse(xml_str).map_err(|e: uppsala::XmlError| {
+    let doc = gamlastan::xml::parse_secure(xml_str).map_err(|e: uppsala::XmlError| {
         SamlActixError::Xml(gamlastan::xml::error::XmlError::ParseError(e))
     })?;
     let request_ref = gamlastan::xml::deserialize::parse_saml::<
@@ -354,7 +354,7 @@ async fn idp_slo(
     config: web::Data<IdpConfig>,
 ) -> Result<HttpResponse, SamlActixError> {
     let xml_str = msg.saml_xml_str()?;
-    let doc = uppsala::parse(xml_str).map_err(|e: uppsala::XmlError| {
+    let doc = gamlastan::xml::parse_secure(xml_str).map_err(|e: uppsala::XmlError| {
         SamlActixError::Xml(gamlastan::xml::error::XmlError::ParseError(e))
     })?;
 
@@ -449,7 +449,7 @@ async fn idp_artifact_resolve(
     config: web::Data<IdpConfig>,
 ) -> Result<HttpResponse, SamlActixError> {
     let xml_str = msg.saml_xml_str()?;
-    let doc = uppsala::parse(xml_str).map_err(|e: uppsala::XmlError| {
+    let doc = gamlastan::xml::parse_secure(xml_str).map_err(|e: uppsala::XmlError| {
         SamlActixError::Xml(gamlastan::xml::error::XmlError::ParseError(e))
     })?;
 

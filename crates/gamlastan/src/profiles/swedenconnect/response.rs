@@ -86,7 +86,7 @@ struct AlgorithmContext {
 /// Validate that the raw response XML only uses algorithms permitted by
 /// section 8 of the profile.
 pub fn validate_response_algorithms(response_xml: &str) -> Result<(), SwedenConnectError> {
-    let doc = uppsala::parse(response_xml)
+    let doc = crate::xml::parse_secure(response_xml)
         .map_err(|e| SwedenConnectError::Xml(crate::xml::XmlError::ParseError(e)))?;
     let root = doc.document_element().ok_or_else(|| {
         SwedenConnectError::Other("response XML has no document element".to_string())
@@ -189,7 +189,7 @@ pub fn decrypt_response(
     response_xml: &str,
     decryptor: &SamlDecryptor,
 ) -> Result<(Response, bool), SwedenConnectError> {
-    let doc = uppsala::parse(response_xml)
+    let doc = crate::xml::parse_secure(response_xml)
         .map_err(|e| SwedenConnectError::Xml(crate::xml::XmlError::ParseError(e)))?;
     let response_ref = parse_saml::<ResponseRef<'_>>(&doc)?;
     let mut response = response_ref.to_owned();
@@ -211,7 +211,7 @@ pub fn decrypt_response(
         let enc_xml = std::str::from_utf8(&ea.raw)
             .map_err(|e| SwedenConnectError::Other(format!("non-UTF8 EncryptedAssertion: {e}")))?;
         let plaintext = decryptor.decrypt(enc_xml)?;
-        let assertion_doc = uppsala::parse(&plaintext)
+        let assertion_doc = crate::xml::parse_secure(&plaintext)
             .map_err(|e| SwedenConnectError::Xml(crate::xml::XmlError::ParseError(e)))?;
         let assertion_ref = parse_saml::<AssertionRef<'_>>(&assertion_doc)?;
         response.assertions.push(assertion_ref.to_owned());

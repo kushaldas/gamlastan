@@ -37,3 +37,65 @@ pub fn parse_saml<'a, T: SamlDeserialize<'a>>(doc: &'a Document<'a>) -> Result<T
     let root = doc.document_element().ok_or(XmlError::EmptyDocument)?;
     T::from_xml(doc, root)
 }
+
+/// Parse untrusted SAML XML with SAML-specific input hardening.
+///
+/// This is the parse entry point for any attacker-controlled XML (inbound
+/// protocol messages, SOAP/PAOS envelopes, remote metadata, KeyInfo fragments,
+/// decrypted assertions). It is a drop-in replacement for [`uppsala::parse`]
+/// (same return type) and layers two defenses:
+///
+/// 1. **uppsala 0.5 resource limits** — inherited automatically from
+///    [`uppsala::parse`]: element-nesting depth cap
+///    ([`uppsala::parser::DEFAULT_MAX_DEPTH`], 128), entity-expansion byte
+///    budget ([`uppsala::parser::DEFAULT_MAX_ENTITY_EXPANSION`], 1 MiB), and
+///    entity-nesting depth cap ([`uppsala::parser::DEFAULT_MAX_ENTITY_DEPTH`],
+///    256). These bound classic billion-laughs / quadratic-blowup
+///    amplification and deep-nesting stack exhaustion.
+///
+/// 2. **DTD rejection** — any document carrying a `<!DOCTYPE …>` is refused.
+///    Legitimate SAML messages never contain a DTD; refusing them closes the
+///    internal-entity-expansion attack surface entirely (defense in depth over
+///    uppsala's expansion byte budget) and removes the XXE entry point.
+///
+/// Trusted XML the library produces itself (serialize-then-reparse round trips,
+/// unit-test fixtures) may continue to call [`uppsala::parse`] directly.
+pub fn parse_secure(xml: &str) -> Result<Document<'_>, uppsala::XmlError> {
+    let doc = uppsala::parse(xml)?;
+    if doc.doctype.is_some() {
+        return Err(uppsala::XmlError::well_formedness(
+            "DOCTYPE/DTD declarations are forbidden in SAML messages",
+            1,
+            1,
+        ));
+    }
+    Ok(doc)
+}
+
+#[cfg(test)]
+mod parse_secure_tests {
+    use super::parse_secure;
+
+    #[test]
+    fn rejects_doctype_declaration() {
+        // A SAML-shaped payload that smuggles in a DTD must be refused even
+        // though uppsala bounds the expansion: SAML forbids DTDs outright.
+        let xml = r#"<?xml version="1.0"?>
+<!DOCTYPE Response [ <!ENTITY x "expanded"> ]>
+<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol">&x;</samlp:Response>"#;
+        assert!(parse_secure(xml).is_err());
+    }
+
+    #[test]
+    fn rejects_internal_subset_without_entities() {
+        let xml = r#"<!DOCTYPE Response><Response/>"#;
+        assert!(parse_secure(xml).is_err());
+    }
+
+    #[test]
+    fn accepts_well_formed_saml_without_dtd() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_1"/>"#;
+        let doc = parse_secure(xml).expect("DTD-free SAML must parse");
+        assert!(doc.document_element().is_some());
+    }
+}

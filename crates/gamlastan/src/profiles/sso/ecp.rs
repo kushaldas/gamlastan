@@ -325,7 +325,7 @@ struct ParsedEcpEnvelope {
 fn parse_envelope(soap_xml: &[u8]) -> Result<ParsedEcpEnvelope, ProfileError> {
     let xml_str = std::str::from_utf8(soap_xml)
         .map_err(|e| ProfileError::Other(format!("envelope is not valid UTF-8: {e}")))?;
-    let doc = uppsala::parse(xml_str)
+    let doc = crate::xml::parse_secure(xml_str)
         .map_err(|e| ProfileError::Other(format!("envelope XML parse error: {e}")))?;
 
     let root = doc
