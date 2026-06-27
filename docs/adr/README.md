@@ -31,5 +31,5 @@ rewriting history (mark the old one `Superseded by NNNN`).
 | [0020](0020-xml-signature-object-detection-is-namespace-aware.md) | XML Signature `ds:Object` detection is namespace aware | Accepted |
 | [0021](0021-bindings-reject-duplicate-saml-parameters.md) | Bindings reject duplicate SAML parameters | Accepted |
 | [0022](0022-generic-sp-processing-rejects-opaque-encrypted-assertions.md) | Generic SP processing rejects opaque encrypted assertions | Accepted |
-| [0023](0023-uppsala-0.5-bergshamra-0.6-dependency-stack.md) | Adopt uppsala 0.5, local bergshamra 0.6, and kryptering 0.4 | Accepted |
+| [0023](0023-uppsala-0.5-bergshamra-0.6-dependency-stack.md) | Adopt uppsala 0.5, bergshamra 0.6, and kryptering 0.4 | Accepted |
 | [0024](0024-reject-dtd-at-saml-parse-boundary.md) | Reject DTDs at the SAML parse boundary | Accepted |

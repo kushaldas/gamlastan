@@ -54,9 +54,16 @@ pub fn parse_saml<'a, T: SamlDeserialize<'a>>(doc: &'a Document<'a>) -> Result<T
 ///    amplification and deep-nesting stack exhaustion.
 ///
 /// 2. **DTD rejection** — any document carrying a `<!DOCTYPE …>` is refused.
-///    Legitimate SAML messages never contain a DTD; refusing them closes the
-///    internal-entity-expansion attack surface entirely (defense in depth over
-///    uppsala's expansion byte budget) and removes the XXE entry point.
+///    Legitimate SAML messages never contain a DTD, so no DTD-bearing document
+///    is ever accepted past this parse boundary, removing the XXE / entity-
+///    smuggling entry point from all downstream SAML handling.
+///
+/// Note on ordering: uppsala parses the document (including any internal DTD
+/// subset, expanding internal entities within the byte/depth budgets above)
+/// *before* this function inspects [`Document::doctype`] and rejects it. The
+/// guarantee is therefore "nothing with a DTD is handed to SAML code", not
+/// "no DTD parsing work occurs" — the bounded parse work that happens before
+/// rejection is capped by uppsala's resource limits, never unbounded.
 ///
 /// Trusted XML the library produces itself (serialize-then-reparse round trips,
 /// unit-test fixtures) may continue to call [`uppsala::parse`] directly.
@@ -78,12 +85,23 @@ mod parse_secure_tests {
 
     #[test]
     fn rejects_doctype_declaration() {
-        // A SAML-shaped payload that smuggles in a DTD must be refused even
-        // though uppsala bounds the expansion: SAML forbids DTDs outright.
+        // Well-formed XML whose only disqualifying feature is the DTD: the
+        // DOCTYPE name (`samlp:Response`) matches the root element, and the
+        // entity reference resolves, so `uppsala::parse` accepts it. That
+        // isolates the rejection to `parse_secure`'s DOCTYPE check rather than
+        // a generic parse error, which would let the test pass for the wrong
+        // reason.
         let xml = r#"<?xml version="1.0"?>
-<!DOCTYPE Response [ <!ENTITY x "expanded"> ]>
+<!DOCTYPE samlp:Response [ <!ENTITY x "expanded"> ]>
 <samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol">&x;</samlp:Response>"#;
-        assert!(parse_secure(xml).is_err());
+        assert!(
+            uppsala::parse(xml).is_ok(),
+            "precondition: the DTD-bearing document is itself well-formed"
+        );
+        assert!(
+            parse_secure(xml).is_err(),
+            "parse_secure must reject the document solely because of the DTD"
+        );
     }
 
     #[test]

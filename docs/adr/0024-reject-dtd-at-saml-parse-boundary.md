@@ -34,10 +34,16 @@ handling is unchanged) and:
 2. **rejects any document whose `doctype` is present**, returning a
    well-formedness error.
 
-Refusing DTDs outright closes the internal-entity-expansion surface entirely —
-defense in depth over uppsala's expansion budget — and removes the XXE entry
-point as a matter of policy rather than relying on a downstream parser's
-configuration.
+Note the ordering: `parse_secure` calls `uppsala::parse` *first*, so uppsala
+does parse any internal DTD subset and may expand internal entities while
+building the DOM — but that work is bounded by uppsala's entity-expansion byte
+budget (1 MiB) and entity-depth cap, and the document is then refused before any
+SAML code sees it. The guarantee is therefore that **no DTD-bearing document is
+accepted past this parse boundary** (removing the XXE / entity-smuggling entry
+point from all downstream SAML handling as a matter of policy), not that zero
+DTD-parsing work occurs. Pre-empting the bounded parse work entirely would
+require uppsala to expose a "reject DTD at parse time" mode; until then the
+residual work is capped by uppsala's resource limits, never unbounded.
 
 The following inbound / remote-derived parse sites were migrated to
 `parse_secure`: SP and IdP actix handlers (`gamlastan-actix` `sp.rs`, `idp.rs`),

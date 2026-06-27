@@ -1,4 +1,4 @@
-# ADR 0023 - Adopt uppsala 0.5, local bergshamra 0.6, and kryptering 0.4
+# ADR 0023 - Adopt uppsala 0.5, bergshamra 0.6, and kryptering 0.4
 
 - **Status:** Accepted
 - **Date:** 2026-06-27

@@ -23,8 +23,9 @@ use std::sync::Arc;
 
 use actix_web::{web, App, HttpResponse, HttpServer};
 use log::info;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
-use rustls_pemfile::{certs, pkcs8_private_keys};
 
 use gamlastan::bindings::redirect::{redirect_encode, RedirectEncodeParams};
 use gamlastan::core::assertion::issuer::Issuer;
@@ -1389,11 +1390,11 @@ async fn main() -> io::Result<()> {
     let cert_file = &mut io::BufReader::new(fs::File::open(&tls_cert_path)?);
     let key_file = &mut io::BufReader::new(fs::File::open(&tls_key_path)?);
 
-    let cert_chain: Vec<_> = certs(cert_file)
+    let cert_chain: Vec<_> = CertificateDer::pem_reader_iter(cert_file)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("cert error: {e}")))?;
 
-    let mut keys = pkcs8_private_keys(key_file)
+    let mut keys: Vec<PrivatePkcs8KeyDer<'_>> = PrivatePkcs8KeyDer::pem_reader_iter(key_file)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("key error: {e}")))?;
 
