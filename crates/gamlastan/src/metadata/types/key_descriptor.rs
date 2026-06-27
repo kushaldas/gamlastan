@@ -193,7 +193,7 @@ const X509_BASE64: base64::engine::GeneralPurpose = base64::engine::GeneralPurpo
 fn x509_certificates_der_from_key_info(key_info_xml: &str) -> Vec<Vec<u8>> {
     use base64::Engine;
 
-    let doc = match uppsala::parse(key_info_xml) {
+    let doc = match crate::xml::parse_secure(key_info_xml) {
         Ok(doc) => doc,
         // KeyInfo captured from a larger metadata document often borrows
         // ancestor namespace declarations and is not valid standalone XML.

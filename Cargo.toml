@@ -9,7 +9,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 repository = "https://github.com/kushaldas/gamlastan"
 readme = "README.md"
@@ -18,27 +18,28 @@ rust-version = "1.75"
 
 [workspace.dependencies]
 # Internal crates
-gamlastan = { version = "0.5.0", path = "crates/gamlastan" }
-gamlastan-actix = { version = "0.5.0", path = "crates/gamlastan-actix" }
-gamlastan-mdq = { version = "0.5.0", path = "crates/gamlastan-mdq" }
+gamlastan = { version = "0.6.0", path = "crates/gamlastan" }
+gamlastan-actix = { version = "0.6.0", path = "crates/gamlastan-actix" }
+gamlastan-mdq = { version = "0.6.0", path = "crates/gamlastan-mdq" }
 
 # XML parsing
-uppsala = "0.4.0"
+uppsala = "0.5.0"
 
 # XML security
-bergshamra = "0.5.1"
-bergshamra-core = "0.5.1"
-bergshamra-dsig = "0.5.1"
-bergshamra-enc = "0.5.1"
-bergshamra-c14n = "0.5.1"
-bergshamra-crypto = "0.5.1"
-bergshamra-keys = "0.5.1"
+bergshamra = "0.6.0"
+bergshamra-core = "0.6.0"
+bergshamra-dsig = "0.6.0"
+bergshamra-enc = "0.6.0"
+bergshamra-c14n = "0.6.0"
+bergshamra-crypto = "0.6.0"
+bergshamra-keys = "0.6.0"
 
 # HSM / PKCS#11 signing backend (the low-level crypto provider beneath
 # bergshamra). This direct dependency exists so gamlastan can re-export the
 # shared `kryptering::Signer` trait/types without version drift from the
-# bergshamra stack.
-kryptering = "0.3"
+# bergshamra stack. Features mirror bergshamra's kryptering dependency so the
+# crate resolves to a single instance with a unified feature set.
+kryptering = { version = "0.4.0", default-features = false, features = ["legacy", "post-quantum", "pkcs11"] }
 
 # Date/time
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
@@ -61,7 +62,6 @@ actix-web = { version = "4", features = ["rustls-0_23"] }
 
 # TLS
 rustls = "0.23"
-rustls-pemfile = "2"
 
 # Logging
 env_logger = "0.11"

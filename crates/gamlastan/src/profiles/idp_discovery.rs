@@ -218,7 +218,7 @@ pub fn parse_discovery_response_endpoints(
         body = extensions_raw_xml
     );
 
-    let doc = uppsala::parse(&wrapped)
+    let doc = crate::xml::parse_secure(&wrapped)
         .map_err(|e| ProfileError::Metadata(format!("cannot parse Extensions XML: {e}")))?;
     let root = doc
         .document_element()

@@ -7,6 +7,45 @@ where needed to correct protocol handling.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-06-27
+
+### Security
+
+- Added `gamlastan::xml::parse_secure`, a hardened parse entry point for all
+  attacker-controlled XML. It is a drop-in replacement for `uppsala::parse`
+  that, on top of uppsala 0.5's default resource limits, **rejects any document
+  carrying a DTD (`<!DOCTYPE …>`)** so that no DTD-bearing document is accepted
+  past the parse boundary — removing the XXE / entity-smuggling entry point from
+  downstream SAML handling. All inbound and remote-derived parse sites were
+  migrated to it: SP/IdP Actix handlers, SOAP/PAOS envelope unwrap, ECP envelope
+  parsing, Sweden Connect response validation/decryption and decrypted
+  assertions, IdP-discovery and PEFIM extension parsing, SPID and Sweden Connect
+  metadata extensions, `KeyInfo` X.509 extraction, the standalone `ds:Object`
+  signature guard, and the MDQ verifier. See ADR 0024.
+- Inbound XML is now bounded by uppsala 0.5's fail-closed default limits —
+  element-nesting depth (128), entity-expansion byte budget (1 MiB), and
+  entity-nesting depth (256) — defeating deep-nesting stack exhaustion and
+  billion-laughs / quadratic entity amplification before assertion validation
+  runs. uppsala 0.5 also sanitizes serializer output (comments, PIs, CDATA,
+  names, encoding, control characters). See ADR 0023.
+
+### Changed
+
+- Upgraded the XML/crypto stack: `uppsala` 0.4 → 0.5, `bergshamra` 0.5.1 → 0.6.0,
+  and the direct `kryptering` dependency 0.3 → 0.4 with features mirroring
+  bergshamra (`legacy`, `post-quantum`, `pkcs11`) so the shared `Signer` /
+  `Pkcs11Signer` types resolve to a single instance with no version or feature
+  drift. All are consumed from crates.io. See ADR 0023.
+- Migrated `spid-sp-test` and `example-idp` off the unmaintained `rustls-pemfile`
+  crate (RUSTSEC-2025-0134) to the `PemObject` API in `rustls-pki-types`, and
+  dropped the `rustls-pemfile` dependency.
+
+### Fixed
+
+- Cleared all `cargo audit` findings: `quinn-proto` 0.11.14 → 0.11.15
+  (RUSTSEC-2026-0185, remote memory exhaustion), `rand` 0.8.5 → 0.8.6 and
+  0.9.2 → 0.9.4 (RUSTSEC-2026-0097), and `crypto-bigint` off the yanked 0.7.3.
+
 ## [0.5.0] - 2026-06-21
 
 ### Security
@@ -220,7 +259,8 @@ Historical release recorded before changelog adoption.
 
 Historical release recorded before changelog adoption.
 
-[Unreleased]: https://github.com/kushaldas/gamlastan/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/kushaldas/gamlastan/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/kushaldas/gamlastan/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/kushaldas/gamlastan/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/kushaldas/gamlastan/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/kushaldas/gamlastan/compare/v0.3.0...v0.4.0

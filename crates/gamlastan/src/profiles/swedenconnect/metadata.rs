@@ -184,7 +184,7 @@ pub fn entity_attribute_values(ext: &Extensions, attribute_name: &str) -> Vec<St
         ext.raw_xml
     );
 
-    let doc = match uppsala::parse(&full_xml) {
+    let doc = match crate::xml::parse_secure(&full_xml) {
         Ok(d) => d,
         Err(_) => return Vec::new(),
     };

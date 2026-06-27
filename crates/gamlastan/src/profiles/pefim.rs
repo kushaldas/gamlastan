@@ -64,7 +64,7 @@ pub fn extract_encryption_certs(extensions_xml: &str) -> Result<Vec<String>, Pro
     let wrapped = format!(
         r#"<w xmlns:samlp="{SAMLP_NS}" xmlns:pefim="{PEFIM_NS}" xmlns:ds="{DSIG_NS}" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">{extensions_xml}</w>"#
     );
-    let doc = uppsala::parse(&wrapped)
+    let doc = crate::xml::parse_secure(&wrapped)
         .map_err(|e| ProfileError::Other(format!("cannot parse Extensions XML: {e}")))?;
     let root = doc
         .document_element()

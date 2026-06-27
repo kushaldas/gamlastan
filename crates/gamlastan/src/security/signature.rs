@@ -21,7 +21,7 @@
 pub fn contains_ds_object(signature_xml: &str) -> bool {
     const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 
-    let Ok(doc) = uppsala::parse(signature_xml) else {
+    let Ok(doc) = crate::xml::parse_secure(signature_xml) else {
         // The caller's XML verifier will report malformed XML later. This
         // helper only answers "is there a real XMLDSig Object element?" and
         // avoids guessing from text when the fragment is not parseable XML.

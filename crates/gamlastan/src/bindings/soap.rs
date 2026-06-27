@@ -47,7 +47,7 @@ pub fn soap_envelope_unwrap(soap_xml: &[u8]) -> Result<SoapUnwrapped, BindingErr
     let xml_str = std::str::from_utf8(soap_xml)
         .map_err(|e| BindingError::InvalidSoapEnvelope(format!("not valid UTF-8: {}", e)))?;
 
-    let doc = uppsala::parse(xml_str)
+    let doc = crate::xml::parse_secure(xml_str)
         .map_err(|e| BindingError::InvalidSoapEnvelope(format!("XML parse error: {}", e)))?;
 
     let root = doc
