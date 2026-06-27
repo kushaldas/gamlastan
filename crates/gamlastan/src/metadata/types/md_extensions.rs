@@ -140,7 +140,7 @@ fn attribute_values(doc: &crate::xml::Document<'_>, attr_node: crate::xml::NodeI
             continue;
         };
         if elem.name.namespace_uri.as_deref() == Some(SAML_ASSERTION_NS)
-            && *elem.name.local_name == *"AttributeValue"
+            && elem.name.local_name == "AttributeValue"
         {
             let text = match doc.text_content(child) {
                 Some(t) => t.trim().to_string(),
