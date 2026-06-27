@@ -68,10 +68,15 @@ unit-test fixtures) may continue to call `uppsala::parse` directly.
   do not flow through `parse_secure`.
 - New parse sites for untrusted XML should use `parse_secure`; this is the single
   documented choke point for inbound XML hardening.
+- The rejection error reports the actual `<!DOCTYPE` position (1-based line /
+  column, counting characters) rather than a fixed `1:1`, so logs point at the
+  offending declaration even when it appears after the prolog. It falls back to
+  `1:1` only if the literal cannot be located.
 
 ## Validation
 
 - `parse_secure_tests::rejects_doctype_declaration` (entity-bearing DTD)
 - `parse_secure_tests::rejects_internal_subset_without_entities`
 - `parse_secure_tests::accepts_well_formed_saml_without_dtd`
+- `parse_secure_tests::reports_doctype_position` (line/column accuracy)
 - `cargo test --workspace` — full suite green.

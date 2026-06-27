@@ -70,18 +70,58 @@ pub fn parse_saml<'a, T: SamlDeserialize<'a>>(doc: &'a Document<'a>) -> Result<T
 pub fn parse_secure(xml: &str) -> Result<Document<'_>, uppsala::XmlError> {
     let doc = uppsala::parse(xml)?;
     if doc.doctype.is_some() {
+        let (line, column) = locate_doctype(xml).unwrap_or((1, 1));
         return Err(uppsala::XmlError::well_formedness(
             "DOCTYPE/DTD declarations are forbidden in SAML messages",
-            1,
-            1,
+            line,
+            column,
         ));
     }
     Ok(doc)
 }
 
+/// Locate the `<!DOCTYPE` token and return its 1-based `(line, column)`.
+///
+/// Reports the actual position of the offending declaration so error logs point
+/// at it rather than at a misleading `1:1`. Returns `None` when the literal
+/// cannot be found (e.g. an exotic-but-valid spelling uppsala accepted that this
+/// byte search misses), so callers fall back to `1:1`.
+fn locate_doctype(xml: &str) -> Option<(usize, usize)> {
+    let offset = xml.find("<!DOCTYPE")?;
+    let mut line = 1usize;
+    let mut line_start = 0usize;
+    for (i, b) in xml.as_bytes()[..offset].iter().enumerate() {
+        if *b == b'\n' {
+            line += 1;
+            line_start = i + 1;
+        }
+    }
+    // Column counts UTF-8 characters from the line start, not raw bytes.
+    let column = xml[line_start..offset].chars().count() + 1;
+    Some((line, column))
+}
+
 #[cfg(test)]
 mod parse_secure_tests {
-    use super::parse_secure;
+    use super::{locate_doctype, parse_secure};
+
+    #[test]
+    fn reports_doctype_position() {
+        // DOCTYPE on its own line: line 2, column 1.
+        assert_eq!(
+            locate_doctype("<?xml version=\"1.0\"?>\n<!DOCTYPE x [ ]>\n<x/>"),
+            Some((2, 1))
+        );
+        // Indented DOCTYPE on the first line: column is 1-based from line start.
+        assert_eq!(locate_doctype("   <!DOCTYPE x><x/>"), Some((1, 4)));
+        // Column counts characters, not bytes (the leading text is multi-byte).
+        assert_eq!(
+            locate_doctype("<!-- café -->\n<!DOCTYPE x><x/>"),
+            Some((2, 1))
+        );
+        // No DOCTYPE present.
+        assert_eq!(locate_doctype("<x/>"), None);
+    }
 
     #[test]
     fn rejects_doctype_declaration() {
