@@ -2,6 +2,8 @@
 //
 // Per saml-metadata-2.0-os Sections 2.3.1, 2.3.2
 
+use std::collections::HashSet;
+
 use chrono::{DateTime, Utc};
 
 use super::additional::{AdditionalMetadataLocation, AdditionalMetadataLocationRef};
@@ -11,7 +13,7 @@ use super::authn_authority::{AuthnAuthorityDescriptor, AuthnAuthorityDescriptorR
 use super::contact::{ContactPerson, ContactPersonRef};
 use super::extensions::{Extensions, ExtensionsRef};
 use super::idp::{IdpSsoDescriptor, IdpSsoDescriptorRef};
-use super::md_extensions::MdExtensions;
+use super::md_extensions::{MdExtensions, UiInfo as MdUiInfo};
 use super::organization::{Organization, OrganizationRef};
 use super::pdp::{PdpDescriptor, PdpDescriptorRef};
 use super::sp::{SpSsoDescriptor, SpSsoDescriptorRef};
@@ -222,6 +224,83 @@ impl EntityDescriptor {
     pub fn entity_attribute_values(&self, name: &str) -> Vec<String> {
         self.md_extensions().entity_attribute_values(name)
     }
+
+    /// The `mdui:UIInfo` published for the SP role (`SPSSODescriptor`), if any -
+    /// the display name / logo / description an IdP shows for this SP. Falls back
+    /// to entity-level `Extensions`.
+    pub fn sp_ui_info(&self) -> Option<MdUiInfo> {
+        self.role_ui_info(self.roles.sp_sso_descriptors().iter().map(|d| &d.sso_base))
+    }
+
+    /// The `mdui:UIInfo` published for the IdP role (`IDPSSODescriptor`), if any.
+    /// Falls back to entity-level `Extensions`.
+    pub fn idp_ui_info(&self) -> Option<MdUiInfo> {
+        self.role_ui_info(self.roles.idp_sso_descriptors().iter().map(|d| &d.sso_base))
+    }
+
+    /// First non-empty UIInfo across the given role descriptors, then the
+    /// entity-level Extensions.
+    fn role_ui_info<'a>(
+        &self,
+        roles: impl Iterator<Item = &'a super::role_descriptor::SsoDescriptorBase>,
+    ) -> Option<MdUiInfo> {
+        for sso_base in roles {
+            if let Some(ext) = &sso_base.base.extensions {
+                if let Some(ui) = MdExtensions::from_extensions(ext).ui_info {
+                    if !ui.is_empty() {
+                        return Some(ui);
+                    }
+                }
+            }
+        }
+        self.md_extensions().ui_info.filter(|ui| !ui.is_empty())
+    }
+
+    /// The algorithm URIs (`alg:SigningMethod` / `alg:DigestMethod`) advertised
+    /// for algorithm support, with duplicates removed (first occurrence kept).
+    ///
+    /// Sources are aggregated in a fixed order: the entity-level `Extensions`
+    /// first, then the IdP SSO role descriptors, then the SP SSO role
+    /// descriptors; within each source, signing methods precede digest methods
+    /// (see [`MdExtensions::supported_algorithms`]). Because IdP and SP
+    /// descriptors are stored in separate collections, this is NOT the original
+    /// XML role-descriptor order, so callers must not treat the order as
+    /// meaningful.
+    ///
+    /// # Security
+    ///
+    /// This is an **untrusted advertisement** copied verbatim from the peer's
+    /// metadata, not a security control. A peer that controls its own metadata
+    /// can advertise only weak algorithms (or omit strong ones) to drive a
+    /// downgrade. Consumers MUST intersect this list with a local
+    /// minimum-strength allowlist (see `is_broken_algorithm`) and never simply
+    /// adopt the peer's advertised choice. The list also aggregates the IdP and
+    /// SP roles together; a caller needing a single role must filter itself.
+    pub fn supported_algorithms(&self) -> Vec<String> {
+        // First-seen de-duplication: `seen` gives O(1) membership instead of the
+        // O(n^2) `Vec::contains` scan, while `out` keeps the fixed aggregation
+        // order documented above.
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut push_from = |ext: &Extensions| {
+            for alg in MdExtensions::from_extensions(ext).supported_algorithms() {
+                if seen.insert(alg.clone()) {
+                    out.push(alg);
+                }
+            }
+        };
+        if let Some(ext) = &self.extensions {
+            push_from(ext);
+        }
+        let idp_bases = self.roles.idp_sso_descriptors().iter().map(|d| &d.sso_base);
+        let sp_bases = self.roles.sp_sso_descriptors().iter().map(|d| &d.sso_base);
+        for sso_base in idp_bases.chain(sp_bases) {
+            if let Some(ext) = &sso_base.base.extensions {
+                push_from(ext);
+            }
+        }
+        out
+    }
 }
 
 /// A child of EntitiesDescriptor: either an EntityDescriptor or nested EntitiesDescriptor.
@@ -390,6 +469,55 @@ mod tests {
         assert_eq!(
             ed.entity_attribute_values("urn:oasis:names:tc:SAML:profiles:subject-id:req"),
             vec!["any".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_entity_descriptor_ui_info_and_algorithms_from_role() {
+        use super::super::extensions::Extensions;
+        use super::super::role_descriptor::{RoleDescriptorBase, SsoDescriptorBase};
+
+        // An SP whose SPSSODescriptor carries mdui:UIInfo and algsupport.
+        let mut base =
+            RoleDescriptorBase::new(vec!["urn:oasis:names:tc:SAML:2.0:protocol".to_string()]);
+        base.extensions = Some(Extensions::new(
+            r#"
+            <mdui:UIInfo xmlns:mdui="urn:oasis:names:tc:SAML:metadata:ui">
+              <mdui:DisplayName xml:lang="en">Example SP</mdui:DisplayName>
+            </mdui:UIInfo>
+            <alg:SigningMethod xmlns:alg="urn:oasis:names:tc:SAML:metadata:algsupport"
+                Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+            "#
+            .to_string(),
+        ));
+        let sp = SpSsoDescriptor {
+            sso_base: SsoDescriptorBase {
+                base,
+                artifact_resolution_services: vec![],
+                single_logout_services: vec![],
+                manage_name_id_services: vec![],
+                name_id_formats: vec![],
+            },
+            authn_requests_signed: None,
+            want_assertions_signed: None,
+            assertion_consumer_services: vec![],
+            attribute_consuming_services: vec![],
+        };
+        let mut ed = simple_sp_entity("https://sp.example.com");
+        ed.roles = EntityRoles::Roles {
+            idp_sso: vec![],
+            sp_sso: vec![sp],
+            authn_authority: vec![],
+            attr_authority: vec![],
+            pdp: vec![],
+        };
+
+        let ui = ed.sp_ui_info().expect("SP UIInfo");
+        assert_eq!(ui.display_names[0].value, "Example SP");
+        assert!(ed.idp_ui_info().is_none());
+        assert_eq!(
+            ed.supported_algorithms(),
+            vec!["http://www.w3.org/2001/04/xmldsig-more#rsa-sha256".to_string()]
         );
     }
 

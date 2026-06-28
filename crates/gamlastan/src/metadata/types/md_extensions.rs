@@ -24,6 +24,87 @@ pub const MDATTR_NS: &str = "urn:oasis:names:tc:SAML:metadata:attribute";
 pub const SAML_ASSERTION_NS: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
 /// The entity-attribute `Name` that carries entity-category URIs.
 pub const ENTITY_CATEGORY_ATTR: &str = "http://macedir.org/entity-category";
+/// SAML V2.0 Metadata Extensions for Login and Discovery UI (MDUI) namespace.
+pub const MDUI_NS: &str = "urn:oasis:names:tc:SAML:metadata:ui";
+/// SAML V2.0 Metadata Extensions for Algorithm Support namespace.
+pub const ALGSUPPORT_NS: &str = "urn:oasis:names:tc:SAML:metadata:algsupport";
+/// XML namespace, for the `xml:lang` attribute.
+const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
+
+/// A localized string (`xml:lang` plus value) from an MDUI element.
+///
+/// `value` is **attacker-controlled** (see [`UiInfo`]); output-encode it before
+/// rendering.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LocalizedText {
+    /// The `xml:lang` tag, if present.
+    pub lang: Option<String>,
+    /// The element text. Attacker-controlled; output-encode before display.
+    pub value: String,
+}
+
+/// An `mdui:Logo` (a URL with optional dimensions and language).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UiLogo {
+    /// The `xml:lang` tag, if present.
+    pub lang: Option<String>,
+    /// Logo width in pixels, if a valid integer was given.
+    pub width: Option<u32>,
+    /// Logo height in pixels, if a valid integer was given.
+    pub height: Option<u32>,
+    /// The logo URL (or `data:` URI). **Attacker-controlled and unvalidated**
+    /// (see [`UiInfo`]): the scheme is not restricted, so before using it as an
+    /// `<img src>`/link target a consumer MUST reject anything outside an
+    /// expected allowlist (typically `https:`, plus `data:` only if images are
+    /// intentionally inlined).
+    pub url: String,
+}
+
+/// Parsed `mdui:UIInfo` (SP/IdP display metadata for consent and discovery UIs).
+///
+/// # Security
+///
+/// Every field here is copied **verbatim from attacker-controllable metadata**
+/// (federation aggregates / MDQ) and is parsed for display, not validated for
+/// safety. Treat all strings and URLs as untrusted:
+///
+/// - HTML-rendering consumers (e.g. an IdP consent screen) MUST output-encode
+///   `display_names` / `descriptions` / `keywords` values, or they risk stored
+///   XSS.
+/// - URL-bearing fields (`information_urls`, `privacy_statement_urls`, and
+///   [`UiLogo::url`]) are NOT scheme-checked; a value may be `javascript:` or a
+///   hostile `data:` URI. Restrict to an expected scheme allowlist (e.g.
+///   `https:`) before emitting them as `href`/`src`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UiInfo {
+    /// `mdui:DisplayName` entries. Attacker-controlled; output-encode.
+    pub display_names: Vec<LocalizedText>,
+    /// `mdui:Description` entries. Attacker-controlled; output-encode.
+    pub descriptions: Vec<LocalizedText>,
+    /// `mdui:InformationURL` entries. Attacker-controlled and not scheme-checked;
+    /// validate the scheme before use as a link.
+    pub information_urls: Vec<LocalizedText>,
+    /// `mdui:PrivacyStatementURL` entries. Attacker-controlled and not
+    /// scheme-checked; validate the scheme before use as a link.
+    pub privacy_statement_urls: Vec<LocalizedText>,
+    /// `mdui:Keywords` entries (each value is the raw space-separated string).
+    /// Attacker-controlled; output-encode.
+    pub keywords: Vec<LocalizedText>,
+    /// `mdui:Logo` entries. See [`UiLogo::url`] for the URL trust caveat.
+    pub logos: Vec<UiLogo>,
+}
+
+impl UiInfo {
+    /// Whether this UIInfo carries no entries at all.
+    pub fn is_empty(&self) -> bool {
+        self.display_names.is_empty()
+            && self.descriptions.is_empty()
+            && self.information_urls.is_empty()
+            && self.privacy_statement_urls.is_empty()
+            && self.keywords.is_empty()
+            && self.logos.is_empty()
+    }
+}
 
 /// Parsed view of the attribute-release-relevant metadata extensions of one
 /// entity. Cheap to ignore (empty when the entity has no such extensions).
@@ -33,6 +114,12 @@ pub struct MdExtensions {
     pub registration_authority: Option<String>,
     /// `mdattr:EntityAttributes` as `(Name, values)` pairs, in document order.
     pub entity_attributes: Vec<(String, Vec<String>)>,
+    /// The first `mdui:UIInfo` found, if any.
+    pub ui_info: Option<UiInfo>,
+    /// `alg:SigningMethod/@Algorithm` URIs, in document order.
+    pub signing_methods: Vec<String>,
+    /// `alg:DigestMethod/@Algorithm` URIs, in document order.
+    pub digest_methods: Vec<String>,
 }
 
 impl MdExtensions {
@@ -62,8 +149,12 @@ impl MdExtensions {
                 "<md:Extensions xmlns:md=\"urn:oasis:names:tc:SAML:2.0:metadata\">{trimmed}</md:Extensions>"
             )
         };
+        // Declare every prefix these accessors care about on the synthetic root,
+        // so a fragment that used a prefix declared on an ancestor we did not
+        // capture (the common case for role-level Extensions, where xmlns:mdui /
+        // xmlns:alg sit on the EntityDescriptor) still resolves.
         let full = format!(
-            r#"<gamlastan-md-root xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" xmlns:mdrpi="{MDRPI_NS}" xmlns:mdattr="{MDATTR_NS}" xmlns:saml="{SAML_ASSERTION_NS}">{inner}</gamlastan-md-root>"#
+            r#"<gamlastan-md-root xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" xmlns:mdrpi="{MDRPI_NS}" xmlns:mdattr="{MDATTR_NS}" xmlns:saml="{SAML_ASSERTION_NS}" xmlns:mdui="{MDUI_NS}" xmlns:alg="{ALGSUPPORT_NS}">{inner}</gamlastan-md-root>"#
         );
 
         let Ok(doc) = crate::xml::parse_secure(&full) else {
@@ -90,6 +181,18 @@ impl MdExtensions {
     /// (`http://macedir.org/entity-category`).
     pub fn entity_categories(&self) -> Vec<String> {
         self.entity_attribute_values(ENTITY_CATEGORY_ATTR)
+    }
+
+    /// All advertised algorithm URIs: every `alg:SigningMethod` first, then
+    /// every `alg:DigestMethod`. Each group preserves its own document order,
+    /// but the two groups are concatenated rather than merged, so a
+    /// `alg:DigestMethod` that appears before a `alg:SigningMethod` in the XML
+    /// still sorts after it. Callers must not treat the combined order as the
+    /// original document order.
+    pub fn supported_algorithms(&self) -> Vec<String> {
+        let mut out = self.signing_methods.clone();
+        out.extend(self.digest_methods.iter().cloned());
+        out
     }
 }
 
@@ -126,6 +229,21 @@ fn walk(
                 let values = attribute_values(doc, child);
                 out.entity_attributes.push((name.to_string(), values));
             }
+        } else if ns == Some(MDUI_NS) && local == "UIInfo" {
+            // Keep the first UIInfo; its children are parsed here, so don't
+            // recurse into them.
+            if out.ui_info.is_none() {
+                out.ui_info = Some(parse_ui_info(doc, child));
+            }
+            continue;
+        } else if ns == Some(ALGSUPPORT_NS) && local == "SigningMethod" {
+            if let Some(alg) = elem.get_attribute("Algorithm") {
+                out.signing_methods.push(alg.to_string());
+            }
+        } else if ns == Some(ALGSUPPORT_NS) && local == "DigestMethod" {
+            if let Some(alg) = elem.get_attribute("Algorithm") {
+                out.digest_methods.push(alg.to_string());
+            }
         }
 
         walk(doc, child, child_in_entity_attributes, out);
@@ -153,6 +271,66 @@ fn attribute_values(doc: &crate::xml::Document<'_>, attr_node: crate::xml::NodeI
         }
     }
     values
+}
+
+/// The trimmed text content of an element (direct text, falling back to a deep
+/// gather), or the empty string.
+fn element_text(doc: &crate::xml::Document<'_>, node: crate::xml::NodeId) -> String {
+    match doc.text_content(node) {
+        Some(t) => t.trim().to_string(),
+        None => doc.text_content_deep(node).trim().to_string(),
+    }
+}
+
+/// The `xml:lang` of an element, if present.
+fn element_lang(elem: &crate::xml::uppsala::Element<'_>) -> Option<String> {
+    elem.get_attribute_ns(XML_NS, "lang")
+        .or_else(|| elem.get_attribute("xml:lang"))
+        .map(str::to_string)
+}
+
+/// Parse the children of an `mdui:UIInfo` element.
+fn parse_ui_info(doc: &crate::xml::Document<'_>, node: crate::xml::NodeId) -> UiInfo {
+    let mut info = UiInfo::default();
+    for child in doc.children_iter(node) {
+        let Some(elem) = doc.element(child) else {
+            continue;
+        };
+        if elem.name.namespace_uri.as_deref() != Some(MDUI_NS) {
+            continue;
+        }
+        let lang = element_lang(elem);
+        match elem.name.local_name.as_ref() {
+            "DisplayName" => info.display_names.push(LocalizedText {
+                lang,
+                value: element_text(doc, child),
+            }),
+            "Description" => info.descriptions.push(LocalizedText {
+                lang,
+                value: element_text(doc, child),
+            }),
+            "InformationURL" => info.information_urls.push(LocalizedText {
+                lang,
+                value: element_text(doc, child),
+            }),
+            "PrivacyStatementURL" => info.privacy_statement_urls.push(LocalizedText {
+                lang,
+                value: element_text(doc, child),
+            }),
+            "Keywords" => info.keywords.push(LocalizedText {
+                lang,
+                value: element_text(doc, child),
+            }),
+            "Logo" => info.logos.push(UiLogo {
+                lang,
+                width: elem.get_attribute("width").and_then(|s| s.parse().ok()),
+                height: elem.get_attribute("height").and_then(|s| s.parse().ok()),
+                url: element_text(doc, child),
+            }),
+            _ => {}
+        }
+    }
+    info
 }
 
 #[cfg(test)]
@@ -240,6 +418,97 @@ mod tests {
         assert!(ext
             .entity_attribute_values("urn:example:should-be-ignored")
             .is_empty());
+    }
+
+    #[test]
+    fn test_ui_info_parsing() {
+        let ext = MdExtensions::parse(
+            r#"
+            <mdui:UIInfo xmlns:mdui="urn:oasis:names:tc:SAML:metadata:ui">
+              <mdui:DisplayName xml:lang="en">Example Service</mdui:DisplayName>
+              <mdui:DisplayName xml:lang="sv">Exempeltjänst</mdui:DisplayName>
+              <mdui:Description xml:lang="en">An example.</mdui:Description>
+              <mdui:InformationURL xml:lang="en">https://example.org/about</mdui:InformationURL>
+              <mdui:PrivacyStatementURL xml:lang="en">https://example.org/privacy</mdui:PrivacyStatementURL>
+              <mdui:Keywords xml:lang="en">login example</mdui:Keywords>
+              <mdui:Logo width="80" height="60" xml:lang="en">https://example.org/logo.png</mdui:Logo>
+            </mdui:UIInfo>
+            "#,
+        );
+        let ui = ext.ui_info.expect("UIInfo present");
+        assert_eq!(ui.display_names.len(), 2);
+        assert_eq!(ui.display_names[0].lang.as_deref(), Some("en"));
+        assert_eq!(ui.display_names[0].value, "Example Service");
+        assert_eq!(ui.display_names[1].value, "Exempeltjänst");
+        assert_eq!(ui.descriptions[0].value, "An example.");
+        assert_eq!(ui.information_urls[0].value, "https://example.org/about");
+        assert_eq!(
+            ui.privacy_statement_urls[0].value,
+            "https://example.org/privacy"
+        );
+        assert_eq!(ui.keywords[0].value, "login example");
+        assert_eq!(ui.logos.len(), 1);
+        assert_eq!(ui.logos[0].url, "https://example.org/logo.png");
+        assert_eq!(ui.logos[0].width, Some(80));
+        assert_eq!(ui.logos[0].height, Some(60));
+        assert_eq!(ui.logos[0].lang.as_deref(), Some("en"));
+    }
+
+    #[test]
+    fn test_algorithm_support_parsing() {
+        let ext = MdExtensions::parse(
+            r#"
+            <alg:SigningMethod xmlns:alg="urn:oasis:names:tc:SAML:metadata:algsupport"
+                Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+            <alg:SigningMethod xmlns:alg="urn:oasis:names:tc:SAML:metadata:algsupport"
+                Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha512"/>
+            <alg:DigestMethod xmlns:alg="urn:oasis:names:tc:SAML:metadata:algsupport"
+                Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+            "#,
+        );
+        assert_eq!(
+            ext.signing_methods,
+            vec![
+                "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256".to_string(),
+                "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512".to_string(),
+            ]
+        );
+        assert_eq!(
+            ext.digest_methods,
+            vec!["http://www.w3.org/2001/04/xmlenc#sha256".to_string()]
+        );
+        // supported_algorithms lists signing methods first, then digests.
+        let all = ext.supported_algorithms();
+        assert_eq!(all.len(), 3);
+        assert!(all[0].contains("rsa-sha256"));
+        assert!(all[2].contains("xmlenc#sha256"));
+    }
+
+    #[test]
+    fn test_ui_info_with_ancestor_declared_namespace() {
+        // Role-level Extensions are captured as a raw fragment that uses the
+        // mdui/alg prefixes declared on an ancestor (the EntityDescriptor) we did
+        // not capture. The synthetic root must still resolve them.
+        let ext = MdExtensions::parse(
+            r#"
+            <mdui:UIInfo>
+              <mdui:DisplayName xml:lang="en">Example SP</mdui:DisplayName>
+            </mdui:UIInfo>
+            <alg:SigningMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+            "#,
+        );
+        let ui = ext.ui_info.expect("UIInfo resolves without a local xmlns");
+        assert_eq!(ui.display_names[0].value, "Example SP");
+        assert_eq!(
+            ext.signing_methods,
+            vec!["http://www.w3.org/2001/04/xmldsig-more#rsa-sha256".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_ui_info_absent_yields_none() {
+        assert!(MdExtensions::parse(SWAMID_SP_EXT).ui_info.is_none());
+        assert!(MdExtensions::default().ui_info.is_none());
     }
 
     #[test]
