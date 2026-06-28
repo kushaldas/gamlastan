@@ -22,6 +22,15 @@ where needed to correct protocol handling.
   (`mdrpi:RegistrationInfo`), `entity_categories()` and
   `entity_attribute_values()` (`mdattr:EntityAttributes`), backed by the new
   `metadata::types::md_extensions::MdExtensions` (fail-soft, `parse_secure`).
+- MDUI and algorithm-support metadata extensions: `MdExtensions` now also parses
+  `mdui:UIInfo` (`UiInfo` / `LocalizedText` / `UiLogo`: display names,
+  descriptions, information/privacy URLs, keywords, logos) and
+  `alg:SigningMethod` / `alg:DigestMethod` (`signing_methods` / `digest_methods`
+  / `supported_algorithms()`). `EntityDescriptor` exposes `sp_ui_info()` /
+  `idp_ui_info()` (role descriptor first, then entity-level Extensions) and
+  `supported_algorithms()` (aggregated across the entity and SSO roles,
+  de-duplicated). Used by IdPs to display an SP's name/logo on consent screens
+  and to negotiate signing/digest algorithms.
 - `idp::policy::ReleasePolicy` registration-authority-based selection:
   `set_registration_authority` / `with_registration_authority` /
   `register_sp_metadata`, resolving SP entity ID > registration authority >
