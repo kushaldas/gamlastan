@@ -15,6 +15,8 @@
 // - Phase 1: SAML request in SOAP response from IdP
 // - Phase 2: SAML response in SOAP request to SP
 
+use bergshamra_c14n::escape::{escape_attr, escape_text};
+
 use crate::bindings::error::BindingError;
 use crate::bindings::soap::SOAP11_ACTOR_NEXT;
 
@@ -84,22 +86,6 @@ pub struct EcpRelayState {
     pub relay_state: String,
 }
 
-/// Escape a string for use in XML attribute values and text content.
-fn xml_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&apos;"),
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
 /// Serialize a PAOS Request header block to XML.
 pub fn paos_request_header_xml(req: &PaosRequest) -> String {
     let mut xml = String::with_capacity(256);
@@ -107,13 +93,13 @@ pub fn paos_request_header_xml(req: &PaosRequest) -> String {
         r#"<paos:Request xmlns:paos="{}" soap:mustUnderstand="1" soap:actor="{}" responseConsumerURL="{}""#,
         PAOS_NS,
         SOAP11_ACTOR_NEXT,
-        xml_escape(&req.response_consumer_url)
+        escape_attr(&req.response_consumer_url)
     ));
     if let Some(ref svc) = req.service {
-        xml.push_str(&format!(r#" service="{}""#, xml_escape(svc)));
+        xml.push_str(&format!(r#" service="{}""#, escape_attr(svc)));
     }
     if let Some(ref mid) = req.message_id {
-        xml.push_str(&format!(r#" messageID="{}""#, xml_escape(mid)));
+        xml.push_str(&format!(r#" messageID="{}""#, escape_attr(mid)));
     }
     xml.push_str("/>");
     xml
@@ -141,7 +127,7 @@ pub fn ecp_request_header_xml(req: &EcpRequest) -> String {
         ECP_NS, SOAP11_ACTOR_NEXT, req.is_passive
     ));
     if let Some(ref pn) = req.provider_name {
-        xml.push_str(&format!(r#" ProviderName="{}""#, xml_escape(pn)));
+        xml.push_str(&format!(r#" ProviderName="{}""#, escape_attr(pn)));
     }
     if req.issuer.is_none() && req.idp_list.is_empty() {
         xml.push_str("/>");
@@ -151,7 +137,7 @@ pub fn ecp_request_header_xml(req: &EcpRequest) -> String {
     if let Some(ref issuer) = req.issuer {
         xml.push_str(&format!(
             r#"<saml:Issuer xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">{}</saml:Issuer>"#,
-            xml_escape(issuer)
+            escape_text(issuer)
         ));
     }
     if !req.idp_list.is_empty() {
@@ -159,7 +145,7 @@ pub fn ecp_request_header_xml(req: &EcpRequest) -> String {
         for idp in &req.idp_list {
             xml.push_str(&format!(
                 r#"<samlp:IDPEntry ProviderID="{}"/>"#,
-                xml_escape(idp)
+                escape_attr(idp)
             ));
         }
         xml.push_str("</samlp:IDPList>");
@@ -174,7 +160,7 @@ pub fn ecp_response_header_xml(resp: &EcpResponse) -> String {
         r#"<ecp:Response xmlns:ecp="{}" soap:mustUnderstand="1" soap:actor="{}" AssertionConsumerServiceURL="{}"/>"#,
         ECP_NS,
         SOAP11_ACTOR_NEXT,
-        xml_escape(&resp.assertion_consumer_service_url)
+        escape_attr(&resp.assertion_consumer_service_url)
     )
 }
 
@@ -184,7 +170,7 @@ pub fn ecp_relay_state_header_xml(rs: &EcpRelayState) -> String {
         r#"<ecp:RelayState xmlns:ecp="{}" soap:mustUnderstand="1" soap:actor="{}">{}</ecp:RelayState>"#,
         ECP_NS,
         SOAP11_ACTOR_NEXT,
-        xml_escape(&rs.relay_state)
+        escape_text(&rs.relay_state)
     )
 }
 

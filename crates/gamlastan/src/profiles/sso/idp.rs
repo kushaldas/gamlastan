@@ -486,20 +486,26 @@ const DIGEST_METHOD_SHA256: &str = "http://www.w3.org/2001/04/xmlenc#sha256";
 /// `<ds:KeyInfo>` from the key manager on the HSM path).
 ///
 /// `reference_id` and `signature_method_uri` land in double-quoted attribute
-/// values and `cert_der_b64` in element text; all three are escaped with
-/// bergshamra's C14N entity-escaping helpers ([`bergshamra_c14n::escape`]) so a
-/// caller-supplied value containing `&`, `<`, or `"` cannot break out of its
-/// context or inject markup.
+/// values and are escaped with bergshamra's C14N attribute escaper
+/// ([`bergshamra_c14n::escape::escape_attr`]) so a caller-supplied value
+/// containing `&`, `<`, or `"` cannot break out of its context. The
+/// `<ds:KeyInfo>` block is built by [`crate::crypto::build_x509_key_info`]
+/// (upstream bergshamra-keys), which writes `cert_der_b64` via an auto-escaping
+/// XML writer. The KeyInfo carries a redundant-but-valid `xmlns:ds` declaration;
+/// it sits outside `<ds:SignedInfo>` and is stripped from the enveloping
+/// element's digest by the enveloped-signature transform, so it never affects
+/// either signature.
 pub fn signature_template(
     reference_id: &str,
     cert_der_b64: &str,
     signature_method_uri: &str,
 ) -> String {
-    use bergshamra_c14n::escape::{escape_attr, escape_text};
+    use bergshamra_c14n::escape::escape_attr;
+    let key_info = crate::crypto::build_x509_key_info(&[cert_der_b64]);
     format!(
-        r##"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="{sig_alg}"/><ds:Reference URI="#{id}"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms><ds:DigestMethod Algorithm="{digest}"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{cert}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></ds:Signature>"##,
+        r##"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="{sig_alg}"/><ds:Reference URI="#{id}"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms><ds:DigestMethod Algorithm="{digest}"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/>{key_info}</ds:Signature>"##,
         id = escape_attr(reference_id),
-        cert = escape_text(cert_der_b64),
+        key_info = key_info,
         sig_alg = escape_attr(signature_method_uri),
         digest = DIGEST_METHOD_SHA256,
     )
