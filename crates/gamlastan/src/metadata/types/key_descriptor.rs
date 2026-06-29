@@ -405,21 +405,66 @@ fn last_tag(haystack: &str, needle: &str) -> Option<usize> {
 /// True if a start-tag body declares a default or prefixed `xmlns` bound to a
 /// namespace other than XMLDSig. Used to reject inline foreign-namespace
 /// rebinding in the fragment fallback.
+///
+/// XML permits arbitrary whitespace around the `=` of an attribute
+/// (`xmlns:ds = "urn:evil"`), so this parses `name = "value"` pairs with a small
+/// scanner rather than whitespace tokenization — a token-splitting check would
+/// miss the spaced form and let a rebinding slip through.
 fn declares_foreign_namespace(tag_body: &str) -> bool {
-    for token in tag_body.split_whitespace() {
-        if let Some(value) = token.strip_prefix("xmlns=").or_else(|| {
-            token
-                .split_once("xmlns:")
-                .and_then(|(_, rest)| rest.split_once('='))
-                .map(|(_, v)| v)
-        }) {
-            let uri = value.trim_matches(['"', '\'']);
-            if !uri.is_empty() && uri != XMLDSIG_NS {
-                return true;
+    tag_attributes(tag_body).into_iter().any(|(name, value)| {
+        (name == "xmlns" || name.starts_with("xmlns:")) && !value.is_empty() && value != XMLDSIG_NS
+    })
+}
+
+/// Scan a start-tag body into `(name, value)` attribute pairs, tolerating
+/// arbitrary whitespace around `=` and both quote styles. Values are returned
+/// without their surrounding quotes; the leading element name (which has no
+/// `=value`) and any malformed remnants are skipped. This is a minimal scanner
+/// sufficient for namespace-declaration detection in the KeyInfo fragment
+/// fallback, not a general XML attribute parser.
+fn tag_attributes(tag_body: &str) -> Vec<(&str, &str)> {
+    let bytes = tag_body.as_bytes();
+    let n = bytes.len();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < n {
+        while i < n && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let name_start = i;
+        while i < n && !bytes[i].is_ascii_whitespace() && bytes[i] != b'=' {
+            i += 1;
+        }
+        let name = &tag_body[name_start..i];
+        while i < n && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i < n && bytes[i] == b'=' {
+            i += 1; // consume '='
+            while i < n && bytes[i].is_ascii_whitespace() {
+                i += 1;
             }
+            if i < n && (bytes[i] == b'"' || bytes[i] == b'\'') {
+                let quote = bytes[i];
+                i += 1;
+                let value_start = i;
+                while i < n && bytes[i] != quote {
+                    i += 1;
+                }
+                let value = &tag_body[value_start..i];
+                if i < n {
+                    i += 1; // consume closing quote
+                }
+                if !name.is_empty() {
+                    out.push((name, value));
+                }
+            }
+        } else if i == name_start {
+            // No progress (e.g. a stray '='): advance to avoid an infinite loop.
+            i += 1;
         }
     }
-    false
+    out
 }
 
 fn find_next_x509_start_tag(xml: &str, mut cursor: usize) -> Option<(usize, usize, &str)> {
@@ -689,6 +734,33 @@ mod tests {
             kd.x509_certificates_der().is_empty(),
             "an inline-rebound foreign namespace must not be trusted in the fragment path"
         );
+    }
+
+    #[test]
+    fn test_x509_certificates_der_fragment_rejects_rebind_with_spaced_equals() {
+        // PR #20 review: XML allows whitespace around '=' in attributes, so an
+        // inline rebinding written as `xmlns:ds = "urn:evil"` must still be
+        // rejected by the fragment fallback — a whitespace-tokenizing check
+        // would miss it and re-open the rebinding evasion.
+        let kd = KeyDescriptor::signing(
+            "<ds:KeyInfo>\
+             <ds:X509Data xmlns:ds = \"urn:evil\">\
+             <ds:X509Certificate>aGVsbG8=</ds:X509Certificate></ds:X509Data></ds:KeyInfo>",
+        );
+        assert!(uppsala::parse(&kd.key_info_xml).is_err());
+        assert!(
+            kd.x509_certificates_der().is_empty(),
+            "a spaced-equals inline foreign-namespace rebinding must not be trusted"
+        );
+
+        // The same evasion on the default namespace.
+        let kd_default = KeyDescriptor::signing(
+            "<KeyInfo>\
+             <X509Data xmlns = 'urn:evil'>\
+             <X509Certificate>aGVsbG8=</X509Certificate></X509Data></KeyInfo>",
+        );
+        // (Parses standalone, but the namespace-aware path also rejects urn:evil.)
+        assert!(kd_default.x509_certificates_der().is_empty());
     }
 
     #[test]

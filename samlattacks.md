@@ -24,7 +24,7 @@ Relevant Research: "On Breaking SAML: Be Whoever You Want to Be" (Somorovsky et 
 - CVE-2024-45409	Ruby SAML	Signature Verification Bypass	A flaw in XPath selection allowed attackers to bypass signature verification, enabling them to forge SAML responses and log in as any user.
 - CVE-2025-29775	xml-crypto	Authentication Bypass	Dubbed "SAMLStorm". A vulnerability in the xml-crypto Node.js library allows attackers to forge signatures by embedding comments in the DigestValue node, bypassing integrity checks.
 - CVE-2025-54419	Node-SAML	Signature Validation Bypass	Versions 5.0.1 and below load the assertion from the unsigned original document rather than the verified signed portion, allowing modification of authentication details (e.g., username).
-- CVE-2025-66578	xmlseclibs (PHP)	Authentication Bypass	A flaw in libxml2 canonicalization allows xmlseclibs to compute a digest over an empty string when processing invalid XML, treating it as valid.
+- CVE-2025-66578	xmlseclibs (PHP)	Authentication Bypass	A flaw in libxml2 canonicalization allows xmlseclibs to compute a digest over an empty string when processing invalid XML, treating it as valid. Fixed in 3.1.4. Refs: https://nvd.nist.gov/vuln/detail/CVE-2025-66578 , https://github.com/robrichards/xmlseclibs/security/advisories/GHSA-c4cc-x928-vjw9
 
 - CVE-2017-11427	python-saml (OneLogin)	XSW / Comment Injection	Incorrect handling of nodes with comments during signature verification allowed text modification.
 - CVE-2017-11428	ruby-saml (OneLogin)	XSW / Comment Injection	Similar to above; processing of XML nodes allowed attackers to modify content without invalidating the signature.
