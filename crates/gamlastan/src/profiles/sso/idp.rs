@@ -484,16 +484,23 @@ const DIGEST_METHOD_SHA256: &str = "http://www.w3.org/2001/04/xmlenc#sha256";
 /// The certificate is embedded explicitly so the template is valid on both the
 /// in-process and the HSM signing paths (bergshamra-dsig does not populate
 /// `<ds:KeyInfo>` from the key manager on the HSM path).
+///
+/// `reference_id` and `signature_method_uri` land in double-quoted attribute
+/// values and `cert_der_b64` in element text; all three are escaped with
+/// bergshamra's C14N entity-escaping helpers ([`bergshamra_c14n::escape`]) so a
+/// caller-supplied value containing `&`, `<`, or `"` cannot break out of its
+/// context or inject markup.
 pub fn signature_template(
     reference_id: &str,
     cert_der_b64: &str,
     signature_method_uri: &str,
 ) -> String {
+    use bergshamra_c14n::escape::{escape_attr, escape_text};
     format!(
         r##"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="{sig_alg}"/><ds:Reference URI="#{id}"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms><ds:DigestMethod Algorithm="{digest}"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{cert}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></ds:Signature>"##,
-        id = reference_id,
-        cert = cert_der_b64,
-        sig_alg = signature_method_uri,
+        id = escape_attr(reference_id),
+        cert = escape_text(cert_der_b64),
+        sig_alg = escape_attr(signature_method_uri),
         digest = DIGEST_METHOD_SHA256,
     )
 }
@@ -1004,6 +1011,21 @@ mod tests {
         assert!(tmpl.contains("<ds:DigestValue/>"));
         assert!(tmpl.contains("<ds:SignatureValue/>"));
         assert!(tmpl.contains("<ds:X509Certificate>CERTB64</ds:X509Certificate>"));
+    }
+
+    #[test]
+    fn test_signature_template_escapes_inputs() {
+        // Hostile inputs in attribute (id, sig_alg) and text (cert) contexts must
+        // be entity-escaped, not interpolated raw, so they cannot break out of the
+        // attribute/element or inject markup.
+        let tmpl = signature_template(r#"a"&<b"#, "cert&<value", r#"urn:alg"><evil/>"#);
+        // Attribute values escaped (note: '>' is legal unescaped in attributes).
+        assert!(tmpl.contains(r##"<ds:Reference URI="#a&quot;&amp;&lt;b">"##));
+        assert!(tmpl.contains(r#"Algorithm="urn:alg&quot;>&lt;evil/>""#));
+        // Text content escaped.
+        assert!(tmpl.contains("<ds:X509Certificate>cert&amp;&lt;value</ds:X509Certificate>"));
+        // No raw injected element survived.
+        assert!(!tmpl.contains("<evil/>"));
     }
 
     #[test]
