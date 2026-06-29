@@ -18,6 +18,7 @@ use crate::core::assertion::subject::{Subject, SubjectConfirmation, SubjectConfi
 use crate::core::assertion::types::{Advice, Assertion, EncryptedAssertion};
 use crate::core::constants;
 use crate::core::identifiers::{SamlId, SamlVersion};
+use crate::core::namespace;
 use crate::core::protocol::request::AuthnRequest;
 use crate::core::protocol::response::{Response, ResponseBase};
 use crate::core::protocol::status::Status;
@@ -498,31 +499,54 @@ pub fn signature_template(
 }
 
 /// Insert `sig_template` into `xml` immediately after the `<saml:Issuer>` of the
-/// element opened by `element_tag` (e.g. `"saml:Assertion"` or `"samlp:Response"`).
+/// `(namespace_uri, local_name)` element (e.g. SAML-assertion `Assertion` or
+/// SAML-protocol `Response`) whose `ID` attribute equals `reference_id`.
+///
+/// The element is parsed and located by namespace + `ID` rather than by a string
+/// scan for the first occurrence of the tag, so the splice always lands in the
+/// same element the signature template's `<ds:Reference URI="#reference_id">`
+/// points at - even when the Response carries several elements of the same tag
+/// (e.g. multiple `<saml:Assertion>`). Going through the parser also keeps the
+/// match namespace-aware and immune to `ID="..."` text appearing inside comments,
+/// CDATA, or unrelated attributes.
 ///
 /// SAML schema orders `<ds:Signature>` *after* `<saml:Issuer>` (and before
-/// `<saml:Subject>` / `<samlp:Status>`), so the template is anchored there rather
-/// than as the element's first child. The scan starts at the element's opening
-/// tag, so the first `</saml:Issuer>` at or after it is that element's own Issuer.
+/// `<saml:Subject>` / `<samlp:Status>`), so the template is anchored at the end of
+/// the matched element's own `<saml:Issuer>` child rather than as its first child.
 fn insert_signature_after_issuer(
     xml: &str,
-    element_tag: &str,
+    namespace_uri: &str,
+    local_name: &str,
+    reference_id: &str,
     sig_template: &str,
 ) -> Result<String, ProfileError> {
-    let open_space = format!("<{element_tag} ");
-    let open_close = format!("<{element_tag}>");
-    let elem_start = xml
-        .find(&open_space)
-        .or_else(|| xml.find(&open_close))
-        .ok_or_else(|| ProfileError::Other(format!("cannot find <{element_tag}> to sign")))?;
+    let doc = crate::xml::parse_secure(xml)
+        .map_err(|e| ProfileError::Other(format!("cannot parse XML to place signature: {e}")))?;
 
-    const ISSUER_END: &str = "</saml:Issuer>";
-    let rel = xml[elem_start..].find(ISSUER_END).ok_or_else(|| {
-        ProfileError::Other(format!(
-            "<{element_tag}> has no <saml:Issuer> to anchor the signature"
-        ))
-    })?;
-    let insert_at = elem_start + rel + ISSUER_END.len();
+    let elem = doc
+        .get_elements_by_tag_name_ns(namespace_uri, local_name)
+        .into_iter()
+        .find(|&n| doc.get_attribute(n, "ID") == Some(reference_id))
+        .ok_or_else(|| {
+            ProfileError::Other(format!(
+                r#"cannot find <{local_name}> with ID="{reference_id}" to sign"#
+            ))
+        })?;
+
+    let issuer = doc
+        .first_child_element_by_name_ns(elem, namespace::SAML_ASSERTION_NS, "Issuer")
+        .ok_or_else(|| {
+            ProfileError::Other(format!(
+                "<{local_name}> has no <saml:Issuer> to anchor the signature"
+            ))
+        })?;
+
+    // `node_range(issuer).end` is the byte offset just past `</saml:Issuer>`.
+    let insert_at = doc
+        .node_range(issuer)
+        .ok_or_else(|| ProfileError::Other("Issuer node has no source range".to_string()))?
+        .end;
+
     Ok(format!(
         "{}{}{}",
         &xml[..insert_at],
@@ -555,13 +579,25 @@ pub fn sign_response_xml(
             ProfileError::Other("sign_assertions requested without an assertion_id".to_string())
         })?;
         let sig = signature_template(assertion_id, cert_der_b64, signer.signature_method_uri()?);
-        xml = insert_signature_after_issuer(&xml, "saml:Assertion", &sig)?;
+        xml = insert_signature_after_issuer(
+            &xml,
+            namespace::SAML_ASSERTION_NS,
+            "Assertion",
+            assertion_id,
+            &sig,
+        )?;
         xml = signer.sign_enveloped(&xml)?;
     }
 
     if sign_responses {
         let sig = signature_template(response_id, cert_der_b64, signer.signature_method_uri()?);
-        xml = insert_signature_after_issuer(&xml, "samlp:Response", &sig)?;
+        xml = insert_signature_after_issuer(
+            &xml,
+            namespace::SAML_PROTOCOL_NS,
+            "Response",
+            response_id,
+            &sig,
+        )?;
         xml = signer.sign_enveloped(&xml)?;
     }
 
@@ -979,7 +1015,14 @@ mod tests {
             r#"<saml:Assertion ID="_a1"><saml:Issuer>idp</saml:Issuer>"#,
             "<saml:Subject/></saml:Assertion></samlp:Response>",
         );
-        let out = insert_signature_after_issuer(xml, "saml:Assertion", "<SIG/>").unwrap();
+        let out = insert_signature_after_issuer(
+            xml,
+            namespace::SAML_ASSERTION_NS,
+            "Assertion",
+            "_a1",
+            "<SIG/>",
+        )
+        .unwrap();
         // The signature lands after the ASSERTION's Issuer (the second one) and
         // before the Subject - schema-correct ordering, not as the first child.
         assert!(out.contains(
@@ -990,20 +1033,84 @@ mod tests {
     }
 
     #[test]
+    fn test_insert_signature_targets_assertion_by_id() {
+        // Two assertions: the signature must land in the one whose ID matches the
+        // reference, not in the first <saml:Assertion> encountered.
+        let xml = concat!(
+            r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" "#,
+            r#"xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_r1">"#,
+            "<saml:Issuer>idp</saml:Issuer><samlp:Status/>",
+            r#"<saml:Assertion ID="_a1"><saml:Issuer>idp</saml:Issuer><saml:Subject/></saml:Assertion>"#,
+            r#"<saml:Assertion ID="_a2"><saml:Issuer>idp</saml:Issuer><saml:Subject/></saml:Assertion>"#,
+            "</samlp:Response>",
+        );
+        let out = insert_signature_after_issuer(
+            xml,
+            namespace::SAML_ASSERTION_NS,
+            "Assertion",
+            "_a2",
+            "<SIG/>",
+        )
+        .unwrap();
+        // Second assertion got the signature ...
+        assert!(out.contains(
+            r#"<saml:Assertion ID="_a2"><saml:Issuer>idp</saml:Issuer><SIG/><saml:Subject/>"#
+        ));
+        // ... and the first one was left untouched.
+        assert!(out
+            .contains(r#"<saml:Assertion ID="_a1"><saml:Issuer>idp</saml:Issuer><saml:Subject/>"#));
+    }
+
+    #[test]
+    fn test_insert_signature_unknown_id_errors() {
+        let xml = concat!(
+            r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_a1">"#,
+            "<saml:Issuer>idp</saml:Issuer><saml:Subject/></saml:Assertion>",
+        );
+        let err = insert_signature_after_issuer(
+            xml,
+            namespace::SAML_ASSERTION_NS,
+            "Assertion",
+            "_nope",
+            "<SIG/>",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains(r#"ID="_nope""#));
+    }
+
+    #[test]
     fn test_insert_signature_after_issuer_response() {
         let xml = concat!(
             r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" "#,
             r#"xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_r1">"#,
             "<saml:Issuer>idp</saml:Issuer><samlp:Status/></samlp:Response>",
         );
-        let out = insert_signature_after_issuer(xml, "samlp:Response", "<SIG/>").unwrap();
+        let out = insert_signature_after_issuer(
+            xml,
+            namespace::SAML_PROTOCOL_NS,
+            "Response",
+            "_r1",
+            "<SIG/>",
+        )
+        .unwrap();
         assert!(out.contains("<saml:Issuer>idp</saml:Issuer><SIG/><samlp:Status/>"));
     }
 
     #[test]
     fn test_insert_signature_missing_element_errors() {
-        let xml = "<samlp:Response><saml:Issuer>idp</saml:Issuer></samlp:Response>";
-        let err = insert_signature_after_issuer(xml, "saml:Assertion", "<SIG/>").unwrap_err();
-        assert!(err.to_string().contains("cannot find <saml:Assertion>"));
+        let xml = concat!(
+            r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" "#,
+            r#"xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_r1">"#,
+            "<saml:Issuer>idp</saml:Issuer></samlp:Response>",
+        );
+        let err = insert_signature_after_issuer(
+            xml,
+            namespace::SAML_ASSERTION_NS,
+            "Assertion",
+            "_a1",
+            "<SIG/>",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("cannot find <Assertion>"));
     }
 }

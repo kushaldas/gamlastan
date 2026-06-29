@@ -147,11 +147,19 @@ fn signs_response_and_assertion_and_verifies() {
         "response signature precedes the assertion"
     );
 
-    let result = verifier(cert_der)
-        .verify_enveloped(&signed)
+    // Both signatures must validate. `verify_enveloped` only reports the first
+    // (the Response) signature, so the Assertion signature would go unchecked;
+    // `verify_all_enveloped` returns one result per <ds:Signature>.
+    let results = verifier(cert_der)
+        .verify_all_enveloped(&signed)
         .expect("verify enveloped signatures");
+    assert_eq!(
+        results.len(),
+        2,
+        "expected response and assertion signatures"
+    );
     assert!(
-        result.is_valid(),
+        results.iter().all(|r| r.is_valid()),
         "response/assertion signatures did not validate"
     );
 }

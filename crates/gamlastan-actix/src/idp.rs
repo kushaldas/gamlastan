@@ -225,7 +225,7 @@ pub fn sign_response_xml(
         sign_assertions,
         sign_responses,
     )
-    .map_err(|e| SamlActixError::Internal(format!("response signing failed: {e}")))
+    .map_err(|e| SamlActixError::Internal(format!("response/assertion signing failed: {e}")))
 }
 
 /// IdP SSO handler: process an incoming AuthnRequest.
