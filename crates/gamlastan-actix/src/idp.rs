@@ -299,11 +299,17 @@ async fn idp_sso(
         None => None,
     };
     let sp_sso = sp_sso.ok_or_else(|| {
-        SamlActixError::Configuration(format!(
-            "AuthnRequest issuer {:?} is not a trusted SP; refusing to issue \
-             (register it with IdpConfig::with_trusted_sp or configure an MDQ \
-             resolver via IdpConfig::with_sp_resolver)",
-            issuer.unwrap_or("<missing>")
+        // Untrusted/unknown requester is an authorization failure on
+        // attacker-controllable request input, not a server misconfiguration:
+        // surface it as 403 rather than 500 so hostile traffic does not read as
+        // internal errors or leak configuration detail.
+        SamlActixError::Profile(gamlastan::profiles::ProfileError::AssertionValidation(
+            format!(
+                "AuthnRequest issuer {:?} is not a trusted SP; refusing to issue \
+                 (register it with IdpConfig::with_trusted_sp or configure an MDQ \
+                 resolver via IdpConfig::with_sp_resolver)",
+                issuer.unwrap_or("<missing>")
+            ),
         ))
     })?;
 
@@ -594,7 +600,9 @@ async fn idp_artifact_resolve(
 /// `sp` is the metadata resolved for the message's issuer (statically or via the
 /// MDQ-backed resolver). `what` is a short human label (e.g. `"LogoutRequest"`)
 /// used in error messages. Returns `Ok(())` when the message is authorized, or a
-/// [`SamlActixError::Configuration`] describing why it was rejected.
+/// 403-mapped [`SamlActixError::Profile`] describing why it was rejected — every
+/// rejection here is an unauthenticated/invalid request condition, so none of
+/// them is reported as a 500.
 ///
 /// # Examples
 ///
@@ -610,10 +618,15 @@ fn verify_sp_message_signature(
     expected_id: &str,
     what: &str,
 ) -> Result<(), SamlActixError> {
+    // Missing signing material for an inbound request is an authentication
+    // failure on attacker-controllable traffic, not a server fault: map it to
+    // 403 (via ProfileError) rather than 500.
     let verifier = config.verifier_for(sp).ok_or_else(|| {
-        SamlActixError::Configuration(format!(
-            "{what} issuer has no usable signing certificate in its metadata; \
-             refusing unauthenticated request"
+        SamlActixError::Profile(gamlastan::profiles::ProfileError::AssertionValidation(
+            format!(
+                "{what} issuer has no usable signing certificate in its metadata; \
+                 refusing unauthenticated request"
+            ),
         ))
     })?;
 
@@ -628,17 +641,25 @@ fn verify_sp_message_signature(
             if bound {
                 Ok(())
             } else {
-                Err(SamlActixError::Configuration(format!(
-                    "{what} signature did not reference the message (XML Signature Wrapping)"
-                )))
+                // Unbound-but-valid signature (XSW) is a request authentication
+                // failure → 403, not 500.
+                Err(SamlActixError::Profile(
+                    gamlastan::profiles::ProfileError::AssertionValidation(format!(
+                        "{what} signature did not reference the message (XML Signature Wrapping)"
+                    )),
+                ))
             }
         }
-        Ok(gamlastan::crypto::VerifyResult::Invalid { reason }) => Err(
-            SamlActixError::Configuration(format!("{what} signature invalid: {reason}")),
-        ),
-        Err(e) => Err(SamlActixError::Configuration(format!(
-            "{what} signature verification failed: {e}"
-        ))),
+        Ok(gamlastan::crypto::VerifyResult::Invalid { reason }) => Err(SamlActixError::Profile(
+            gamlastan::profiles::ProfileError::AssertionValidation(format!(
+                "{what} signature invalid: {reason}"
+            )),
+        )),
+        Err(e) => Err(SamlActixError::Profile(
+            gamlastan::profiles::ProfileError::AssertionValidation(format!(
+                "{what} signature verification failed: {e}"
+            )),
+        )),
     }
 }
 
@@ -699,7 +720,8 @@ async fn resolve_trusted_sp(
 ///
 /// `sp` is the metadata resolved for `logout_req`'s issuer, or `None` if the
 /// issuer is unknown/untrusted. Returns `Ok(())` when the logout is authorized,
-/// otherwise a [`SamlActixError::Configuration`] explaining the rejection.
+/// otherwise a 403-mapped [`SamlActixError::Profile`] explaining the rejection
+/// (these are request authorization failures, not server faults).
 ///
 /// # Examples
 ///
@@ -721,16 +743,22 @@ fn authorize_slo_request(
 
     // The issuer must resolve to trusted SP metadata.
     let issuer = logout_req.issuer.as_ref().map(|i| i.value.as_str());
+    // Untrusted/missing issuer and Destination mismatch are authorization
+    // failures on request input → 403 (via ProfileError), not 500.
     let sp = match (issuer, sp) {
         (Some(_), Some(sp)) => sp,
         (Some(id), None) => {
-            return Err(SamlActixError::Configuration(format!(
-                "LogoutRequest issuer {id:?} is not a trusted SP; refusing to destroy sessions"
-            )))
+            return Err(SamlActixError::Profile(
+                gamlastan::profiles::ProfileError::AssertionValidation(format!(
+                    "LogoutRequest issuer {id:?} is not a trusted SP; refusing to destroy sessions"
+                )),
+            ))
         }
         (None, _) => {
-            return Err(SamlActixError::Configuration(
-                "LogoutRequest has no Issuer; refusing to destroy sessions".into(),
+            return Err(SamlActixError::Profile(
+                gamlastan::profiles::ProfileError::AssertionValidation(
+                    "LogoutRequest has no Issuer; refusing to destroy sessions".into(),
+                ),
             ))
         }
     };
@@ -738,9 +766,11 @@ fn authorize_slo_request(
     // The Destination, when present, must address this IdP's SLO endpoint.
     if let Some(dest) = logout_req.destination.as_deref() {
         if !config.slo_url.is_empty() && dest != config.slo_url {
-            return Err(SamlActixError::Configuration(format!(
-                "LogoutRequest Destination {dest:?} does not match this IdP's SLO endpoint"
-            )));
+            return Err(SamlActixError::Profile(
+                gamlastan::profiles::ProfileError::AssertionValidation(format!(
+                    "LogoutRequest Destination {dest:?} does not match this IdP's SLO endpoint"
+                )),
+            ));
         }
     }
 
@@ -767,7 +797,8 @@ fn authorize_slo_request(
 ///
 /// `sp` is the metadata resolved for `resolve`'s issuer, or `None` if the issuer
 /// is unknown/untrusted. Returns `Ok(())` when the requester is authorized,
-/// otherwise a [`SamlActixError::Configuration`] describing the rejection.
+/// otherwise a 403-mapped [`SamlActixError::Profile`] describing the rejection
+/// (a requester-authentication failure, not a server fault).
 ///
 /// # Examples
 ///
@@ -788,16 +819,22 @@ fn authorize_artifact_resolve(
     }
 
     let issuer = resolve.issuer.as_ref().map(|i| i.value.as_str());
+    // Untrusted/missing requester is an authentication failure on
+    // attacker-controllable input → 403 (via ProfileError), not 500.
     let sp = match (issuer, sp) {
         (Some(_), Some(sp)) => sp,
         (Some(id), None) => {
-            return Err(SamlActixError::Configuration(format!(
-                "ArtifactResolve issuer {id:?} is not a trusted SP; refusing resolution"
-            )))
+            return Err(SamlActixError::Profile(
+                gamlastan::profiles::ProfileError::AssertionValidation(format!(
+                    "ArtifactResolve issuer {id:?} is not a trusted SP; refusing resolution"
+                )),
+            ))
         }
         (None, _) => {
-            return Err(SamlActixError::Configuration(
-                "ArtifactResolve has no Issuer; refusing resolution".into(),
+            return Err(SamlActixError::Profile(
+                gamlastan::profiles::ProfileError::AssertionValidation(
+                    "ArtifactResolve has no Issuer; refusing resolution".into(),
+                ),
             ))
         }
     };
@@ -997,6 +1034,46 @@ mod tests {
         let req = logout_request(Some("https://evil-sp.example.com"));
         // `resolve_trusted_sp` would return None for the untrusted issuer.
         assert!(authorize_slo_request(&config, &req, "<LogoutRequest/>", None).is_err());
+    }
+
+    #[test]
+    fn test_authz_failures_map_to_forbidden_not_internal_error() {
+        // PR #20 review: untrusted/missing issuer and other request-input
+        // authorization failures must surface as 403, not 500 — a 500 makes the
+        // endpoint look broken under attack and risks leaking detail in noisy
+        // error logs. They go through ProfileError, which maps to FORBIDDEN.
+        use actix_web::http::StatusCode;
+        use actix_web::ResponseError;
+
+        let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso");
+
+        let slo_err = authorize_slo_request(
+            &config,
+            &logout_request(Some("https://sp.example.com")),
+            "<LogoutRequest/>",
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(slo_err.status_code(), StatusCode::FORBIDDEN);
+
+        let slo_no_issuer_err =
+            authorize_slo_request(&config, &logout_request(None), "<LogoutRequest/>", None)
+                .unwrap_err();
+        assert_eq!(slo_no_issuer_err.status_code(), StatusCode::FORBIDDEN);
+
+        let resolve = ArtifactResolve {
+            id: "_ar_1".to_string(),
+            version: SamlVersion::V2_0,
+            issue_instant: Utc::now(),
+            destination: None,
+            consent: None,
+            issuer: Some(Issuer::entity("https://sp.example.com")),
+            has_signature: false,
+            artifact: "AAQAAD...".to_string(),
+        };
+        let ar_err =
+            authorize_artifact_resolve(&config, &resolve, "<ArtifactResolve/>", None).unwrap_err();
+        assert_eq!(ar_err.status_code(), StatusCode::FORBIDDEN);
     }
 
     #[test]

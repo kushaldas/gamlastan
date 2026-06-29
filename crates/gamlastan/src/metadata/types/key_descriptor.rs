@@ -410,9 +410,22 @@ fn last_tag(haystack: &str, needle: &str) -> Option<usize> {
 /// (`xmlns:ds = "urn:evil"`), so this parses `name = "value"` pairs with a small
 /// scanner rather than whitespace tokenization — a token-splitting check would
 /// miss the spaced form and let a rebinding slip through.
+///
+/// A prefixed declaration (`xmlns:ds`) bound to anything other than XMLDSig is
+/// foreign, including an empty URI (`xmlns:ds=""`): an empty value undeclares or
+/// rebinds the prefix and must be rejected so it cannot masquerade as a trusted
+/// XMLDSig prefix. The default-namespace undeclaration `xmlns=""` is legal and
+/// benign (it binds the default to "no namespace"), so it is not treated as
+/// foreign; only a non-empty default rebinding to a non-XMLDSig URI is.
 fn declares_foreign_namespace(tag_body: &str) -> bool {
     tag_attributes(tag_body).into_iter().any(|(name, value)| {
-        (name == "xmlns" || name.starts_with("xmlns:")) && !value.is_empty() && value != XMLDSIG_NS
+        if name.starts_with("xmlns:") {
+            value != XMLDSIG_NS
+        } else if name == "xmlns" {
+            !value.is_empty() && value != XMLDSIG_NS
+        } else {
+            false
+        }
     })
 }
 
@@ -761,6 +774,29 @@ mod tests {
         );
         // (Parses standalone, but the namespace-aware path also rejects urn:evil.)
         assert!(kd_default.x509_certificates_der().is_empty());
+    }
+
+    #[test]
+    fn test_x509_certificates_der_fragment_rejects_empty_prefixed_namespace() {
+        // PR #20 review: an empty namespace URI on a prefixed declaration
+        // (`xmlns:ds=""`) undeclares/rebinds the prefix and must be treated as
+        // foreign — otherwise an attacker could rebind the KeyInfo-root prefix
+        // away from XMLDSig in the fragment fallback without detection.
+        let kd = KeyDescriptor::signing(
+            "<ds:KeyInfo>\
+             <ds:X509Data xmlns:ds=\"\">\
+             <ds:X509Certificate>aGVsbG8=</ds:X509Certificate></ds:X509Data></ds:KeyInfo>",
+        );
+        assert!(uppsala::parse(&kd.key_info_xml).is_err());
+        assert!(
+            kd.x509_certificates_der().is_empty(),
+            "an empty-URI prefixed namespace rebinding must not be trusted"
+        );
+
+        // The benign counterpart: a default-namespace undeclaration `xmlns=""`
+        // is legal and must NOT, on its own, mark the tag foreign.
+        assert!(!declares_foreign_namespace("X509Data xmlns=\"\""));
+        assert!(declares_foreign_namespace("X509Data xmlns:ds=\"\""));
     }
 
     #[test]
