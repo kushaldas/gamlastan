@@ -382,7 +382,16 @@ fn enclosing_x509data_tag<'a>(xml: &'a str, pos: usize, prefix: &str) -> Option<
     }
     let after_name = open + open_needle.len();
     let tag_end = find_tag_end(xml, after_name)?;
-    Some(&xml[after_name..tag_end])
+    let attrs = &xml[after_name..tag_end];
+    // A self-closing `<X509Data .../>` ends at its own start tag, so it does not
+    // enclose a certificate that appears later. There is no matching close tag to
+    // trip the guard above, so detect the trailing `/` (after any whitespace; the
+    // `>` was located quote-aware, so a `/` here is the self-close marker, not
+    // part of an attribute value) and treat the certificate as not enclosed.
+    if attrs.trim_end().ends_with('/') {
+        return None;
+    }
+    Some(attrs)
 }
 
 /// Byte index of the last occurrence of `needle` (e.g. `"<ds:X509Data"`) in
@@ -708,6 +717,34 @@ mod tests {
         );
         assert!(uppsala::parse(&kd.key_info_xml).is_err());
         assert!(kd.x509_certificates_der().is_empty());
+    }
+
+    #[test]
+    fn test_x509_certificates_der_fragment_rejects_self_closing_x509data() {
+        // PR #20 review: a self-closing <ds:X509Data/> ends immediately, so a
+        // later loose <ds:X509Certificate> is NOT enclosed by it. The structural
+        // guard must not treat the self-closing element as an open enclosure (it
+        // has no close tag to trip the existing check), otherwise a loose cert
+        // would be trusted in the fragment fallback (Finding #2).
+        let kd = KeyDescriptor::signing(
+            "<ds:KeyInfo>\
+             <ds:X509Data/>\
+             <ds:X509Certificate>aGVsbG8=</ds:X509Certificate></ds:KeyInfo>",
+        );
+        assert!(uppsala::parse(&kd.key_info_xml).is_err());
+        assert!(
+            kd.x509_certificates_der().is_empty(),
+            "a cert after a self-closing X509Data must not be treated as enclosed"
+        );
+
+        // Same for the self-closing tag written with a space before the slash.
+        let kd_spaced = KeyDescriptor::signing(
+            "<ds:KeyInfo>\
+             <ds:X509Data />\
+             <ds:X509Certificate>aGVsbG8=</ds:X509Certificate></ds:KeyInfo>",
+        );
+        assert!(uppsala::parse(&kd_spaced.key_info_xml).is_err());
+        assert!(kd_spaced.x509_certificates_der().is_empty());
     }
 
     #[test]
