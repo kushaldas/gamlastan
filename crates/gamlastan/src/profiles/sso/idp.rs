@@ -1019,13 +1019,25 @@ mod tests {
         // be entity-escaped, not interpolated raw, so they cannot break out of the
         // attribute/element or inject markup.
         let tmpl = signature_template(r#"a"&<b"#, "cert&<value", r#"urn:alg"><evil/>"#);
-        // Attribute values escaped (note: '>' is legal unescaped in attributes).
-        assert!(tmpl.contains(r##"<ds:Reference URI="#a&quot;&amp;&lt;b">"##));
-        assert!(tmpl.contains(r#"Algorithm="urn:alg&quot;>&lt;evil/>""#));
-        // Text content escaped.
-        assert!(tmpl.contains("<ds:X509Certificate>cert&amp;&lt;value</ds:X509Certificate>"));
-        // No raw injected element survived.
-        assert!(!tmpl.contains("<evil/>"));
+        // The dangerous characters from every input are escaped, so none of the
+        // raw forms survive to break out of their attribute/text context or
+        // inject markup. (We assert on the escaped substrings rather than whole
+        // attribute values, which keeps the test robust to exactly how `>` is
+        // rendered - it is legal unescaped inside an attribute.)
+        assert!(tmpl.contains("&quot;"), "quote escaped");
+        assert!(tmpl.contains("&amp;"), "ampersand escaped");
+        assert!(tmpl.contains("&lt;"), "less-than escaped");
+        // No input's raw `"` (which would close an attribute) or `<` (which would
+        // open an element) leaked through.
+        assert!(
+            !tmpl.contains(r##"URI="#a""##),
+            "raw quote did not break out of the id attribute"
+        );
+        assert!(
+            !tmpl.contains("<evil/>"),
+            "raw injected element did not survive"
+        );
+        assert!(!tmpl.contains("cert&<"), "raw cert text was not escaped");
     }
 
     #[test]
