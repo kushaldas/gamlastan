@@ -315,8 +315,12 @@ async fn idp_sso(
 
     // Process the AuthnRequest (validates and extracts parameters). With trusted
     // SP metadata, a request-supplied ACS URL not present in metadata is rejected.
+    // These are validation failures on attacker-controllable request input, so
+    // preserve the ProfileError mapping (HTTP 403) rather than turning a normal
+    // rejection into an Internal 500 (which is misleading and noisy under
+    // hostile traffic).
     let processed = idp_profile::process_authn_request(&authn_request, Some(&sp_sso))
-        .map_err(|e| SamlActixError::Internal(format!("AuthnRequest processing failed: {e}")))?;
+        .map_err(SamlActixError::Profile)?;
 
     // Call the authentication callback
     let callback = authn_callback.ok_or_else(|| {
