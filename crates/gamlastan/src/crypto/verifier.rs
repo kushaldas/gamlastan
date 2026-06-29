@@ -1,6 +1,9 @@
 // gamlastan crypto verifier - SAML signature verification wrapping bergshamra::dsig.
 
-use bergshamra_dsig::{verify::verify, DsigContext, VerifyResult};
+use bergshamra_dsig::{
+    verify::{verify, verify_all},
+    DsigContext, VerifyResult,
+};
 use bergshamra_keys::{KeyUsage, KeysManager};
 
 use crate::crypto::error::CryptoError;
@@ -131,13 +134,53 @@ impl SamlVerifier {
             }
         }
 
+        let ctx = self.dsig_context();
+        let result = verify(&ctx, signed_xml)?;
+        Ok(result)
+    }
+
+    /// Verify **every** `<Signature>` in a signed SAML message, returning one
+    /// [`VerifyResult`] per signature in document order.
+    ///
+    /// [`verify_enveloped`](Self::verify_enveloped) only reports the *first*
+    /// signature. That is insufficient for a document signed in more than one
+    /// place — most importantly a SAML Response signed at both the Response and
+    /// the Assertion level, where the Response signature comes first in document
+    /// order. A caller that must bind a *specific* object (e.g. the consumed
+    /// Assertion) to its own signature would otherwise never see the assertion's
+    /// signature. This method verifies each signature independently so the caller
+    /// can collect the references covered by all of them.
+    ///
+    /// The same E91 `<ds:Object>` guard as [`verify_enveloped`](Self::verify_enveloped)
+    /// applies, and it fails closed if the document cannot be parsed for that
+    /// check.
+    pub fn verify_all_enveloped(&self, signed_xml: &str) -> Result<Vec<VerifyResult>, CryptoError> {
+        if self.reject_ds_object {
+            match crate::security::signature::contains_ds_object(signed_xml) {
+                Ok(true) => return Err(CryptoError::SignatureContainsDsObject),
+                Ok(false) => {}
+                Err(e) => {
+                    return Err(CryptoError::VerificationFailed(format!(
+                        "could not parse XML for E91 ds:Object check: {e}"
+                    )))
+                }
+            }
+        }
+
+        let ctx = self.dsig_context();
+        let results = verify_all(&ctx, signed_xml)?;
+        Ok(results)
+    }
+
+    /// Build a [`DsigContext`] from this verifier's configured policy. Shared by
+    /// the single-signature and all-signatures enveloped verification paths.
+    fn dsig_context(&self) -> DsigContext {
         let mut ctx = DsigContext::new(self.keys_manager.clone());
         ctx.trusted_keys_only = self.trusted_keys_only;
         ctx.strict_verification = self.strict_verification;
         ctx.skip_time_checks = self.skip_time_checks;
         ctx.hmac_min_out_len = self.hmac_min_out_len;
-        let result = verify(&ctx, signed_xml)?;
-        Ok(result)
+        ctx
     }
 
     /// Verify HTTP Redirect binding detached signature.

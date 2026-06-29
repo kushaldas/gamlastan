@@ -23,16 +23,19 @@ gamlastan-actix = { version = "0.7.0", path = "crates/gamlastan-actix" }
 gamlastan-mdq = { version = "0.7.0", path = "crates/gamlastan-mdq" }
 
 # XML parsing
-uppsala = "0.5.0"
+uppsala = "0.5.2"
 
 # XML security
-bergshamra = "0.6.0"
-bergshamra-core = "0.6.0"
-bergshamra-dsig = "0.6.0"
-bergshamra-enc = "0.6.0"
-bergshamra-c14n = "0.6.0"
-bergshamra-crypto = "0.6.0"
-bergshamra-keys = "0.6.0"
+# 0.6.1 adds bergshamra_dsig::verify::verify_all, used to verify every
+# <Signature> in a multiply-signed SAML Response (Response + Assertion) and bind
+# the consumed assertion to its own signature.
+bergshamra = "0.6.1"
+bergshamra-core = "0.6.1"
+bergshamra-dsig = "0.6.1"
+bergshamra-enc = "0.6.1"
+bergshamra-c14n = "0.6.1"
+bergshamra-crypto = "0.6.1"
+bergshamra-keys = "0.6.1"
 
 # HSM / PKCS#11 signing backend (the low-level crypto provider beneath
 # bergshamra). This direct dependency exists so gamlastan can re-export the
@@ -72,3 +75,4 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 
 # Tokio
 tokio = { version = "1", features = ["full"] }
+

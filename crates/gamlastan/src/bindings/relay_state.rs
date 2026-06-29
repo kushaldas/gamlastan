@@ -58,11 +58,15 @@ impl std::fmt::Display for RelayState {
 
 /// Validate a RelayState value.
 ///
-/// Checks:
+/// Checks (all E90):
 /// 1. Length <= 80 bytes
-/// 2. E90: No dangerous URI schemes (javascript:, data:, vbscript:)
-/// 3. E90: No HTML tags
-/// 4. E90: No null bytes
+/// 2. No null bytes
+/// 3. No control characters (C0/C1, TAB/CR/LF, DEL) — they can smuggle a
+///    dangerous scheme past the prefix check (e.g. `java\tscript:`)
+/// 4. No dangerous URI schemes (`javascript:`, `data:`, `vbscript:`), checked
+///    case-insensitively and after trimming surrounding whitespace so a leading
+///    space cannot bypass the prefix match
+/// 5. No HTML tags
 pub fn validate_relay_state(value: &str) -> Result<(), BindingError> {
     // Check length
     if value.len() > RELAY_STATE_MAX_BYTES {

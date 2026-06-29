@@ -1170,6 +1170,64 @@ mod tests {
     }
 
     #[test]
+    fn test_verify_all_enveloped_collects_response_and_assertion_signatures() {
+        // A SPID-style Response signed at BOTH the Response and the Assertion,
+        // with the Response signature first in document order (as real IdPs and
+        // the spid-sp-test conformance tool emit). verify_enveloped reports only
+        // the first (Response) signature; verify_all_enveloped must report both so
+        // the consumed assertion can be bound to its OWN signature.
+        let now = Utc::now();
+        let response = make_test_response(
+            "_response",
+            vec![make_test_assertion("_assertion", "user@example.com", now)],
+            now,
+        );
+        let unsigned_xml = response.to_xml_string().unwrap();
+        // Sign the assertion first, then insert and sign the Response signature
+        // (which lands ahead of the assertion signature in document order).
+        let asserted =
+            insert_assertion_signature_template(&unsigned_xml, "_assertion", "_assertion");
+        let assertion_signed = test_signer().sign_enveloped(&asserted).unwrap();
+        let templated = insert_response_signature_template(&assertion_signed, "_response");
+        let double_signed = test_signer().sign_enveloped(&templated).unwrap();
+
+        let config = test_sp_config_with_signing_cert(&cert_b64(SIGN_CERT_PEM));
+        let verifier = trusted_idp_verifier(&config).unwrap();
+
+        // Sanity: the single-signature path sees only the first (Response) signature.
+        let single = verifier.verify_enveloped(&double_signed).unwrap();
+        let single_ids: Vec<String> = match single {
+            VerifyResult::Valid { references, .. } => references
+                .iter()
+                .filter_map(|r| r.uri.strip_prefix('#').map(str::to_string))
+                .collect(),
+            VerifyResult::Invalid { reason } => panic!("unexpected invalid: {reason}"),
+        };
+        assert_eq!(single_ids, vec!["_response".to_string()]);
+
+        // verify_all_enveloped sees both signatures, so the assertion ID is bound.
+        let results = verifier.verify_all_enveloped(&double_signed).unwrap();
+        assert_eq!(results.len(), 2, "both signatures must be verified");
+        let mut ids: Vec<String> = Vec::new();
+        for r in results {
+            match r {
+                VerifyResult::Valid { references, .. } => {
+                    for rf in references {
+                        if let Some(id) = rf.uri.strip_prefix('#') {
+                            ids.push(id.to_string());
+                        }
+                    }
+                }
+                VerifyResult::Invalid { reason } => {
+                    panic!("unexpected invalid signature: {reason}")
+                }
+            }
+        }
+        ids.sort();
+        assert_eq!(ids, vec!["_assertion".to_string(), "_response".to_string()]);
+    }
+
+    #[test]
     fn test_acs_ignores_inline_key_info_without_matching_metadata_trust() {
         let now = Utc::now();
         let response = make_test_response(

@@ -520,37 +520,55 @@ async fn sp_acs(state: web::Data<AppState>, form: web::Form<AcsForm>) -> HttpRes
     // ── Step 3: Verify signatures ──────────────────────────────────────
     // We verify signatures on the raw XML before parsing into typed structs.
     // This catches wrong certs, missing signatures, XSW attacks, etc.
-    // Collect the IDs that the signature actually covered (from the verified
-    // XML-DSig references) rather than collapsing verification to a boolean. The
-    // consumed assertion is later required to be among these IDs, which defeats
-    // XML Signature Wrapping: a valid signature over a *sibling* object no longer
+    //
+    // A SPID Response is signed in TWO places: the Response element AND the
+    // Assertion (the Response signature appears first in document order). A
+    // single-signature verify only reports the first one (the Response), so the
+    // assertion's own signature would never be seen and the per-assertion binding
+    // below would reject every legitimately signed assertion. `verify_all_enveloped`
+    // verifies every <Signature> independently; we collect the reference targets
+    // from each VALID signature.
+    //
+    // Collect the IDs the signatures actually covered (from the verified XML-DSig
+    // references) rather than collapsing verification to a boolean. The consumed
+    // assertion is later required to be among these IDs, which defeats XML
+    // Signature Wrapping: a valid signature over a *sibling* object no longer
     // counts as protecting the assertion whose identity/attributes we read.
-    // `sig_verified` tracks whether verification returned `Valid` at all; it must
-    // be independent of `verified_signed_ids`, because the latter only collects
-    // `#`-prefixed reference targets. A valid signature over the document root
-    // (empty URI) or one that references only the Response ID would otherwise
-    // leave `verified_signed_ids` empty and be misreported as "no valid
-    // signature". XSW protection does not depend on this flag: the per-assertion
-    // binding check below requires the consumed assertion's ID to be among the
-    // verified references regardless.
+    //
+    // `sig_verified` tracks whether ANY signature returned `Valid`, independent
+    // of `verified_signed_ids` (which only collects `#`-prefixed targets): a valid
+    // signature over the document root or one referencing only the Response ID
+    // must not be misreported as "no valid signature". XSW protection does not
+    // depend on this flag — the per-assertion binding check requires the consumed
+    // assertion's ID to be among the verified references regardless.
     let mut sig_verified = false;
-    let verified_signed_ids: Vec<String> = match state.idp_verifier.verify_enveloped(&xml_str) {
-        Ok(gamlastan::crypto::VerifyResult::Valid { references, .. }) => {
-            info!("ACS: Signature verification succeeded");
-            sig_verified = true;
-            references
-                .iter()
-                .filter_map(|r| r.uri.strip_prefix('#').map(str::to_string))
-                .collect()
-        }
-        Ok(gamlastan::crypto::VerifyResult::Invalid { reason }) => {
-            log::warn!("ACS: Signature verification failed: {reason}");
-            Vec::new()
+    let mut verified_signed_ids: Vec<String> = Vec::new();
+    match state.idp_verifier.verify_all_enveloped(&xml_str) {
+        Ok(results) => {
+            for result in results {
+                match result {
+                    gamlastan::crypto::VerifyResult::Valid { references, .. } => {
+                        sig_verified = true;
+                        for r in &references {
+                            if let Some(id) = r.uri.strip_prefix('#') {
+                                if !verified_signed_ids.iter().any(|e| e == id) {
+                                    verified_signed_ids.push(id.to_string());
+                                }
+                            }
+                        }
+                    }
+                    gamlastan::crypto::VerifyResult::Invalid { reason } => {
+                        log::warn!("ACS: a signature failed verification: {reason}");
+                    }
+                }
+            }
+            if sig_verified {
+                info!("ACS: Signature verification succeeded");
+            }
         }
         Err(e) => {
-            // ds:Object rejection (E91) or other crypto errors
+            // ds:Object rejection (E91), no <Signature> present, or crypto error.
             log::warn!("ACS: Signature verification error: {e}");
-            Vec::new()
         }
     };
 

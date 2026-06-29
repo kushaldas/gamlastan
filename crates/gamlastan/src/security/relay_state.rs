@@ -13,9 +13,11 @@ pub const MAX_RELAY_STATE_BYTES: usize = 80;
 ///
 /// Per E90: sanitize for XSS/CSRF attacks. Checks:
 /// 1. Length <= 80 bytes
-/// 2. No dangerous URI schemes (javascript:, data:, vbscript:)
-/// 3. No HTML tags
-/// 4. No null bytes
+/// 2. No null bytes
+/// 3. No control characters (C0/C1, TAB/CR/LF, DEL)
+/// 4. No dangerous URI schemes (javascript:, data:, vbscript:), matched after
+///    trimming surrounding whitespace
+/// 5. No HTML angle brackets
 ///
 /// Returns `Ok(())` if the RelayState is safe, or an error description.
 pub fn validate_relay_state(relay_state: &str) -> Result<(), String> {
@@ -32,6 +34,13 @@ pub fn validate_relay_state(relay_state: &str) -> Result<(), String> {
 }
 
 /// Validate RelayState content for potentially dangerous patterns (E90).
+///
+/// Rejects, in order: null bytes; any control character (C0/C1, including
+/// TAB/CR/LF and DEL); a dangerous URI scheme (`javascript:`, `data:`,
+/// `vbscript:`) matched case-insensitively *after* trimming surrounding
+/// whitespace, so a leading space cannot bypass the prefix check; and HTML
+/// angle brackets. Rejecting control characters and trimming before the scheme
+/// check close obfuscation vectors such as `java\tscript:` and ` javascript:`.
 ///
 /// Does not check length (use `validate_relay_state` for full validation).
 pub fn validate_relay_state_content(relay_state: &str) -> Result<(), String> {
