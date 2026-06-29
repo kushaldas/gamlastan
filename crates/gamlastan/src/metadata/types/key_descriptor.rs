@@ -188,8 +188,28 @@ const X509_BASE64: base64::engine::GeneralPurpose = base64::engine::GeneralPurpo
         .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
 );
 
-/// Pull every `<X509Certificate>` (any namespace prefix) out of a `KeyInfo`
-/// fragment and base64-decode it to DER.
+/// The XML Signature namespace. Trusted `<X509Certificate>` nodes must live here
+/// (or be namespace-unqualified, which non-conformant-but-common producers emit);
+/// an element explicitly bound to a *different* namespace is a lookalike and must
+/// not become a trust anchor.
+const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
+
+/// True for the XML Signature namespace or no namespace at all. Used to accept
+/// legacy unqualified `<X509Certificate>`/`<X509Data>` while rejecting elements
+/// deliberately bound to a foreign namespace (e.g. `evil:X509Certificate`).
+fn is_xmldsig_or_unqualified(ns: Option<&str>) -> bool {
+    ns.is_none() || ns == Some(XMLDSIG_NS)
+}
+
+/// Pull every XML-DSig `<X509Certificate>` out of a `KeyInfo` fragment and
+/// base64-decode it to DER.
+///
+/// Two trust constraints (Finding #2, CWE-347/CWE-345): a certificate is only a
+/// candidate signing key if its element is (a) in the XML Signature namespace
+/// (or unqualified), not a foreign-namespace lookalike, and (b) nested under an
+/// `<X509Data>` parent — matching the XMLDSig schema. Without (a) a metadata
+/// author could smuggle attacker DER through an `<evil:X509Certificate>` tag;
+/// without (b) any `X509Certificate`-named element anywhere would be trusted.
 fn x509_certificates_der_from_key_info(key_info_xml: &str) -> Vec<Vec<u8>> {
     use base64::Engine;
 
@@ -208,6 +228,14 @@ fn x509_certificates_der_from_key_info(key_info_xml: &str) -> Vec<Vec<u8>> {
         if &*elem.name.local_name != "X509Certificate" {
             continue;
         }
+        // (a) Reject explicit foreign-namespace lookalikes.
+        if !is_xmldsig_or_unqualified(elem.name.namespace_uri.as_deref()) {
+            continue;
+        }
+        // (b) Require an <X509Data> ancestor (XMLDSig structure).
+        if !has_x509data_ancestor(&doc, node) {
+            continue;
+        }
         // Certificate base64 is often pretty-printed across lines; strip all
         // ASCII whitespace before decoding.
         let b64: String = doc.text_content_deep(node).split_whitespace().collect();
@@ -221,13 +249,58 @@ fn x509_certificates_der_from_key_info(key_info_xml: &str) -> Vec<Vec<u8>> {
     out
 }
 
+/// True if `node` has an `<X509Data>` ancestor in the XMLDSig (or unqualified)
+/// namespace.
+fn has_x509data_ancestor(doc: &uppsala::Document<'_>, node: uppsala::NodeId) -> bool {
+    let mut current = doc.parent(node);
+    while let Some(parent) = current {
+        if let Some(elem) = doc.element(parent) {
+            if &*elem.name.local_name == "X509Data"
+                && is_xmldsig_or_unqualified(elem.name.namespace_uri.as_deref())
+            {
+                return true;
+            }
+        }
+        current = doc.parent(parent);
+    }
+    false
+}
+
+/// Fallback extractor for `KeyInfo` fragments that cannot be parsed standalone
+/// because they inherit namespace declarations from the (now absent) metadata
+/// ancestors.
+///
+/// Without those ancestor declarations we cannot resolve prefixes to namespaces,
+/// so trust is anchored to the fragment's root element: the deserializer only
+/// ever feeds this function a genuine XMLDSig `<KeyInfo>`, so the root's prefix
+/// *is* the prefix bound to the XML Signature namespace. A certificate is
+/// honoured only when all of these hold (Finding #2, CWE-347/CWE-345):
+///
+/// 1. the `<X509Certificate>` uses the **same prefix** as the `<KeyInfo>` root —
+///    a different prefix must resolve to a different (foreign) namespace via an
+///    ancestor declaration, i.e. an inherited-prefix lookalike such as
+///    `<evil:X509Certificate>`;
+/// 2. it is enclosed in an `<X509Data>` element that *also* uses that prefix; and
+/// 3. neither the `<X509Certificate>` nor the enclosing `<X509Data>` start tag
+///    rebinds its prefix (or the default namespace) to a non-XMLDSig namespace
+///    inline.
+///
+/// This deliberately fails closed on the pathological case of two distinct
+/// prefixes both bound to the XMLDSig namespace; a conformant producer uses one.
 fn x509_certificates_der_from_fragment(key_info_xml: &str) -> Vec<Vec<u8>> {
     use base64::Engine;
 
     let mut out = Vec::new();
-    let mut cursor = 0;
 
-    while let Some((start_tag_end, qualified_name)) = find_next_x509_start_tag(key_info_xml, cursor)
+    // Anchor trust to the KeyInfo root's prefix; if we cannot identify it, trust
+    // nothing from this fragment.
+    let Some(expected_prefix) = fragment_root_prefix(key_info_xml) else {
+        return out;
+    };
+
+    let mut cursor = 0;
+    while let Some((tag_start, start_tag_end, qualified_name)) =
+        find_next_x509_start_tag(key_info_xml, cursor)
     {
         let close_tag = format!("</{qualified_name}>");
         let Some(rel_close) = key_info_xml[start_tag_end + 1..].find(&close_tag) else {
@@ -235,12 +308,27 @@ fn x509_certificates_der_from_fragment(key_info_xml: &str) -> Vec<Vec<u8>> {
         };
 
         let content_end = start_tag_end + 1 + rel_close;
-        let b64: String = key_info_xml[start_tag_end + 1..content_end]
-            .split_whitespace()
-            .collect();
-        if !b64.is_empty() {
-            if let Ok(der) = X509_BASE64.decode(&b64) {
-                out.push(der);
+        let cert_tag_body = &key_info_xml[tag_start + 1..start_tag_end];
+
+        // (1) the cert prefix must match the KeyInfo root, (2) it must be
+        // enclosed in an <X509Data> under that same prefix, and (3) neither tag
+        // may rebind that prefix (or the default namespace) to a foreign URI.
+        if qualified_prefix(qualified_name) == expected_prefix {
+            if let Some(data_tag_body) =
+                enclosing_x509data_tag(key_info_xml, tag_start, expected_prefix)
+            {
+                if !declares_foreign_namespace(cert_tag_body)
+                    && !declares_foreign_namespace(data_tag_body)
+                {
+                    let b64: String = key_info_xml[start_tag_end + 1..content_end]
+                        .split_whitespace()
+                        .collect();
+                    if !b64.is_empty() {
+                        if let Ok(der) = X509_BASE64.decode(&b64) {
+                            out.push(der);
+                        }
+                    }
+                }
             }
         }
 
@@ -250,12 +338,96 @@ fn x509_certificates_der_from_fragment(key_info_xml: &str) -> Vec<Vec<u8>> {
     out
 }
 
-fn find_next_x509_start_tag(xml: &str, mut cursor: usize) -> Option<(usize, &str)> {
+/// The prefix (with trailing colon, e.g. `"ds:"`, or `""` for the default
+/// namespace) of the fragment's root `<KeyInfo>` element. The deserializer only
+/// produces genuine XMLDSig `<KeyInfo>` fragments here, so this prefix is the one
+/// the original document binds to the XML Signature namespace. Returns `None`
+/// when the root tag is missing or is not a `KeyInfo` element.
+fn fragment_root_prefix(key_info_xml: &str) -> Option<&str> {
+    let lt = key_info_xml.find('<')?;
+    let rest = &key_info_xml[lt + 1..];
+    let end = rest.find(|c: char| c.is_whitespace() || c == '>' || c == '/')?;
+    let qname = &rest[..end];
+    match qname.split_once(':') {
+        Some((prefix, "KeyInfo")) => Some(&qname[..prefix.len() + 1]),
+        Some(_) => None,
+        None if qname == "KeyInfo" => Some(""),
+        None => None,
+    }
+}
+
+/// The namespace prefix of `qualified_name`, including the trailing colon (e.g.
+/// `"ds:"`), or `""` when the name is unprefixed.
+fn qualified_prefix(qualified_name: &str) -> &str {
+    match qualified_name.find(':') {
+        Some(i) => &qualified_name[..i + 1],
+        None => "",
+    }
+}
+
+/// If byte position `pos` (the `<` of an X509Certificate start tag) sits inside a
+/// `<{prefix}X509Data ...>` element, return that start tag's attribute body
+/// (between the qualified name and `>`); otherwise `None`. Prefix-exact: an
+/// `<X509Data>` under a *different* prefix does not enclose the certificate.
+fn enclosing_x509data_tag<'a>(xml: &'a str, pos: usize, prefix: &str) -> Option<&'a str> {
+    let before = &xml[..pos];
+    let open_needle = format!("<{prefix}X509Data");
+    let close_needle = format!("</{prefix}X509Data");
+    let open = last_tag(before, &open_needle)?;
+    // A later close before `pos` means we are no longer inside the element.
+    if let Some(close) = last_tag(before, &close_needle) {
+        if close > open {
+            return None;
+        }
+    }
+    let after_name = open + open_needle.len();
+    let tag_end = find_tag_end(xml, after_name)?;
+    Some(&xml[after_name..tag_end])
+}
+
+/// Byte index of the last occurrence of `needle` (e.g. `"<ds:X509Data"`) in
+/// `haystack` whose following character terminates the element name (whitespace,
+/// `>`, `/`, or end of input), so `"<ds:X509DataFoo"` does not match.
+fn last_tag(haystack: &str, needle: &str) -> Option<usize> {
+    let mut from = 0;
+    let mut found = None;
+    while let Some(rel) = haystack[from..].find(needle) {
+        let at = from + rel;
+        let after = haystack[at + needle.len()..].chars().next();
+        if after.map_or(true, |c| c.is_whitespace() || c == '>' || c == '/') {
+            found = Some(at);
+        }
+        from = at + needle.len();
+    }
+    found
+}
+
+/// True if a start-tag body declares a default or prefixed `xmlns` bound to a
+/// namespace other than XMLDSig. Used to reject inline foreign-namespace
+/// rebinding in the fragment fallback.
+fn declares_foreign_namespace(tag_body: &str) -> bool {
+    for token in tag_body.split_whitespace() {
+        if let Some(value) = token.strip_prefix("xmlns=").or_else(|| {
+            token
+                .split_once("xmlns:")
+                .and_then(|(_, rest)| rest.split_once('='))
+                .map(|(_, v)| v)
+        }) {
+            let uri = value.trim_matches(['"', '\'']);
+            if !uri.is_empty() && uri != XMLDSIG_NS {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn find_next_x509_start_tag(xml: &str, mut cursor: usize) -> Option<(usize, usize, &str)> {
     while let Some(rel_lt) = xml[cursor..].find('<') {
         let tag_start = cursor + rel_lt;
         let tag_end = find_tag_end(xml, tag_start + 1)?;
         if let Some(qualified_name) = parse_x509_start_tag_name(&xml[tag_start + 1..tag_end]) {
-            return Some((tag_end, qualified_name));
+            return Some((tag_start, tag_end, qualified_name));
         }
         cursor = tag_end + 1;
     }
@@ -432,6 +604,101 @@ mod tests {
     fn test_x509_certificates_der_handles_deserialized_fragment_without_namespace() {
         let kd = KeyDescriptor::signing(
             "<ds:KeyInfo><ds:X509Data><ds:X509Certificate>aGVsbG8=</ds:X509Certificate></ds:X509Data></ds:KeyInfo>",
+        );
+        assert!(uppsala::parse(&kd.key_info_xml).is_err());
+        assert_eq!(kd.x509_certificates_der(), vec![b"hello".to_vec()]);
+    }
+
+    #[test]
+    fn test_x509_certificates_der_rejects_foreign_namespace_lookalike() {
+        // Finding #2 regression: an <evil:X509Certificate> bound to a non-XMLDSig
+        // namespace must NOT be promoted to a trusted certificate. This fragment
+        // parses cleanly (all namespaces inline), so it goes through the
+        // namespace-aware path, which rejects the foreign namespace.
+        let kd = KeyDescriptor::signing(
+            "<ds:KeyInfo xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\" \
+             xmlns:evil=\"urn:evil\">\
+             <evil:X509Data><evil:X509Certificate>aGVsbG8=</evil:X509Certificate>\
+             </evil:X509Data></ds:KeyInfo>",
+        );
+        assert!(
+            kd.x509_certificates_der().is_empty(),
+            "foreign-namespace X509Certificate must not be trusted"
+        );
+    }
+
+    #[test]
+    fn test_x509_certificates_der_requires_x509data_ancestor() {
+        // Finding #2 regression: an X509Certificate that is not inside an
+        // X509Data element is not a conformant trust anchor and must be ignored.
+        let kd = KeyDescriptor::signing(
+            "<ds:KeyInfo xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">\
+             <ds:X509Certificate>aGVsbG8=</ds:X509Certificate></ds:KeyInfo>",
+        );
+        assert!(
+            kd.x509_certificates_der().is_empty(),
+            "X509Certificate without X509Data ancestor must not be trusted"
+        );
+    }
+
+    #[test]
+    fn test_x509_certificates_der_fragment_requires_x509data() {
+        // Finding #2 regression (fragment path): a loose X509Certificate in an
+        // unparseable fragment (inherited prefix) without X509Data is ignored.
+        let kd = KeyDescriptor::signing(
+            "<ds:KeyInfo><ds:X509Certificate>aGVsbG8=</ds:X509Certificate></ds:KeyInfo>",
+        );
+        assert!(uppsala::parse(&kd.key_info_xml).is_err());
+        assert!(kd.x509_certificates_der().is_empty());
+    }
+
+    #[test]
+    fn test_x509_certificates_der_fragment_rejects_inherited_foreign_prefix() {
+        // Finding #2 / R1 regression (fragment path): when the cert's prefix is
+        // declared on a (now-absent) ancestor — so the fragment does not parse
+        // standalone — a *different* prefix from the KeyInfo root must resolve to
+        // a different namespace and is rejected as an inherited-prefix lookalike.
+        // Here KeyInfo uses `ds:` while the X509Data/X509Certificate use `evil:`;
+        // both prefixes are undeclared in the fragment, so it hits the fallback.
+        let kd = KeyDescriptor::signing(
+            "<ds:KeyInfo>\
+             <evil:X509Data><evil:X509Certificate>aGVsbG8=</evil:X509Certificate>\
+             </evil:X509Data></ds:KeyInfo>",
+        );
+        assert!(uppsala::parse(&kd.key_info_xml).is_err());
+        assert!(
+            kd.x509_certificates_der().is_empty(),
+            "a foreign inherited-prefix X509Certificate must not be trusted in the fragment path"
+        );
+    }
+
+    #[test]
+    fn test_x509_certificates_der_fragment_rejects_inline_rebound_prefix() {
+        // Finding #2 / R1 regression (fragment path): even when the prefix
+        // *matches* the KeyInfo root, an inline xmlns that rebinds it to a
+        // foreign namespace on the X509Data (or cert) tag must be rejected. The
+        // fragment still fails standalone parse because `ds:` is undeclared on
+        // the root KeyInfo, so it reaches the fallback.
+        let kd = KeyDescriptor::signing(
+            "<ds:KeyInfo>\
+             <ds:X509Data xmlns:ds=\"urn:evil\">\
+             <ds:X509Certificate>aGVsbG8=</ds:X509Certificate></ds:X509Data></ds:KeyInfo>",
+        );
+        assert!(uppsala::parse(&kd.key_info_xml).is_err());
+        assert!(
+            kd.x509_certificates_der().is_empty(),
+            "an inline-rebound foreign namespace must not be trusted in the fragment path"
+        );
+    }
+
+    #[test]
+    fn test_x509_certificates_der_fragment_accepts_matching_prefix() {
+        // The legitimate fragment case still works: KeyInfo, X509Data and
+        // X509Certificate share the `ds:` prefix (bound to XMLDSig on an absent
+        // ancestor), so the fragment fails standalone parse but is trusted.
+        let kd = KeyDescriptor::signing(
+            "<ds:KeyInfo><ds:X509Data>\
+             <ds:X509Certificate>aGVsbG8=</ds:X509Certificate></ds:X509Data></ds:KeyInfo>",
         );
         assert!(uppsala::parse(&kd.key_info_xml).is_err());
         assert_eq!(kd.x509_certificates_der(), vec![b"hello".to_vec()]);

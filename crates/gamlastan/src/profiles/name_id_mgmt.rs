@@ -79,16 +79,42 @@ pub fn create_manage_name_id_response(
     }
 }
 
-/// Process a ManageNameIDResponse.
+/// Process a solicited `ManageNameIDResponse` and confirm the management
+/// operation completed.
+///
+/// `expected_request_id` is the `ID` of the `ManageNameIDRequest` this response
+/// answers. The response is accepted only when its `InResponseTo` is **present
+/// and equal** to `expected_request_id` (a missing value is rejected so the
+/// wrong transaction cannot be marked complete — CWE-345) and its `Status` is
+/// success.
+///
+/// Returns `Ok(())` on success, or [`ProfileError::NameIdManagementFailed`] for
+/// a missing/mismatched `InResponseTo` or a non-success status.
+///
+/// # Examples
+///
+/// ```ignore
+/// // After sending a ManageNameIDRequest with id `req_id`:
+/// process_manage_name_id_response(&response, &req_id)?;
+/// // Safe to commit the local NameID change now.
+/// ```
 pub fn process_manage_name_id_response(
     response: &ManageNameIdResponse,
     expected_request_id: &str,
 ) -> Result<(), ProfileError> {
-    // Verify InResponseTo
-    if let Some(irt) = &response.in_response_to {
-        if irt != expected_request_id {
+    // Verify InResponseTo. This is a solicited response, so a missing
+    // InResponseTo must fail closed rather than skip correlation (CWE-345):
+    // require it present and equal to the request this answers.
+    match &response.in_response_to {
+        Some(irt) if irt == expected_request_id => {}
+        Some(irt) => {
             return Err(ProfileError::NameIdManagementFailed(format!(
                 "InResponseTo mismatch: expected {expected_request_id}, got {irt}"
+            )));
+        }
+        None => {
+            return Err(ProfileError::NameIdManagementFailed(format!(
+                "ManageNameIDResponse is missing InResponseTo (expected {expected_request_id})"
             )));
         }
     }
@@ -153,6 +179,23 @@ mod tests {
             Status::success(),
         );
         assert!(process_manage_name_id_response(&resp, "_req123").is_ok());
+    }
+
+    #[test]
+    fn test_process_manage_name_id_response_missing_irt_rejected() {
+        // Finding #10 regression: a successful response with no InResponseTo must
+        // not be accepted as completing the solicited request.
+        let mut resp = create_manage_name_id_response(
+            "https://idp.example.com",
+            "_req123",
+            None,
+            Status::success(),
+        );
+        resp.in_response_to = None;
+        assert!(matches!(
+            process_manage_name_id_response(&resp, "_req123"),
+            Err(ProfileError::NameIdManagementFailed(_))
+        ));
     }
 
     #[test]

@@ -230,6 +230,36 @@ impl AttributeConverterSet {
         attribute.friendly_name.clone()
     }
 
+    /// Resolve the local name of a wire attribute using **only** the registered
+    /// NameFormat converters — never the attribute's own `FriendlyName`.
+    ///
+    /// [`local_name`](Self::local_name) additionally falls back to the
+    /// `FriendlyName` carried on the attribute. That fallback is convenient when
+    /// turning *received* attributes into local form, but it must not drive
+    /// attribute *release* decisions: a `FriendlyName` is non-unique and, in an
+    /// SP's `RequestedAttribute`, attacker-controllable. Using it as a match key
+    /// would let SP metadata request a locally-mapped attribute by putting its
+    /// local name in the `FriendlyName` without naming it by the correct wire
+    /// `Name` (Finding #7, CWE-345). Release matching therefore resolves the
+    /// requested attribute through this method and falls back only to the exact
+    /// wire `Name`.
+    pub fn local_name_via_converters(&self, attribute: &Attribute) -> Option<String> {
+        if let Some(nf) = &attribute.name_format {
+            // A declared NameFormat selects its converter; an unknown format has
+            // no trusted mapping (mirrors `local_name`, minus the FriendlyName).
+            return self
+                .converter_for(nf)
+                .and_then(|conv| conv.to_local_name(&attribute.name))
+                .map(str::to_string);
+        }
+        for conv in &self.converters {
+            if let Some(local) = conv.to_local_name(&attribute.name) {
+                return Some(local.to_string());
+            }
+        }
+        None
+    }
+
     /// Convert wire attributes to local attributes (pysaml2 `to_local`).
     ///
     /// Unknown attributes (no map entry and no FriendlyName) are dropped

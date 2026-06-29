@@ -118,18 +118,45 @@ pub fn create_assertion_id_request(
     }
 }
 
-/// Process a query Response (for AuthnQuery, AttributeQuery, etc.).
+/// Process a solicited query `Response` (for `AuthnQuery`, `AttributeQuery`,
+/// `AuthzDecisionQuery`, or `AssertionIDRequest`) and return its assertions.
 ///
-/// Validates the status and returns assertions.
+/// `expected_request_id` is the `ID` of the query the caller sent. The
+/// assertions are returned only when the response's `InResponseTo` is **present
+/// and equal** to `expected_request_id` (a missing value is rejected so a
+/// replayed or substituted response cannot have its assertions consumed —
+/// CWE-294) and its `Status` is success.
+///
+/// Returns the response's assertions on success, or [`ProfileError::Other`] for
+/// a missing/mismatched `InResponseTo` and [`ProfileError::ResponseFailure`]
+/// for a non-success status. The returned slice borrows from `response`; the
+/// caller is still responsible for validating each assertion (signature,
+/// conditions, subject confirmation) before trusting it.
+///
+/// # Examples
+///
+/// ```ignore
+/// // After sending an AttributeQuery with id `query_id`:
+/// let assertions = process_query_response(&response, &query_id)?;
+/// ```
 pub fn process_query_response<'a>(
     response: &'a Response,
     expected_request_id: &str,
 ) -> Result<&'a [crate::core::assertion::types::Assertion], ProfileError> {
-    // Verify InResponseTo
-    if let Some(irt) = &response.base.in_response_to {
-        if irt != expected_request_id {
+    // Verify InResponseTo. This is a solicited query response, so a missing
+    // InResponseTo must fail closed rather than skip correlation (CWE-294):
+    // require it present and equal to the query this answers, otherwise a
+    // replayed or substituted response would have its assertions returned.
+    match &response.base.in_response_to {
+        Some(irt) if irt == expected_request_id => {}
+        Some(irt) => {
             return Err(ProfileError::Other(format!(
                 "InResponseTo mismatch: expected {expected_request_id}, got {irt}"
+            )));
+        }
+        None => {
+            return Err(ProfileError::Other(format!(
+                "query Response is missing InResponseTo (expected {expected_request_id})"
             )));
         }
     }
@@ -236,5 +263,30 @@ mod tests {
         };
         let result = process_query_response(&response, "_req123").unwrap();
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_process_query_response_missing_irt_rejected() {
+        // Finding #11 regression: a successful solicited query response with no
+        // InResponseTo must not have its assertions returned.
+        let response = Response {
+            base: crate::core::protocol::response::ResponseBase {
+                id: "_resp1".to_string(),
+                version: SamlVersion::V2_0,
+                issue_instant: Utc::now(),
+                destination: None,
+                consent: None,
+                issuer: None,
+                has_signature: false,
+                in_response_to: None,
+                status: crate::core::protocol::status::Status::success(),
+            },
+            assertions: vec![],
+            encrypted_assertions: vec![],
+        };
+        assert!(matches!(
+            process_query_response(&response, "_req123"),
+            Err(ProfileError::Other(_))
+        ));
     }
 }

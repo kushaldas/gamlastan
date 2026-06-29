@@ -41,7 +41,10 @@ pub mod response_adapter;
 pub mod sp;
 
 // Re-exports for convenience.
-pub use config::{IdpConfig, InMemoryRequestIdTracker, RequestIdTracker, SpConfig};
+pub use config::{
+    IdpConfig, InMemoryRequestIdTracker, RequestIdTracker, ResolveSpFuture, SpConfig, TrustedSp,
+    TrustedSpResolver,
+};
 pub use error::SamlActixError;
 pub use extractors::{SamlBinding, SamlMessage};
 pub use idp::{AuthnCallback, AuthnCallbackResult, IdpSigningContext};

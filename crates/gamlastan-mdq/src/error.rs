@@ -45,6 +45,17 @@ pub enum MdqError {
     #[error("metadata is not signed but a signing certificate is configured")]
     Unsigned,
 
+    /// The signature verified, but none of its verified XML-DSig references
+    /// covered the metadata element being trusted. A valid signature over a
+    /// sibling object in the same document (XML Signature Wrapping) must not be
+    /// treated as protecting the EntityDescriptor/EntitiesDescriptor whose keys
+    /// and endpoints are later consumed.
+    #[error(
+        "metadata signature did not reference the trusted metadata element \
+         (XML Signature Wrapping); element ID {0:?}"
+    )]
+    SignatureNotBound(String),
+
     /// No signing certificate is configured and unverified operation was not
     /// explicitly allowed. The MDQ server is untrusted, so metadata that cannot
     /// be signature-verified must not be accepted by default.

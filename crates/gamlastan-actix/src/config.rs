@@ -3,13 +3,88 @@
 // Provides SpConfig and IdpConfig for registering SAML endpoints.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use gamlastan::bindings::traits::ArtifactStore;
+use gamlastan::crypto::keys::loader;
+use gamlastan::crypto::{KeysManager, SamlVerifier};
 use gamlastan::metadata::types::entity_descriptor::EntityDescriptor;
+use gamlastan::metadata::types::sp::SpSsoDescriptor;
 use gamlastan::profiles::session::SessionStore;
 use gamlastan::security::config::SecurityConfig;
 use gamlastan::security::replay::{InMemoryReplayCache, ReplayCache};
+
+/// A Service Provider this IdP trusts.
+///
+/// The ready IdP handlers use these descriptors to bind request-supplied values
+/// to known SP metadata: the requested AssertionConsumerServiceURL (so an
+/// attacker cannot redirect a signed assertion to an ACS they control), and the
+/// SP signing keys used to authenticate back-channel ArtifactResolve and
+/// front-channel LogoutRequest messages before any state is mutated.
+#[derive(Clone)]
+pub struct TrustedSp {
+    /// The SP `entityID` (matched against the message `Issuer`).
+    pub entity_id: String,
+    /// The SP's SSO descriptor (ACS endpoints, signing certificates).
+    pub sp_sso: SpSsoDescriptor,
+}
+
+/// Future returned by [`TrustedSpResolver::resolve_sp`].
+pub type ResolveSpFuture<'a> = Pin<Box<dyn Future<Output = Option<SpSsoDescriptor>> + Send + 'a>>;
+
+/// Resolves trusted SP metadata by `entityID` at request time.
+///
+/// In a federation the IdP usually does **not** know its partner SPs statically;
+/// it learns their metadata from a Metadata Query (MDQ) server or an aggregate
+/// feed, keyed by `entityID`. Implement this trait (typically over a
+/// `gamlastan_mdq::MdqClient`) and register it with
+/// [`IdpConfig::with_sp_resolver`] so the ready SSO/SLO/artifact handlers can
+/// obtain trusted SP metadata dynamically instead of failing closed.
+///
+/// The ready handlers consult the static [`IdpConfig::trusted_sps`] registry
+/// first and fall back to this resolver. The resolver is responsible for its own
+/// trust decisions — for MDQ that means verifying the metadata signature against
+/// the federation's trust anchor before returning a descriptor (the MDQ client
+/// does this when configured with signing certificates). Returning `None` means
+/// "this entityID is not a trusted SP", and the handler then fails closed.
+///
+/// `gamlastan-actix` deliberately does not depend on `gamlastan-mdq`; the
+/// application wires the two together.
+///
+/// # Examples
+///
+/// ```ignore
+/// use std::sync::Arc;
+/// use gamlastan_actix::{IdpConfig, ResolveSpFuture, TrustedSpResolver};
+/// use gamlastan_mdq::MdqClient;
+///
+/// // An MdqClient configured with `.require_role(RequiredRole::Sp)` and the
+/// // federation signing certificate(s), so `get` verifies the metadata
+/// // signature against the trust anchor before returning it.
+/// struct MdqSpResolver(Arc<MdqClient>);
+///
+/// impl TrustedSpResolver for MdqSpResolver {
+///     fn resolve_sp<'a>(&'a self, entity_id: &'a str) -> ResolveSpFuture<'a> {
+///         Box::pin(async move {
+///             self.0
+///                 .get(entity_id)
+///                 .await
+///                 .ok()
+///                 .and_then(|ed| ed.sp_sso_descriptors().first().cloned())
+///         })
+///     }
+/// }
+///
+/// let resolver = Arc::new(MdqSpResolver(mdq_client));
+/// let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
+///     .with_sp_resolver(resolver);
+/// ```
+pub trait TrustedSpResolver: Send + Sync {
+    /// Resolve the SP metadata for `entity_id`, or `None` if it is not trusted.
+    fn resolve_sp<'a>(&'a self, entity_id: &'a str) -> ResolveSpFuture<'a>;
+}
 
 /// Service Provider configuration for SAML integration.
 ///
@@ -219,6 +294,27 @@ pub struct IdpConfig {
     /// Artifact store for HTTP Artifact binding resolution.
     /// If None, artifact resolution returns an error response.
     pub artifact_store: Option<Arc<dyn ArtifactStore + Send + Sync>>,
+
+    /// Service providers this IdP trusts statically. The ready SSO/SLO/artifact
+    /// handlers fail closed when the relevant trust material is absent: an
+    /// AuthnRequest whose issuer/ACS is not described here (and not resolvable
+    /// via [`sp_resolver`](IdpConfig::sp_resolver)) is refused, and unsigned or
+    /// untrusted ArtifactResolve / LogoutRequest messages are rejected.
+    pub trusted_sps: Vec<TrustedSp>,
+
+    /// Optional dynamic resolver for trusted SP metadata, consulted when an SP is
+    /// not in [`trusted_sps`](IdpConfig::trusted_sps). This is how a federation
+    /// IdP with an MDQ setup (and no statically registered SPs) provides trust:
+    /// the resolver fetches and signature-verifies SP metadata by `entityID` at
+    /// request time. Without either source, the ready handlers fail closed.
+    pub sp_resolver: Option<Arc<dyn TrustedSpResolver>>,
+
+    /// Escape hatch for deployments that authenticate the SAML SOAP back-channel
+    /// and front-channel at the transport layer (e.g. mutual TLS) instead of via
+    /// message signatures. When `false` (the default), the ready artifact and SLO
+    /// handlers require a signature from a trusted SP before acting. Only set
+    /// this `true` if the transport already authenticates the requester.
+    pub allow_unauthenticated_backchannel: bool,
 }
 
 impl IdpConfig {
@@ -237,6 +333,9 @@ impl IdpConfig {
             signing_cert_b64: None,
             session_store: None,
             artifact_store: None,
+            trusted_sps: Vec::new(),
+            sp_resolver: None,
+            allow_unauthenticated_backchannel: false,
         }
     }
 
@@ -274,6 +373,182 @@ impl IdpConfig {
     pub fn with_artifact_store(mut self, store: Arc<dyn ArtifactStore + Send + Sync>) -> Self {
         self.artifact_store = Some(store);
         self
+    }
+
+    /// Register a Service Provider this IdP trusts (builder style).
+    ///
+    /// The ready IdP handlers consult the registered SPs to make the SSO, SLO,
+    /// and artifact-resolution endpoints fail closed:
+    ///
+    /// - **SSO** binds the request `Issuer` to a trusted SP and validates the
+    ///   request-supplied `AssertionConsumerServiceURL` against that SP's
+    ///   metadata, so an attacker cannot have a signed assertion delivered to an
+    ///   ACS URL they control.
+    /// - **SLO / Artifact** verify the message signature against the trusted SP's
+    ///   signing certificates before mutating session state or consuming an
+    ///   artifact.
+    ///
+    /// `entity_id` is matched against the message `Issuer`; `sp_sso` is the SP's
+    /// SSO descriptor (typically parsed from the SP's metadata document).
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// # use gamlastan_actix::IdpConfig;
+    /// # use gamlastan::metadata::types::sp::SpSsoDescriptor;
+    /// # let sp_sso: SpSsoDescriptor = unimplemented!("parsed from SP metadata");
+    /// let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
+    ///     .with_trusted_sp("https://sp.example.com", sp_sso);
+    /// assert!(config.trusted_sp("https://sp.example.com").is_some());
+    /// ```
+    pub fn with_trusted_sp(
+        mut self,
+        entity_id: impl Into<String>,
+        sp_sso: SpSsoDescriptor,
+    ) -> Self {
+        self.trusted_sps.push(TrustedSp {
+            entity_id: entity_id.into(),
+            sp_sso,
+        });
+        self
+    }
+
+    /// Register a dynamic [`TrustedSpResolver`] (builder style), typically backed
+    /// by an MDQ client, so the ready handlers can obtain trusted SP metadata for
+    /// federations where SPs are not statically registered.
+    ///
+    /// The handlers check [`trusted_sps`](IdpConfig::trusted_sps) first, then this
+    /// resolver. See [`TrustedSpResolver`] for an MDQ-backed example.
+    pub fn with_sp_resolver(mut self, resolver: Arc<dyn TrustedSpResolver>) -> Self {
+        self.sp_resolver = Some(resolver);
+        self
+    }
+
+    /// Opt into transport-authenticated back-channel/front-channel operation
+    /// (builder style).
+    ///
+    /// When set to `true` *and* no trusted SPs are registered, the ready SLO and
+    /// artifact-resolution handlers skip the message-signature requirement,
+    /// trusting that the transport (e.g. mutual TLS) has already authenticated
+    /// the requester. Leave this at its default (`false`) unless that is
+    /// genuinely the case — otherwise the endpoints accept unauthenticated
+    /// destructive requests. See
+    /// [`allow_unauthenticated_backchannel`](IdpConfig::allow_unauthenticated_backchannel).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use gamlastan_actix::IdpConfig;
+    /// // Deployment terminates mutual TLS in front of the IdP.
+    /// let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
+    ///     .allow_unauthenticated_backchannel(true);
+    /// ```
+    pub fn allow_unauthenticated_backchannel(mut self, allow: bool) -> Self {
+        self.allow_unauthenticated_backchannel = allow;
+        self
+    }
+
+    /// Look up a registered trusted SP's SSO descriptor by `entityID`.
+    ///
+    /// Returns `None` when no SP with that entityID has been registered via
+    /// [`with_trusted_sp`](IdpConfig::with_trusted_sp); callers in the ready
+    /// handlers treat `None` as "untrusted" and fail closed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use gamlastan_actix::IdpConfig;
+    /// let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso");
+    /// assert!(config.trusted_sp("https://sp.example.com").is_none());
+    /// ```
+    pub fn trusted_sp(&self, entity_id: &str) -> Option<&SpSsoDescriptor> {
+        self.trusted_sps
+            .iter()
+            .find(|sp| sp.entity_id == entity_id)
+            .map(|sp| &sp.sp_sso)
+    }
+
+    /// Build an XML-DSig verifier from the signing certificates of every
+    /// registered trusted SP.
+    ///
+    /// The ready SLO and artifact-resolution handlers use this to authenticate
+    /// incoming `LogoutRequest`/`ArtifactResolve` messages. Each trusted SP's
+    /// signing certificates are added both as verification keys and as trusted
+    /// certificates, and the verifier inherits the configured `ds:Object`
+    /// (E91) rejection policy.
+    ///
+    /// Returns `None` when no trusted SP exposes a usable signing certificate —
+    /// in which case the caller fails closed unless
+    /// [`allow_unauthenticated_backchannel`](IdpConfig::allow_unauthenticated_backchannel)
+    /// is set. An empty result deliberately does not distinguish "no SPs
+    /// registered" from "registered SPs had unparseable KeyInfo": both mean
+    /// "cannot authenticate the requester", and both must fail closed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use gamlastan_actix::IdpConfig;
+    /// // With no trusted SPs, there is nothing to verify against.
+    /// let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso");
+    /// assert!(config.trusted_sp_verifier().is_none());
+    /// ```
+    pub fn trusted_sp_verifier(&self) -> Option<SamlVerifier> {
+        let mut keys = KeysManager::new();
+        for sp in &self.trusted_sps {
+            self.add_sp_keys(&mut keys, &sp.sp_sso);
+        }
+        self.finish_verifier(keys)
+    }
+
+    /// Build an XML-DSig verifier from a single SP's signing certificates.
+    ///
+    /// Used by the ready SLO and artifact-resolution handlers to authenticate a
+    /// message against the *specific* SP that issued it — whether that SP was
+    /// registered statically ([`with_trusted_sp`](IdpConfig::with_trusted_sp)) or
+    /// resolved dynamically via a [`TrustedSpResolver`] (e.g. MDQ). Only the
+    /// issuing SP's key should verify its message, so this is preferred over
+    /// [`trusted_sp_verifier`](IdpConfig::trusted_sp_verifier) for that purpose.
+    ///
+    /// Returns `None` when the SP exposes no usable signing certificate, in which
+    /// case the caller fails closed.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// # use gamlastan_actix::IdpConfig;
+    /// # use gamlastan::metadata::types::sp::SpSsoDescriptor;
+    /// # let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso");
+    /// # let sp: SpSsoDescriptor = unimplemented!();
+    /// if let Some(verifier) = config.verifier_for(&sp) {
+    ///     // verify the incoming message against this SP's key
+    /// }
+    /// ```
+    pub fn verifier_for(&self, sp: &SpSsoDescriptor) -> Option<SamlVerifier> {
+        let mut keys = KeysManager::new();
+        self.add_sp_keys(&mut keys, sp);
+        self.finish_verifier(keys)
+    }
+
+    /// Add an SP's signing certificates to `keys` as both verification keys and
+    /// trusted certificates.
+    fn add_sp_keys(&self, keys: &mut KeysManager, sp: &SpSsoDescriptor) {
+        for cert in sp.signing_certificates_der() {
+            if let Ok(key) = loader::load_x509_cert_der(&cert) {
+                keys.add_key(key);
+                keys.add_trusted_cert(cert);
+            }
+        }
+    }
+
+    /// Wrap a populated `KeysManager` in a verifier honouring the E91 policy, or
+    /// `None` when no trusted certificate was loaded.
+    fn finish_verifier(&self, keys: KeysManager) -> Option<SamlVerifier> {
+        keys.has_trusted_certs().then(|| {
+            SamlVerifier::with_ds_object_rejection(
+                keys,
+                self.security.reject_signatures_with_ds_object,
+            )
+        })
     }
 }
 

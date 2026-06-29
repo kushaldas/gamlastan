@@ -229,11 +229,75 @@ fn verify_if_configured(
     MetadataSigningProfile::validate_signature_profile(xml, id)?;
 
     let verifier = SamlVerifier::new(trust.keys().clone());
-    match verifier
+    let references = match verifier
         .verify_enveloped(xml)
         .map_err(|e| MdqError::SignatureInvalid(e.to_string()))?
     {
-        VerifyResult::Valid { .. } => Ok(()),
-        VerifyResult::Invalid { reason } => Err(MdqError::SignatureInvalid(reason)),
+        VerifyResult::Valid { references, .. } => references,
+        VerifyResult::Invalid { reason } => return Err(MdqError::SignatureInvalid(reason)),
+    };
+
+    // Cryptographically bind the signature to the metadata element we parsed and
+    // are about to trust. The verifier only proves "some reference in this XML
+    // digested correctly"; without checking *which* object that reference
+    // covers, a signature over a relocated sibling EntitiesDescriptor would be
+    // accepted as protecting the document root the parser actually reads keys
+    // and endpoints from (XML Signature Wrapping, CWE-347). Require a verified
+    // reference that targets this element's ID, or the document root (empty URI).
+    let covered = references
+        .iter()
+        .any(|reference| reference_uri_covers(&reference.uri, id));
+    if !covered {
+        return Err(MdqError::SignatureNotBound(id.to_string()));
+    }
+    Ok(())
+}
+
+/// True if a verified XML-DSig reference URI covers the element with `id`.
+///
+/// A same-document reference is `"#id"`; an empty URI signs the document root,
+/// which in MDQ is the EntityDescriptor/EntitiesDescriptor the parser reads. Any
+/// other target (a sibling object, an external URI) does not protect the trusted
+/// element and must be rejected as XML Signature Wrapping.
+fn reference_uri_covers(uri: &str, id: &str) -> bool {
+    uri.is_empty() || uri.strip_prefix('#') == Some(id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reference_uri_covers;
+
+    #[test]
+    fn reference_covering_root_id_is_accepted() {
+        // The legitimate case: the signature references the parsed element's ID.
+        assert!(reference_uri_covers("#_entity_1", "_entity_1"));
+    }
+
+    #[test]
+    fn empty_uri_signs_document_root() {
+        assert!(reference_uri_covers("", "_entity_1"));
+    }
+
+    #[test]
+    fn reference_to_sibling_object_is_rejected() {
+        // Finding #1 regression: a valid signature whose reference targets a
+        // *different* (relocated/wrapped) object must not be accepted as
+        // protecting the trusted element.
+        assert!(!reference_uri_covers("#_evil_sibling", "_entity_1"));
+    }
+
+    #[test]
+    fn external_uri_reference_is_rejected() {
+        assert!(!reference_uri_covers(
+            "https://attacker.example/signed",
+            "_entity_1"
+        ));
+    }
+
+    #[test]
+    fn unprefixed_id_is_rejected() {
+        // A bare id without the '#' fragment marker is not a same-document
+        // reference to the element.
+        assert!(!reference_uri_covers("_entity_1", "_entity_1"));
     }
 }

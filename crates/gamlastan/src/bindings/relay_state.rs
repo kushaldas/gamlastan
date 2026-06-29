@@ -76,7 +76,18 @@ pub fn validate_relay_state(value: &str) -> Result<(), BindingError> {
         ));
     }
 
-    // E90: Check for dangerous URI schemes (case-insensitive)
+    // E90: Reject all control characters (C0/C1, TAB/CR/LF, DEL). They are used
+    // to smuggle dangerous URI schemes past prefix checks (e.g. "java\tscript:",
+    // which a browser may normalize back to "javascript:") and have no
+    // legitimate place in a RelayState.
+    if value.chars().any(char::is_control) {
+        return Err(BindingError::RelayStateUnsafe(
+            "contains control characters".to_string(),
+        ));
+    }
+
+    // E90: Check for dangerous URI schemes (case-insensitive). Trim leading and
+    // trailing whitespace first so " javascript:..." cannot bypass the check.
     let lower = value.to_ascii_lowercase();
     let trimmed = lower.trim();
     for scheme in &["javascript:", "data:", "vbscript:"] {
@@ -160,6 +171,15 @@ mod tests {
     #[test]
     fn test_relay_state_null_bytes() {
         assert!(RelayState::new("abc\0def").is_err());
+    }
+
+    #[test]
+    fn test_relay_state_embedded_control_scheme() {
+        // Finding #14 regression: control chars embedded in a dangerous scheme
+        // (which browsers may strip) must be rejected.
+        assert!(RelayState::new("java\tscript:alert(1)").is_err());
+        assert!(RelayState::new("java\u{0001}script:alert(1)").is_err());
+        assert!(RelayState::new("\tjavascript:alert(1)").is_err());
     }
 
     #[test]

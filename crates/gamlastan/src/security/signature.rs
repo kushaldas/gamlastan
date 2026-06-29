@@ -17,19 +17,23 @@
 /// the parsed XML tree and compares expanded names, so it is independent of the
 /// XML Signature prefix used by the input.
 ///
-/// Returns `true` if a ds:Object is found (meaning the signature should be rejected).
-pub fn contains_ds_object(signature_xml: &str) -> bool {
+/// Returns `Ok(true)` if a ds:Object is found (meaning the signature should be
+/// rejected), `Ok(false)` if the XML parsed cleanly and no ds:Object is present,
+/// and `Err(_)` if the input could not be parsed.
+///
+/// This is a *fail-closed* hardening check: the previous version returned
+/// `false` (i.e. "no forbidden Object, proceed") when the XML failed to parse,
+/// so a parser differential that prevented this helper from inspecting the
+/// document — while the real verifier still accepted it — would bypass E91. The
+/// `Err` result forces callers to decide explicitly, and every caller in this
+/// crate treats it as a rejection (CWE-693).
+pub fn contains_ds_object(signature_xml: &str) -> Result<bool, uppsala::XmlError> {
     const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 
-    let Ok(doc) = crate::xml::parse_secure(signature_xml) else {
-        // The caller's XML verifier will report malformed XML later. This
-        // helper only answers "is there a real XMLDSig Object element?" and
-        // avoids guessing from text when the fragment is not parseable XML.
-        return false;
-    };
+    let doc = crate::xml::parse_secure(signature_xml)?;
 
     let Some(root) = doc.document_element() else {
-        return false;
+        return Ok(false);
     };
 
     for node in doc.descendants(root) {
@@ -42,11 +46,11 @@ pub fn contains_ds_object(signature_xml: &str) -> bool {
         if elem.name.local_name == "Object"
             && elem.name.namespace_uri.as_deref() == Some(XMLDSIG_NS)
         {
-            return true;
+            return Ok(true);
         }
     }
 
-    false
+    Ok(false)
 }
 
 /// Known signature algorithm URIs.
@@ -132,7 +136,7 @@ mod tests {
             <ds:SignatureValue>abc</ds:SignatureValue>
             <ds:Object>malicious content</ds:Object>
         </ds:Signature>"#;
-        assert!(contains_ds_object(xml));
+        assert_eq!(contains_ds_object(xml), Ok(true));
     }
 
     #[test]
@@ -142,7 +146,7 @@ mod tests {
             <SignatureValue>abc</SignatureValue>
             <Object>malicious content</Object>
         </Signature>"#;
-        assert!(contains_ds_object(xml));
+        assert_eq!(contains_ds_object(xml), Ok(true));
     }
 
     #[test]
@@ -152,7 +156,7 @@ mod tests {
             <ds:SignatureValue>abc</ds:SignatureValue>
             <ds:KeyInfo/>
         </ds:Signature>"#;
-        assert!(!contains_ds_object(xml));
+        assert_eq!(contains_ds_object(xml), Ok(false));
     }
 
     #[test]
@@ -160,7 +164,7 @@ mod tests {
         let xml = r#"<dsig:Signature xmlns:dsig="http://www.w3.org/2000/09/xmldsig#">
             <dsig:Object>content</dsig:Object>
         </dsig:Signature>"#;
-        assert!(contains_ds_object(xml));
+        assert_eq!(contains_ds_object(xml), Ok(true));
     }
 
     #[test]
@@ -168,7 +172,7 @@ mod tests {
         let xml = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
             <ds:Object />
         </ds:Signature>"#;
-        assert!(contains_ds_object(xml));
+        assert_eq!(contains_ds_object(xml), Ok(true));
     }
 
     #[test]
@@ -176,7 +180,7 @@ mod tests {
         let xml = r#"<Signature xmlns="urn:example:not-dsig">
             <Object>application content</Object>
         </Signature>"#;
-        assert!(!contains_ds_object(xml));
+        assert_eq!(contains_ds_object(xml), Ok(false));
     }
 
     #[test]
@@ -184,7 +188,15 @@ mod tests {
         let xml = r#"<sig:Signature xmlns:sig="http://www.w3.org/2000/09/xmldsig#">
             <sig:Object>content</sig:Object>
         </sig:Signature>"#;
-        assert!(contains_ds_object(xml));
+        assert_eq!(contains_ds_object(xml), Ok(true));
+    }
+
+    #[test]
+    fn test_unparseable_xml_fails_closed() {
+        // Finding #16 regression: malformed XML must return Err (forcing callers
+        // to fail closed), not Ok(false) which would silently bypass E91.
+        let xml = "<ds:Signature><ds:Object>unterminated";
+        assert!(contains_ds_object(xml).is_err());
     }
 
     #[test]

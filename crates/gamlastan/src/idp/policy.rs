@@ -206,6 +206,15 @@ pub struct ReleasePolicy {
     /// registration authority (pysaml2 `Policy.get`: SP > registration
     /// authority > default) before the global `default`.
     registration_authorities: HashMap<String, String>,
+    /// pysaml2-compatibility switch for attribute-release matching. Default
+    /// `false` (the secure default): an SP-supplied `RequestedAttribute` is
+    /// matched only by its trusted converter mapping or its exact wire `Name`,
+    /// never by its non-unique, attacker-controllable `FriendlyName`
+    /// (Finding #7, ADR 0032). Set `true` (see
+    /// [`allow_friendly_name_release_matching`](ReleasePolicy::allow_friendly_name_release_matching))
+    /// to restore strict pysaml2 behaviour, where an unmappable `Name` falls
+    /// back to `FriendlyName` for matching (pysaml2 `_identify_attribute`).
+    allow_friendly_name_match: bool,
 }
 
 /// The key under which the fallback entry is stored.
@@ -218,6 +227,7 @@ impl ReleasePolicy {
             entries: HashMap::new(),
             converters: AttributeConverterSet::with_default_maps(),
             registration_authorities: HashMap::new(),
+            allow_friendly_name_match: false,
         }
     }
 
@@ -236,6 +246,39 @@ impl ReleasePolicy {
     /// Use a custom attribute converter set for local-name resolution.
     pub fn with_converters(mut self, converters: AttributeConverterSet) -> Self {
         self.converters = converters;
+        self
+    }
+
+    /// Enable strict pysaml2-compatible attribute-release matching (builder
+    /// style). **Off by default**, and you should leave it off unless migrating
+    /// a deployment that depends on the legacy behaviour.
+    ///
+    /// With the flag **off** (default, secure — ADR 0032), an SP's
+    /// `RequestedAttribute` is matched against the IdP's held attributes only by
+    /// its trusted converter mapping or its exact wire `Name`. The SP-supplied
+    /// `FriendlyName` is never used as a match key, so it cannot serve as an
+    /// attribute-release authorization token (Finding #7).
+    ///
+    /// With the flag **on**, an SP `RequestedAttribute` whose `Name`/`NameFormat`
+    /// cannot be resolved through the configured converters falls back to
+    /// matching on its `FriendlyName`, reproducing pysaml2's `_identify_attribute`
+    /// (`src/saml2/assertion.py`) behaviour added in pysaml2 7.1.2. This is
+    /// required only for SPs that request **unmapped** attributes and rely on the
+    /// `FriendlyName` to bind to a locally-keyed held attribute. Enabling it
+    /// re-opens the Finding #7 surface: a non-unique, attacker-controllable
+    /// `FriendlyName` becomes sufficient to request a locally-mapped attribute,
+    /// so use it only when the SP metadata feed is trusted.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use gamlastan::idp::policy::ReleasePolicy;
+    /// // Strict pysaml2 parity for a migration where SPs request unmapped
+    /// // attributes by FriendlyName:
+    /// let policy = ReleasePolicy::new().allow_friendly_name_release_matching(true);
+    /// ```
+    pub fn allow_friendly_name_release_matching(mut self, allow: bool) -> Self {
+        self.allow_friendly_name_match = allow;
         self
     }
 
@@ -343,6 +386,11 @@ impl ReleasePolicy {
     }
 
     /// The local (lowercased) name of a wire attribute.
+    ///
+    /// Used for *held* attributes (the IdP's own, trusted data), where the
+    /// `FriendlyName` fallback in [`AttributeMap::local_name`] is acceptable.
+    /// For matching an SP-supplied `RequestedAttribute`, use
+    /// [`trusted_local_key`](Self::trusted_local_key) instead.
     fn local_key(&self, attribute: &Attribute) -> String {
         self.converters
             .local_name(attribute)
@@ -350,19 +398,60 @@ impl ReleasePolicy {
             .to_lowercase()
     }
 
+    /// The trusted local key of a wire attribute: its local name resolved
+    /// through registered converters only, lowercased; `None` when no converter
+    /// maps it.
+    ///
+    /// Unlike [`local_key`](Self::local_key) this never derives the key from the
+    /// attribute's `FriendlyName`, so an untrusted, non-unique SP-supplied
+    /// `FriendlyName` cannot be used as an attribute-release authorization key
+    /// (Finding #7, CWE-345). Release matching keys the *requested* attribute on
+    /// this value (or, failing that, the exact wire `Name`).
+    fn trusted_local_key(&self, attribute: &Attribute) -> Option<String> {
+        self.converters
+            .local_name_via_converters(attribute)
+            .map(|name| name.to_lowercase())
+    }
+
+    /// The local match key for an SP-supplied `RequestedAttribute`.
+    ///
+    /// Always the trusted converter mapping when one resolves. When
+    /// [`allow_friendly_name_match`](ReleasePolicy::allow_friendly_name_match) is
+    /// set (pysaml2-compat, off by default), an unmappable attribute falls back
+    /// to its `FriendlyName` — mirroring pysaml2's
+    /// `local_name = get_local_name(...) or friendly_name`. With the flag off the
+    /// `FriendlyName` is never used, so it cannot authorize release (Finding #7,
+    /// ADR 0032).
+    fn requested_match_key(&self, attribute: &Attribute) -> Option<String> {
+        self.trusted_local_key(attribute).or_else(|| {
+            self.allow_friendly_name_match
+                .then(|| attribute.friendly_name.clone())
+                .flatten()
+                .map(|friendly| friendly.to_lowercase())
+        })
+    }
+
     fn matching_requested_attribute(
         &self,
         attributes: &[Attribute],
         requested: &RequestedAttribute,
     ) -> Option<Attribute> {
-        let req_local = self.local_key(&requested.attribute);
+        // Resolve the requested attribute to a match key. By default this is the
+        // trusted converter mapping only — never its SP-supplied FriendlyName
+        // (Finding #7). A request matches a held attribute by that key or by exact
+        // wire Name. With the pysaml2-compat flag set, an unmappable Name may fall
+        // back to its FriendlyName (see `requested_match_key`).
+        let req_local = self.requested_match_key(&requested.attribute);
         let req_wire = requested.attribute.name.to_lowercase();
 
         // Assertion parsing does not merge duplicate Attribute elements,
         // so collect every input attribute mapping to this requested name
         // (by local or wire name) rather than just the first.
         let mut matched = attributes.iter().filter(|attr| {
-            self.local_key(attr) == req_local || attr.name.to_lowercase() == req_wire
+            req_local
+                .as_ref()
+                .is_some_and(|rl| &self.local_key(attr) == rl)
+                || attr.name.to_lowercase() == req_wire
         });
 
         let mut released = matched.next()?.clone();
@@ -442,9 +531,20 @@ impl ReleasePolicy {
         // resolved policy set rather than cloning it on every request.
         let categories = self.get_ref(sp_entity_id, |e| e.entity_categories.as_deref());
         if let Some(policies) = categories {
+            // Key the SP's required attributes for the entity-category release
+            // set on their trusted local mapping and exact wire Name (and, only
+            // under the pysaml2-compat flag, their FriendlyName) — by default
+            // never the SP-supplied FriendlyName (Finding #7), otherwise the same
+            // FriendlyName confusion could steer which category attributes are
+            // released. Extra wire-name keys are harmless: they only match held
+            // attributes that genuinely carry that Name.
             let required_local: Vec<String> = required
                 .iter()
-                .map(|r| self.local_key(&r.attribute))
+                .flat_map(|r| {
+                    self.requested_match_key(&r.attribute)
+                        .into_iter()
+                        .chain(std::iter::once(r.attribute.name.to_lowercase()))
+                })
                 .collect();
             let released =
                 releasable_attributes_owned(policies, sp_entity_categories, &required_local);
@@ -766,6 +866,66 @@ mod tests {
             },
             is_required: Some(required),
         }
+    }
+
+    #[test]
+    fn test_friendly_name_cannot_authorize_release() {
+        // Finding #7 regression: an SP must not be able to obtain a
+        // locally-mapped attribute by placing its local name in the (untrusted,
+        // non-unique) FriendlyName of a RequestedAttribute whose wire Name does
+        // not map. Only the correct wire Name (or a converter-mapped Name)
+        // releases the attribute.
+        let policy = ReleasePolicy::new();
+        let held = vec![mail_attribute(&["alice@example.com"])];
+
+        // Attack: bogus, unmapped wire Name; FriendlyName falsely claims "mail".
+        let attack = requested("urn:example:not-a-real-attribute", Some("mail"), true);
+        let out = policy
+            .filter_on_attributes(held.clone(), std::slice::from_ref(&attack), &[], false)
+            .unwrap();
+        assert!(
+            out.is_empty(),
+            "FriendlyName must not authorize release of a differently-named attribute; got {out:?}"
+        );
+
+        // Legit: naming the attribute by its actual wire Name still releases it.
+        let legit = requested(&mail_attribute(&[]).name, Some("mail"), true);
+        let out = policy
+            .filter_on_attributes(held, std::slice::from_ref(&legit), &[], false)
+            .unwrap();
+        assert_eq!(
+            out.len(),
+            1,
+            "the correct wire Name must still release the attribute"
+        );
+    }
+
+    #[test]
+    fn test_friendly_name_release_matching_pysaml2_compat() {
+        // ADR 0032 opt-in: with the pysaml2-compatibility flag enabled, an SP
+        // that requests an *unmapped* Name and relies on FriendlyName to bind to
+        // a held attribute is matched (pysaml2 `_identify_attribute`). The secure
+        // default rejects exactly the same request.
+        let held = vec![mail_attribute(&["alice@example.com"])];
+        // Unmappable wire Name; the FriendlyName names the held "mail" attribute.
+        let req = requested("urn:myown:unmapped", Some("mail"), true);
+
+        // Default (secure): the FriendlyName cannot authorize release.
+        let strict = ReleasePolicy::new();
+        assert!(
+            strict
+                .filter_on_attributes(held.clone(), std::slice::from_ref(&req), &[], false)
+                .unwrap()
+                .is_empty(),
+            "default policy must not match by FriendlyName"
+        );
+
+        // pysaml2-compat: the unmappable Name falls back to FriendlyName matching.
+        let compat = ReleasePolicy::new().allow_friendly_name_release_matching(true);
+        let out = compat
+            .filter_on_attributes(held, std::slice::from_ref(&req), &[], false)
+            .unwrap();
+        assert_eq!(out.len(), 1, "pysaml2-compat must match by FriendlyName");
     }
 
     #[test]

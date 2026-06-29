@@ -51,6 +51,14 @@ pub struct SwedenConnectResponseParams<'a> {
     /// Whether the caller cryptographically verified the `<saml2p:Response>`
     /// signature against the IdP's metadata key (section 6.3.1).
     pub response_signature_verified: bool,
+    /// The SAML object IDs that the caller's signature verification actually
+    /// covered, derived from the verified XML-DSig reference URIs (empty URI =
+    /// document root = the Response). When [`response_signature_verified`] is
+    /// `true`, this MUST contain the consumed Response ID, otherwise the
+    /// signature protects some *other* object and the response is rejected as an
+    /// XML Signature Wrapping attempt. Prefer [`verify_and_process_response`],
+    /// which populates this for you.
+    pub verified_signed_ids: &'a [&'a str],
     /// Whether the assertion arrived encrypted (set by [`decrypt_response`]).
     pub assertion_was_encrypted: bool,
     /// Replay-prevention cache (section 6.3.5). The profile *mandates* replay
@@ -305,11 +313,24 @@ pub fn process_response(
         ));
     }
 
+    // Section 6.1 / 6.3.1: the signature the caller verified MUST cover the
+    // exact Response we are about to consume. Previously this path *assumed* the
+    // signature protected `response.base.id` and fabricated that ID as
+    // "verified"; a valid signature over a sibling object in the same document
+    // (XML Signature Wrapping) was therefore accepted as protecting the
+    // consumed Response. Bind to the caller-supplied verified reference IDs
+    // instead, and fail closed when the Response ID is not among them.
+    if !params
+        .verified_signed_ids
+        .contains(&response.base.id.as_str())
+    {
+        return Err(SwedenConnectError::SignatureNotBoundToResponse);
+    }
+
     // Run the 32-check validator with the profile's security configuration,
     // threading the externally-performed response signature verification.
     let security = cfg.security_config();
     let validator = AssertionValidator::new(&security).with_replay_cache(params.replay_cache);
-    let verified_signed_ids = [response.base.id.as_str()];
     let validation_params = ValidationParams {
         received_url: params.received_url,
         expected_idp_entity_id: params.expected_idp_entity_id,
@@ -320,7 +341,7 @@ pub fn process_response(
         relay_state: params.relay_state,
         response_signature_xml: None,
         response_signature_verified: Some(true),
-        verified_signed_ids: &verified_signed_ids,
+        verified_signed_ids: params.verified_signed_ids,
         current_proxy_depth: 0,
         now: params.now,
     };
@@ -436,22 +457,44 @@ pub fn verify_and_process_response(
 ) -> Result<SwedenConnectAuthnResult, SwedenConnectError> {
     validate_response_algorithms(response_xml)?;
 
-    // 1. Verify the response signature over the exact received bytes.
-    match verifier.verify_enveloped(response_xml)? {
-        VerifyResult::Valid { .. } => {}
+    // 1. Verify the response signature over the exact received bytes and keep the
+    //    verified XML-DSig references so the signature can be *bound* to the
+    //    Response we consume — discarding them is the XML Signature Wrapping bug.
+    let references = match verifier.verify_enveloped(response_xml)? {
+        VerifyResult::Valid { references, .. } => references,
         VerifyResult::Invalid { reason } => {
             return Err(SwedenConnectError::InvalidResponseSignature(reason));
         }
-    }
+    };
 
     // 2. Decrypt the assertion (rejects cleartext assertions per section 6.1).
     let (response, was_encrypted) = decrypt_response(response_xml, decryptor)?;
 
+    // Convert the verified reference URIs into SAML object IDs. A same-document
+    // reference is "#ID"; an empty URI signs the document root, which here is
+    // the parsed `<saml2p:Response>`. The assertion arrives encrypted, so the
+    // profile binds trust to the signed Response root rather than the assertion.
+    let mut verified_signed_ids: Vec<&str> = Vec::new();
+    for reference in &references {
+        let id = if reference.uri.is_empty() {
+            Some(response.base.id.as_str())
+        } else {
+            reference.uri.strip_prefix('#')
+        };
+        if let Some(id) = id {
+            if !verified_signed_ids.contains(&id) {
+                verified_signed_ids.push(id);
+            }
+        }
+    }
+
     // 3. Process with the signature/encryption facts established above rather
-    //    than trusted from the caller.
+    //    than trusted from the caller. `process_response` rejects the message if
+    //    none of these verified IDs is the consumed Response ID.
     let resolved = SwedenConnectResponseParams {
         response_signature_verified: true,
         assertion_was_encrypted: was_encrypted,
+        verified_signed_ids: &verified_signed_ids,
         ..*params
     };
     process_response(cfg, &response, &resolved)
@@ -516,6 +559,7 @@ mod tests {
     const SP: &str = "https://sp.example.se";
     const ACS: &str = "https://sp.example.se/acs";
     const REQ_ID: &str = "_req_1";
+    const RESP_ID: &str = "_resp_1";
 
     fn cfg() -> SwedenConnectConfig {
         SwedenConnectConfig::service_provider(SP, vec![constants::LOA3.into()])
@@ -587,7 +631,7 @@ mod tests {
 
         Response {
             base: ResponseBase {
-                id: SamlId::generate().as_str().to_string(),
+                id: RESP_ID.to_string(),
                 version: SamlVersion::V2_0,
                 issue_instant: now,
                 destination: Some(ACS.to_string()),
@@ -612,6 +656,10 @@ mod tests {
             expected_idp_entity_id: IDP,
             expected_request_id: Some(REQ_ID),
             response_signature_verified: true,
+            // The signature is bound to the Response we consume (the default,
+            // happy-path expectation); individual tests override this to model
+            // an XML Signature Wrapping attempt.
+            verified_signed_ids: &[RESP_ID],
             assertion_was_encrypted: true,
             replay_cache,
             relay_state: None,
@@ -684,6 +732,39 @@ mod tests {
         assert!(matches!(
             process_response(&cfg(), &resp, &p),
             Err(SwedenConnectError::ResponseNotSigned)
+        ));
+    }
+
+    #[test]
+    fn test_rejects_signature_wrapping_unbound_to_response() {
+        // Finding #3 regression: a valid signature over some *other* object in
+        // the same document (verified_signed_ids does not contain the consumed
+        // Response ID) must NOT be treated as protecting the consumed Response.
+        let now = Utc::now();
+        let cache = InMemoryReplayCache::new();
+        let resp = make_response(now, constants::LOA3, true);
+        let mut p = params(now, &cache);
+        // The signature covered a sibling element, not RESP_ID.
+        p.verified_signed_ids = &["_some_other_signed_object"];
+        assert!(matches!(
+            process_response(&cfg(), &resp, &p),
+            Err(SwedenConnectError::SignatureNotBoundToResponse)
+        ));
+    }
+
+    #[test]
+    fn test_rejects_signature_verified_but_no_references() {
+        // Finding #3 regression: response_signature_verified=true but an empty
+        // verified-ID set (the verifier produced no usable references) must fail
+        // closed rather than fabricate trust in the Response ID.
+        let now = Utc::now();
+        let cache = InMemoryReplayCache::new();
+        let resp = make_response(now, constants::LOA3, true);
+        let mut p = params(now, &cache);
+        p.verified_signed_ids = &[];
+        assert!(matches!(
+            process_response(&cfg(), &resp, &p),
+            Err(SwedenConnectError::SignatureNotBoundToResponse)
         ));
     }
 

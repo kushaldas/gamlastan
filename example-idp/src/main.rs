@@ -734,6 +734,43 @@ fn get_session_from_cookie(req: &HttpRequest, state: &web::Data<AppState>) -> Op
     None
 }
 
+/// Returns `true` if a verified XML-DSig reference URI covers the AuthnRequest
+/// identified by `request_id`.
+///
+/// A same-document reference is `"#id"`; an empty URI signs the document root,
+/// which for a POSTed AuthnRequest is the request element itself. Any other
+/// target (a sibling element, an external URI) does not protect the parsed
+/// request and so must not count as a valid signature over it — this is the XML
+/// Signature Wrapping (XSW) guard applied in [`validate_authn_request`].
+///
+/// # Examples
+///
+/// ```ignore
+/// assert!(request_reference_covers("#_req-123", "_req-123"));
+/// assert!(request_reference_covers("", "_req-123")); // signs the root
+/// assert!(!request_reference_covers("#_other", "_req-123"));
+/// ```
+fn request_reference_covers(uri: &str, request_id: &str) -> bool {
+    uri.is_empty() || uri.strip_prefix('#') == Some(request_id)
+}
+
+/// Validate an incoming `AuthnRequest` against the trusted-SP registry and the
+/// IdP's signing policy, returning the processed request on success.
+///
+/// Validation steps:
+/// 1. The request `Issuer` must identify a configured trusted SP.
+/// 2. If the request is signed (HTTP-Redirect detached signature or an enveloped
+///    XML-DSig signature), the signature must verify against that SP's key.
+/// 3. For enveloped signatures, the verified reference must cover the parsed
+///    request (see [`request_reference_covers`]) — defeating XML Signature
+///    Wrapping where a valid signature protects a different object.
+/// 4. If IdP policy requires signed requests, an unsigned request is rejected.
+/// 5. The request is processed against the SP's metadata so the
+///    AssertionConsumerServiceURL is validated, not trusted blindly.
+///
+/// `redirect_binding` carries the decoded HTTP-Redirect parameters when the
+/// request arrived via the Redirect binding (its signature covers the query
+/// string, not the XML); pass `None` for POSTed requests.
 fn validate_authn_request(
     state: &AppState,
     authn_request: &gamlastan::core::protocol::request::AuthnRequest,
@@ -768,7 +805,23 @@ fn validate_authn_request(
 
     if authn_request.base.has_signature {
         match sp.request_verifier.verify_enveloped(xml_str) {
-            Ok(VerifyResult::Valid { .. }) => signed = true,
+            Ok(VerifyResult::Valid { references, .. }) => {
+                // Bind the signature to the parsed request: a valid signature over
+                // a sibling object in the same document (XML Signature Wrapping)
+                // must not authorize the AuthnRequest whose fields (ACS URL,
+                // issuer, request ID) we then consume. Require a verified
+                // reference targeting the request root (empty URI) or its ID.
+                let bound = references
+                    .iter()
+                    .any(|r| request_reference_covers(&r.uri, &authn_request.base.id));
+                if !bound {
+                    return Err(
+                        "AuthnRequest signature did not reference the request (XML Signature Wrapping)"
+                            .to_string(),
+                    );
+                }
+                signed = true;
+            }
             Ok(VerifyResult::Invalid { reason }) => {
                 return Err(format!("XML signature verification failed: {reason}"));
             }
@@ -1239,6 +1292,20 @@ mod tests {
     use gamlastan::metadata::types::sp::SpSsoDescriptor;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn test_request_reference_covers() {
+        // Finding #17 regression: only a verified reference targeting the parsed
+        // request (its ID or the document root) counts as signing it.
+        assert!(request_reference_covers("#_req-123", "_req-123"));
+        assert!(request_reference_covers("", "_req-123"));
+        // A signature over a sibling object must not bind the request.
+        assert!(!request_reference_covers("#_other-object", "_req-123"));
+        assert!(!request_reference_covers(
+            "https://attacker.example/signed",
+            "_req-123"
+        ));
+    }
 
     fn write_temp_metadata(contents: &str) -> PathBuf {
         let unique = SystemTime::now()

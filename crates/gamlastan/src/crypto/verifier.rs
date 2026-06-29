@@ -117,8 +117,18 @@ impl SamlVerifier {
         // E91 check: reject XMLDSig Object elements before handing the
         // document to the verifier. The helper parses XML and compares
         // expanded names, so attackers cannot bypass it by changing prefixes.
-        if self.reject_ds_object && crate::security::signature::contains_ds_object(signed_xml) {
-            return Err(CryptoError::SignatureContainsDsObject);
+        // Fail closed: if the document cannot be parsed for this check we must
+        // not proceed as though it were clean (CWE-693).
+        if self.reject_ds_object {
+            match crate::security::signature::contains_ds_object(signed_xml) {
+                Ok(true) => return Err(CryptoError::SignatureContainsDsObject),
+                Ok(false) => {}
+                Err(e) => {
+                    return Err(CryptoError::VerificationFailed(format!(
+                        "could not parse XML for E91 ds:Object check: {e}"
+                    )))
+                }
+            }
         }
 
         let mut ctx = DsigContext::new(self.keys_manager.clone());

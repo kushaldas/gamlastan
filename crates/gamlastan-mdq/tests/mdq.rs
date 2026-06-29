@@ -215,6 +215,33 @@ fn signed_idp(entity_id: &str, id: &str) -> String {
     signer().sign_enveloped(&xml).unwrap()
 }
 
+/// Build an XML Signature Wrapping (XSW) attack document.
+///
+/// The parsed root is an `EntitiesDescriptor` (`agg_id`) whose direct-child
+/// signature cryptographically covers a **sibling** bystander `EntityDescriptor`
+/// (`signed_id`, for an unrelated entity) — a relocation bergshamra's own strict
+/// check *permits* (siblings of the Signature are allowed), so it lands squarely
+/// on gamlastan's verified-reference binding. Alongside the genuinely-signed
+/// bystander, the attacker injects a second, **unsigned** `EntityDescriptor`
+/// advertising the requested `entity_id` and an attacker `SingleSignOnService`;
+/// that is the entity `select_entity` would return.
+///
+/// The aggregate root itself is **not** signed (the reference targets the
+/// sibling, not `agg_id`), so binding the signature to the parsed/returned
+/// element must reject it. A decoy `#agg_id` string satisfies the legacy
+/// substring signing-profile check so only the cryptographic binding can catch
+/// the wrap.
+fn wrapping_attack_idp(entity_id: &str, agg_id: &str, signed_id: &str) -> String {
+    let template = signature_template(signed_id, &cert_b64());
+    // Decoy "#agg_id" so the legacy substring profile check passes; only the
+    // cryptographic reference binding can then catch the wrap.
+    let decoy = format!("#{agg_id}");
+    let xml = format!(
+        r#"<md:EntitiesDescriptor xmlns:md="{MD_NS}" ID="{agg_id}">{template}<md:Extensions><md:PublisherInfo xmlns:mdrpi="urn:decoy" publisher="{decoy}"/></md:Extensions><md:EntityDescriptor ID="{signed_id}" entityID="https://bystander.example.com"><md:IDPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol"><md:SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect" Location="https://bystander.example.com/sso"/></md:IDPSSODescriptor></md:EntityDescriptor><md:EntityDescriptor ID="_evil" entityID="{entity_id}"><md:IDPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol"><md:SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect" Location="https://attacker.example.com/sso"/></md:IDPSSODescriptor></md:EntityDescriptor></md:EntitiesDescriptor>"#
+    );
+    signer().sign_enveloped(&xml).unwrap()
+}
+
 // ── Dynamic-mode tests ────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -466,6 +493,27 @@ async fn signed_metadata_verifies_with_cert() {
         .unwrap();
     let ed = client.get("https://idp.example.com/idp").await.unwrap();
     assert_eq!(ed.entity_id, "https://idp.example.com/idp");
+}
+
+#[tokio::test]
+async fn signature_wrapping_over_sibling_element_is_rejected() {
+    // End-to-end XML Signature Wrapping fixture (Finding #1): the EntityDescriptor
+    // MDQ parses and would return (`_outer`) carries a real, valid signature, but
+    // that signature cryptographically covers a *sibling* bystander element
+    // (`_signed`) rather than `_outer`. A decoy "#_outer" string satisfies the
+    // legacy substring profile check, so the verified-reference binding is the
+    // only control that can catch the wrap. This locks in the binding control
+    // end-to-end, not just at the `reference_uri_covers` unit level.
+    let body = wrapping_attack_idp("https://idp.example.com/idp", "_outer", "_signed");
+    let fetcher = MockFetcher::serving(&body);
+    let client = MdqClient::with_fetcher("https://mdq.example.org/", fetcher)
+        .add_signing_cert_pem(SIGN_CERT_PEM.as_bytes())
+        .unwrap();
+    let err = client.get("https://idp.example.com/idp").await.unwrap_err();
+    assert!(
+        matches!(err, MdqError::SignatureNotBound(_)),
+        "wrapped sibling signature must be rejected as unbound; got {err:?}"
+    );
 }
 
 #[tokio::test]
