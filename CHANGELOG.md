@@ -5,7 +5,21 @@ All notable changes to this repository will be documented in this file.
 The project is still pre-1.0, so minor releases may include behavior changes
 where needed to correct protocol handling.
 
-## [0.6.0] - unreleased
+## [0.7.0] - unreleased
+
+### Added
+
+- `profiles::sso::idp` response/assertion signing helpers: `signature_template`
+  (build an empty enveloped `<ds:Signature>` template for a reference ID, with
+  exclusive c14n, the enveloped-signature transform, a SHA-256 digest and the
+  signing certificate in `<ds:KeyInfo>`), `sign_response_xml` (splice + sign a
+  serialized `Response` - assertion, response envelope, or both, inner-to-outer),
+  and `create_signed_response` (one call: `create_response` + serialize + sign).
+  The signature is anchored after each element's `<saml:Issuer>`, per the SAML
+  schema ordering, so callers no longer hand-roll the template and splice. See
+  ADR 0033.
+
+## [0.6.0] - 2026-06-28
 
 ### Added
 

@@ -19,6 +19,9 @@ use gamlastan::crypto::signer::SamlSigner;
 use gamlastan::profiles::artifact_resolution;
 use gamlastan::profiles::logout;
 use gamlastan::profiles::sso::idp as idp_profile;
+// The canonical enveloped-signature template now lives in core gamlastan;
+// re-export it so existing call sites (and the doc links) keep resolving.
+pub use gamlastan::profiles::sso::idp::signature_template;
 use gamlastan::profiles::sso::web_browser::{ResponseOptions, ResponseTimes};
 use gamlastan::xml::serialize::SamlSerialize;
 use gamlastan::xml::uppsala;
@@ -154,23 +157,6 @@ pub fn configure_idp(cfg: &mut web::ServiceConfig) {
     .service(web::resource("/saml/metadata").route(web::get().to(idp_metadata)));
 }
 
-/// Build a ds:Signature template for enveloped signing.
-///
-/// The template contains empty DigestValue and SignatureValue placeholders
-/// that are filled in by `signer.sign_enveloped()`.
-pub fn signature_template(
-    reference_id: &str,
-    cert_b64: &str,
-    signature_method_uri: &str,
-) -> String {
-    format!(
-        r##"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="{sig_alg}"/><ds:Reference URI="#{id}"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{cert}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></ds:Signature>"##,
-        id = reference_id,
-        cert = cert_b64,
-        sig_alg = signature_method_uri,
-    )
-}
-
 fn metadata_signing_cert_b64<'a>(
     config: &'a IdpConfig,
     signing_ctx: Option<&'a IdpSigningContext>,
@@ -180,9 +166,14 @@ fn metadata_signing_cert_b64<'a>(
         .or(config.signing_cert_b64.as_deref())
 }
 
-/// Insert a signature template after the first occurrence of a given element's opening tag.
+/// Insert a signature template as the FIRST child of a given element (right after
+/// its opening tag's `>`).
 ///
-/// Finds `<element_name ` or `<element_name>` and inserts the template after the `>`.
+/// This is the correct placement for **metadata** (`md:EntityDescriptor` has
+/// `ds:Signature` as its first child and no `saml:Issuer`). It is NOT correct for
+/// a SAML `Response`/`Assertion`, where `ds:Signature` must follow `saml:Issuer`:
+/// for those use [`sign_response_xml`] / `idp_profile::create_signed_response`,
+/// which anchor the signature after the Issuer per the schema.
 pub fn insert_signature_after_element(
     xml: &str,
     element_name: &str,
@@ -213,7 +204,10 @@ pub fn insert_signature_after_element(
 
 /// Sign a SAML Response XML, optionally signing both the Assertion and Response.
 ///
-/// Signing order: Assertion first (inner), then Response (outer).
+/// Signing order: Assertion first (inner), then Response (outer). Delegates to
+/// core gamlastan's [`idp_profile::sign_response_xml`], which anchors each
+/// signature after the element's `<saml:Issuer>` (schema-correct placement) -
+/// replacing this crate's earlier first-child splice. See gamlastan ADR 0033.
 pub fn sign_response_xml(
     response_xml: &str,
     signing_ctx: &IdpSigningContext,
@@ -222,38 +216,16 @@ pub fn sign_response_xml(
     sign_assertions: bool,
     sign_responses: bool,
 ) -> Result<String, SamlActixError> {
-    let mut xml = response_xml.to_string();
-
-    // Sign Assertion first (inner-to-outer order)
-    if sign_assertions {
-        if let Some(assertion_id) = assertion_id {
-            let signature_method_uri = signing_ctx.signer.signature_method_uri().map_err(|e| {
-                SamlActixError::Internal(format!("unsupported signing algorithm: {e}"))
-            })?;
-            let sig = signature_template(assertion_id, &signing_ctx.cert_b64, signature_method_uri);
-            xml = insert_signature_after_element(&xml, "saml:Assertion", &sig)?;
-            xml = signing_ctx
-                .signer
-                .sign_enveloped(&xml)
-                .map_err(|e| SamlActixError::Internal(format!("assertion signing failed: {e}")))?;
-        }
-    }
-
-    // Then sign Response (outer)
-    if sign_responses {
-        let signature_method_uri = signing_ctx
-            .signer
-            .signature_method_uri()
-            .map_err(|e| SamlActixError::Internal(format!("unsupported signing algorithm: {e}")))?;
-        let sig = signature_template(response_id, &signing_ctx.cert_b64, signature_method_uri);
-        xml = insert_signature_after_element(&xml, "samlp:Response", &sig)?;
-        xml = signing_ctx
-            .signer
-            .sign_enveloped(&xml)
-            .map_err(|e| SamlActixError::Internal(format!("response signing failed: {e}")))?;
-    }
-
-    Ok(xml)
+    idp_profile::sign_response_xml(
+        response_xml,
+        &signing_ctx.signer,
+        &signing_ctx.cert_b64,
+        response_id,
+        assertion_id,
+        sign_assertions,
+        sign_responses,
+    )
+    .map_err(|e| SamlActixError::Internal(format!("response/assertion signing failed: {e}")))
 }
 
 /// IdP SSO handler: process an incoming AuthnRequest.
@@ -1185,10 +1157,14 @@ mod tests {
 
     #[test]
     fn test_insert_signature_after_element() {
-        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_resp1"><saml:Assertion ID="_a1"/></samlp:Response>"#;
+        // First-child placement, as required for metadata (EntityDescriptor has
+        // no Issuer). Response/Assertion signing goes through the core helper,
+        // which anchors after the Issuer instead.
+        let xml = r#"<md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" entityID="https://idp.example.com"><md:IDPSSODescriptor/></md:EntityDescriptor>"#;
         let sig = "<SIGNATURE/>";
-        let result = insert_signature_after_element(xml, "samlp:Response", sig).unwrap();
-        assert!(result.contains(r#"ID="_resp1"><SIGNATURE/><saml:Assertion"#));
+        let result = insert_signature_after_element(xml, "md:EntityDescriptor", sig).unwrap();
+        assert!(result
+            .contains(r#"entityID="https://idp.example.com"><SIGNATURE/><md:IDPSSODescriptor"#));
     }
 
     #[test]
