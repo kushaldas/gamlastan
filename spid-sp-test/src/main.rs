@@ -525,9 +525,19 @@ async fn sp_acs(state: web::Data<AppState>, form: web::Form<AcsForm>) -> HttpRes
     // consumed assertion is later required to be among these IDs, which defeats
     // XML Signature Wrapping: a valid signature over a *sibling* object no longer
     // counts as protecting the assertion whose identity/attributes we read.
+    // `sig_verified` tracks whether verification returned `Valid` at all; it must
+    // be independent of `verified_signed_ids`, because the latter only collects
+    // `#`-prefixed reference targets. A valid signature over the document root
+    // (empty URI) or one that references only the Response ID would otherwise
+    // leave `verified_signed_ids` empty and be misreported as "no valid
+    // signature". XSW protection does not depend on this flag: the per-assertion
+    // binding check below requires the consumed assertion's ID to be among the
+    // verified references regardless.
+    let mut sig_verified = false;
     let verified_signed_ids: Vec<String> = match state.idp_verifier.verify_enveloped(&xml_str) {
         Ok(gamlastan::crypto::VerifyResult::Valid { references, .. }) => {
             info!("ACS: Signature verification succeeded");
+            sig_verified = true;
             references
                 .iter()
                 .filter_map(|r| r.uri.strip_prefix('#').map(str::to_string))
@@ -543,7 +553,6 @@ async fn sp_acs(state: web::Data<AppState>, form: web::Form<AcsForm>) -> HttpRes
             Vec::new()
         }
     };
-    let sig_verified = !verified_signed_ids.is_empty();
 
     // ── Step 4: Parse the SAML Response ────────────────────────────────
     let doc = match gamlastan::xml::uppsala::parse(&xml_str) {
