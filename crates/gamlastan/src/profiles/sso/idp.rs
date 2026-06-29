@@ -26,8 +26,10 @@ use crate::crypto::encryptor::{
 };
 use crate::metadata::types::sp::SpSsoDescriptor;
 
+use crate::crypto::SamlSigner;
 use crate::profiles::error::ProfileError;
 use crate::profiles::sso::web_browser::{ResponseOptions, ResponseTimes};
+use crate::xml::serialize::SamlSerialize;
 
 /// Result of processing an AuthnRequest on the IdP side.
 #[derive(Debug, Clone)]
@@ -456,6 +458,148 @@ pub fn create_unsolicited_response(
     create_response(&options, principal_name_id, times)
 }
 
+// ---------------------------------------------------------------------------
+// Response / assertion signing
+//
+// `create_response` returns an unsigned `Response`. Delivering it to an SP that
+// requires signatures means splicing an enveloped `<ds:Signature>` template into
+// the serialized XML and filling it in with `SamlSigner::sign_enveloped`. These
+// helpers do that, so callers (and language bindings) no longer hand-roll the
+// template and the splice. See ADR 0033.
+// ---------------------------------------------------------------------------
+
+/// XML-DSig digest algorithm emitted by [`signature_template`] (SHA-256).
+const DIGEST_METHOD_SHA256: &str = "http://www.w3.org/2001/04/xmlenc#sha256";
+
+/// Build an empty enveloped `<ds:Signature>` template referencing `reference_id`.
+///
+/// The template carries empty `<ds:DigestValue/>` and `<ds:SignatureValue/>`
+/// placeholders that [`SamlSigner::sign_enveloped`] fills in, a single
+/// `<ds:Reference URI="#reference_id">` with the enveloped-signature + exclusive
+/// canonicalization transforms, and the signing certificate (base64 DER, no PEM
+/// armor) in `<ds:KeyInfo>`. `signature_method_uri` is the `<ds:SignatureMethod>`
+/// algorithm - e.g. the value returned by [`SamlSigner::signature_method_uri`].
+///
+/// The certificate is embedded explicitly so the template is valid on both the
+/// in-process and the HSM signing paths (bergshamra-dsig does not populate
+/// `<ds:KeyInfo>` from the key manager on the HSM path).
+pub fn signature_template(
+    reference_id: &str,
+    cert_der_b64: &str,
+    signature_method_uri: &str,
+) -> String {
+    format!(
+        r##"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="{sig_alg}"/><ds:Reference URI="#{id}"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms><ds:DigestMethod Algorithm="{digest}"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{cert}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></ds:Signature>"##,
+        id = reference_id,
+        cert = cert_der_b64,
+        sig_alg = signature_method_uri,
+        digest = DIGEST_METHOD_SHA256,
+    )
+}
+
+/// Insert `sig_template` into `xml` immediately after the `<saml:Issuer>` of the
+/// element opened by `element_tag` (e.g. `"saml:Assertion"` or `"samlp:Response"`).
+///
+/// SAML schema orders `<ds:Signature>` *after* `<saml:Issuer>` (and before
+/// `<saml:Subject>` / `<samlp:Status>`), so the template is anchored there rather
+/// than as the element's first child. The scan starts at the element's opening
+/// tag, so the first `</saml:Issuer>` at or after it is that element's own Issuer.
+fn insert_signature_after_issuer(
+    xml: &str,
+    element_tag: &str,
+    sig_template: &str,
+) -> Result<String, ProfileError> {
+    let open_space = format!("<{element_tag} ");
+    let open_close = format!("<{element_tag}>");
+    let elem_start = xml
+        .find(&open_space)
+        .or_else(|| xml.find(&open_close))
+        .ok_or_else(|| ProfileError::Other(format!("cannot find <{element_tag}> to sign")))?;
+
+    const ISSUER_END: &str = "</saml:Issuer>";
+    let rel = xml[elem_start..].find(ISSUER_END).ok_or_else(|| {
+        ProfileError::Other(format!(
+            "<{element_tag}> has no <saml:Issuer> to anchor the signature"
+        ))
+    })?;
+    let insert_at = elem_start + rel + ISSUER_END.len();
+    Ok(format!(
+        "{}{}{}",
+        &xml[..insert_at],
+        sig_template,
+        &xml[insert_at..]
+    ))
+}
+
+/// Sign a serialized SAML `Response`, optionally signing the assertion, the
+/// response envelope, or both, with enveloped XML-DSig.
+///
+/// When both are requested the assertion (inner) is signed first, then the
+/// response (outer), so the response signature covers the already-signed
+/// assertion. `cert_der_b64` is the base64 DER signing certificate placed in
+/// `<ds:KeyInfo>`; `assertion_id` is required when `sign_assertions` is set. Each
+/// signature is placed after its element's `<saml:Issuer>`, per the SAML schema.
+pub fn sign_response_xml(
+    response_xml: &str,
+    signer: &SamlSigner,
+    cert_der_b64: &str,
+    response_id: &str,
+    assertion_id: Option<&str>,
+    sign_assertions: bool,
+    sign_responses: bool,
+) -> Result<String, ProfileError> {
+    let mut xml = response_xml.to_string();
+
+    if sign_assertions {
+        let assertion_id = assertion_id.ok_or_else(|| {
+            ProfileError::Other("sign_assertions requested without an assertion_id".to_string())
+        })?;
+        let sig = signature_template(assertion_id, cert_der_b64, signer.signature_method_uri()?);
+        xml = insert_signature_after_issuer(&xml, "saml:Assertion", &sig)?;
+        xml = signer.sign_enveloped(&xml)?;
+    }
+
+    if sign_responses {
+        let sig = signature_template(response_id, cert_der_b64, signer.signature_method_uri()?);
+        xml = insert_signature_after_issuer(&xml, "samlp:Response", &sig)?;
+        xml = signer.sign_enveloped(&xml)?;
+    }
+
+    Ok(xml)
+}
+
+/// Build an SP-solicited `Response` (via [`create_response`]) and return it as
+/// signed XML, ready to deliver over a binding.
+///
+/// One-call equivalent of `create_response` + serialize + [`sign_response_xml`].
+/// `sign_assertions` signs the assertion (the usual Web Browser SSO posture);
+/// `sign_responses` additionally signs the response envelope. `cert_der_b64` is
+/// the base64 DER signing certificate for `<ds:KeyInfo>`.
+#[allow(clippy::too_many_arguments)]
+pub fn create_signed_response(
+    options: &ResponseOptions,
+    principal_name_id: &NameId,
+    times: ResponseTimes,
+    signer: &SamlSigner,
+    cert_der_b64: &str,
+    sign_assertions: bool,
+    sign_responses: bool,
+) -> Result<String, ProfileError> {
+    let response = create_response(options, principal_name_id, times);
+    let response_id = response.base.id.clone();
+    let assertion_id = response.assertions.first().map(|a| a.id.clone());
+    let xml = response.to_xml_string()?;
+    sign_response_xml(
+        &xml,
+        signer,
+        cert_der_b64,
+        &response_id,
+        assertion_id.as_deref(),
+        sign_assertions,
+        sign_responses,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -805,5 +949,61 @@ mod tests {
             .unwrap()
             .in_response_to
             .is_none());
+    }
+
+    const RSA_SHA256_URI: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
+
+    #[test]
+    fn test_signature_template_contents() {
+        let tmpl = signature_template("_a1", "CERTB64", RSA_SHA256_URI);
+        // References the target id, advertises the requested SignatureMethod and
+        // SHA-256 digest, the enveloped + exc-c14n transforms, empty value
+        // placeholders to fill, and embeds the certificate.
+        assert!(tmpl.contains(r##"<ds:Reference URI="#_a1">"##));
+        assert!(tmpl.contains(&format!(
+            r#"<ds:SignatureMethod Algorithm="{RSA_SHA256_URI}"/>"#
+        )));
+        assert!(tmpl.contains("xmlenc#sha256"));
+        assert!(tmpl.contains("enveloped-signature"));
+        assert!(tmpl.contains("<ds:DigestValue/>"));
+        assert!(tmpl.contains("<ds:SignatureValue/>"));
+        assert!(tmpl.contains("<ds:X509Certificate>CERTB64</ds:X509Certificate>"));
+    }
+
+    #[test]
+    fn test_insert_signature_after_issuer_assertion() {
+        let xml = concat!(
+            r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" "#,
+            r#"xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_r1">"#,
+            "<saml:Issuer>idp</saml:Issuer><samlp:Status/>",
+            r#"<saml:Assertion ID="_a1"><saml:Issuer>idp</saml:Issuer>"#,
+            "<saml:Subject/></saml:Assertion></samlp:Response>",
+        );
+        let out = insert_signature_after_issuer(xml, "saml:Assertion", "<SIG/>").unwrap();
+        // The signature lands after the ASSERTION's Issuer (the second one) and
+        // before the Subject - schema-correct ordering, not as the first child.
+        assert!(out.contains(
+            r#"<saml:Assertion ID="_a1"><saml:Issuer>idp</saml:Issuer><SIG/><saml:Subject/>"#
+        ));
+        // The response-level Issuer is left untouched.
+        assert!(out.contains("<saml:Issuer>idp</saml:Issuer><samlp:Status/>"));
+    }
+
+    #[test]
+    fn test_insert_signature_after_issuer_response() {
+        let xml = concat!(
+            r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" "#,
+            r#"xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_r1">"#,
+            "<saml:Issuer>idp</saml:Issuer><samlp:Status/></samlp:Response>",
+        );
+        let out = insert_signature_after_issuer(xml, "samlp:Response", "<SIG/>").unwrap();
+        assert!(out.contains("<saml:Issuer>idp</saml:Issuer><SIG/><samlp:Status/>"));
+    }
+
+    #[test]
+    fn test_insert_signature_missing_element_errors() {
+        let xml = "<samlp:Response><saml:Issuer>idp</saml:Issuer></samlp:Response>";
+        let err = insert_signature_after_issuer(xml, "saml:Assertion", "<SIG/>").unwrap_err();
+        assert!(err.to_string().contains("cannot find <saml:Assertion>"));
     }
 }
