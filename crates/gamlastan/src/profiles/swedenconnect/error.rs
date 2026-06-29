@@ -31,6 +31,13 @@ pub enum SwedenConnectError {
     /// (section 6.3.1).
     InvalidResponseSignature(String),
 
+    /// A valid signature was present, but none of its verified XML-DSig
+    /// references covered the `<saml2p:Response>` that supplies the identity and
+    /// attributes consumed below. This is the XML Signature Wrapping defence: a
+    /// signature over a sibling object must not be treated as protecting the
+    /// consumed Response (section 6.1, 6.3.1).
+    SignatureNotBoundToResponse,
+
     /// The `<saml2p:Response>` carried no `<saml2:Issuer>` (section 6.1 — the
     /// response MUST contain an Issuer).
     MissingResponseIssuer,
@@ -151,6 +158,12 @@ impl std::fmt::Display for SwedenConnectError {
             }
             SwedenConnectError::InvalidResponseSignature(reason) => {
                 write!(f, "Response signature verification failed: {reason}")
+            }
+            SwedenConnectError::SignatureNotBoundToResponse => {
+                write!(
+                    f,
+                    "Response signature did not reference the consumed Response (XML Signature Wrapping)"
+                )
             }
             SwedenConnectError::MissingResponseIssuer => {
                 write!(f, "Response message is missing an Issuer (section 6.1)")

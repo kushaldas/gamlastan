@@ -286,9 +286,41 @@ async fn idp_sso(
     >(&doc)?;
     let authn_request = request_ref.to_owned();
 
-    // Process the AuthnRequest (validates and extracts parameters)
-    let processed = idp_profile::process_authn_request(&authn_request, None)
-        .map_err(|e| SamlActixError::Internal(format!("AuthnRequest processing failed: {e}")))?;
+    // Bind the request to trusted SP metadata before issuing anything. Passing
+    // `None` here (the old behaviour) made the core profile trust the
+    // request-supplied AssertionConsumerServiceURL, so any requester could have
+    // a signed assertion delivered to an ACS URL they control (CWE-346). Require
+    // the AuthnRequest issuer to resolve to trusted SP metadata — statically
+    // registered or fetched via the (MDQ-backed) resolver — and validate the ACS
+    // URL against it; fail closed when no metadata is available.
+    let issuer = authn_request.base.issuer.as_ref().map(|i| i.value.as_str());
+    let sp_sso = match issuer {
+        Some(id) => resolve_trusted_sp(&config, id).await,
+        None => None,
+    };
+    let sp_sso = sp_sso.ok_or_else(|| {
+        // Untrusted/unknown requester is an authorization failure on
+        // attacker-controllable request input, not a server misconfiguration:
+        // surface it as 403 rather than 500 so hostile traffic does not read as
+        // internal errors or leak configuration detail.
+        SamlActixError::Profile(gamlastan::profiles::ProfileError::AssertionValidation(
+            format!(
+                "AuthnRequest issuer {:?} is not a trusted SP; refusing to issue \
+                 (register it with IdpConfig::with_trusted_sp or configure an MDQ \
+                 resolver via IdpConfig::with_sp_resolver)",
+                issuer.unwrap_or("<missing>")
+            ),
+        ))
+    })?;
+
+    // Process the AuthnRequest (validates and extracts parameters). With trusted
+    // SP metadata, a request-supplied ACS URL not present in metadata is rejected.
+    // These are validation failures on attacker-controllable request input, so
+    // preserve the ProfileError mapping (HTTP 403) rather than turning a normal
+    // rejection into an Internal 500 (which is misleading and noisy under
+    // hostile traffic).
+    let processed = idp_profile::process_authn_request(&authn_request, Some(&sp_sso))
+        .map_err(SamlActixError::Profile)?;
 
     // Call the authentication callback
     let callback = authn_callback.ok_or_else(|| {
@@ -387,6 +419,21 @@ async fn idp_slo(
             logout::validate_logout_request(&logout_req, now, config.security.clock_skew_seconds)
                 .map_err(|e| SamlActixError::Internal(format!("invalid LogoutRequest: {e}")))?;
 
+            // Authorize the logout before mutating any session. SLO destroys
+            // sessions keyed by the request-supplied NameID, so an unauthenticated
+            // request lets anyone who guesses a NameID force-logout a victim
+            // (CWE-306/CWE-862). Require the LogoutRequest to be signed by a
+            // trusted SP, carry a trusted issuer, and (if present) target this
+            // IdP's SLO endpoint — unless the deployment authenticates the
+            // transport and explicitly opted in. Resolve the issuer's metadata
+            // (static registry or MDQ resolver) before the synchronous check.
+            let slo_issuer = logout_req.issuer.as_ref().map(|i| i.value.as_str());
+            let slo_sp = match slo_issuer {
+                Some(id) => resolve_trusted_sp(&config, id).await,
+                None => None,
+            };
+            authorize_slo_request(&config, &logout_req, xml_str, slo_sp.as_ref())?;
+
             // Propagate logout to session participants via the SessionStore
             if let Some(ref session_store) = config.session_store {
                 use gamlastan::core::assertion::name_id::NameIdOrEncryptedId;
@@ -469,6 +516,21 @@ async fn idp_artifact_resolve(
     >(&doc)?;
     let resolve = resolve_ref.to_owned();
 
+    // Authenticate the requester before consuming the one-time artifact. The
+    // ArtifactResolve/ArtifactResponse exchange is a mutually authenticated SOAP
+    // back-channel; without authentication anyone who obtains a live artifact can
+    // drain it (receiving the stored SAML message) or burn it to deny the
+    // legitimate resolver (CWE-306). Require a signature from a trusted SP whose
+    // issuer matches, unless the deployment authenticates the transport (mTLS)
+    // and explicitly opted in. Resolve the issuer's metadata (static registry or
+    // MDQ resolver) before the synchronous check.
+    let ar_issuer = resolve.issuer.as_ref().map(|i| i.value.as_str());
+    let ar_sp = match ar_issuer {
+        Some(id) => resolve_trusted_sp(&config, id).await,
+        None => None,
+    };
+    authorize_artifact_resolve(&config, &resolve, xml_str, ar_sp.as_ref())?;
+
     // Look up the artifact in the artifact store
     let response_xml = if let Some(ref artifact_store) = config.artifact_store {
         match artifact_store.resolve_and_consume(&resolve.artifact) {
@@ -522,6 +584,266 @@ async fn idp_artifact_resolve(
     Ok(HttpResponse::Ok()
         .content_type("text/xml; charset=utf-8")
         .body(soap_body))
+}
+
+/// Verify that an enveloped XML-DSig signature over `xml_str` was produced by a
+/// trusted Service Provider and is cryptographically bound to the message we
+/// parsed.
+///
+/// This is the shared signature gate for the IdP's back-channel/front-channel
+/// handlers (artifact resolution and Single Logout). It enforces three things:
+///
+/// 1. **Authentication** — the signature must verify against a key built from
+///    the *resolved* SP's signing certificates ([`IdpConfig::verifier_for`]).
+/// 2. **Integrity** — the signature must be `Valid`, not merely present.
+/// 3. **Binding** — a verified XML-DSig reference must target `expected_id`
+///    (the parsed message's `ID`) or the document root, so a valid signature
+///    over a *sibling* object cannot authorize this message (XML Signature
+///    Wrapping).
+///
+/// `sp` is the metadata resolved for the message's issuer (statically or via the
+/// MDQ-backed resolver). `what` is a short human label (e.g. `"LogoutRequest"`)
+/// used in error messages. Returns `Ok(())` when the message is authorized, or a
+/// 403-mapped [`SamlActixError::Profile`] describing why it was rejected — every
+/// rejection here is an unauthenticated/invalid request condition, so none of
+/// them is reported as a 500.
+///
+/// # Examples
+///
+/// ```ignore
+/// // Inside an IdP handler, after parsing the message and resolving its issuer:
+/// verify_sp_message_signature(&config, &sp, xml_str, &logout_req.id, "LogoutRequest")?;
+/// // ... only now is it safe to act on the request.
+/// ```
+fn verify_sp_message_signature(
+    config: &IdpConfig,
+    sp: &gamlastan::metadata::types::sp::SpSsoDescriptor,
+    xml_str: &str,
+    expected_id: &str,
+    what: &str,
+) -> Result<(), SamlActixError> {
+    // Missing signing material for an inbound request is an authentication
+    // failure on attacker-controllable traffic, not a server fault: map it to
+    // 403 (via ProfileError) rather than 500.
+    let verifier = config.verifier_for(sp).ok_or_else(|| {
+        SamlActixError::Profile(gamlastan::profiles::ProfileError::AssertionValidation(
+            format!(
+                "{what} issuer has no usable signing certificate in its metadata; \
+                 refusing unauthenticated request"
+            ),
+        ))
+    })?;
+
+    match verifier.verify_enveloped(xml_str) {
+        Ok(gamlastan::crypto::VerifyResult::Valid { references, .. }) => {
+            // Bind the signature to the parsed message: a verified reference must
+            // target the message root (empty URI) or its ID. This prevents a
+            // signature over a sibling object from authorizing this message.
+            let bound = references
+                .iter()
+                .any(|r| r.uri.is_empty() || r.uri.strip_prefix('#') == Some(expected_id));
+            if bound {
+                Ok(())
+            } else {
+                // Unbound-but-valid signature (XSW) is a request authentication
+                // failure → 403, not 500.
+                Err(SamlActixError::Profile(
+                    gamlastan::profiles::ProfileError::AssertionValidation(format!(
+                        "{what} signature did not reference the message (XML Signature Wrapping)"
+                    )),
+                ))
+            }
+        }
+        Ok(gamlastan::crypto::VerifyResult::Invalid { reason }) => Err(SamlActixError::Profile(
+            gamlastan::profiles::ProfileError::AssertionValidation(format!(
+                "{what} signature invalid: {reason}"
+            )),
+        )),
+        Err(e) => Err(SamlActixError::Profile(
+            gamlastan::profiles::ProfileError::AssertionValidation(format!(
+                "{what} signature verification failed: {e}"
+            )),
+        )),
+    }
+}
+
+/// Resolve trusted SP metadata for `entity_id`: the static
+/// [`IdpConfig::trusted_sps`] registry first, then the optional
+/// [`TrustedSpResolver`](crate::TrustedSpResolver) (e.g. an MDQ client).
+///
+/// Returns owned [`SpSsoDescriptor`] metadata so the caller can both validate a
+/// request-supplied ACS URL against it and build a verifier from its signing
+/// keys. `None` means the entityID is not trusted; the handler then fails closed.
+///
+/// This is the seam that lets a federation IdP with an MDQ setup — and no SPs
+/// registered statically — still operate: the resolver fetches and
+/// signature-verifies the SP's metadata on demand.
+///
+/// # Examples
+///
+/// ```ignore
+/// // In an IdP handler:
+/// let sp = match issuer {
+///     Some(id) => resolve_trusted_sp(&config, id).await,
+///     None => None,
+/// };
+/// ```
+async fn resolve_trusted_sp(
+    config: &IdpConfig,
+    entity_id: &str,
+) -> Option<gamlastan::metadata::types::sp::SpSsoDescriptor> {
+    if let Some(sp) = config.trusted_sp(entity_id) {
+        return Some(sp.clone());
+    }
+    if let Some(resolver) = &config.sp_resolver {
+        return resolver.resolve_sp(entity_id).await;
+    }
+    None
+}
+
+/// Authorize an incoming `LogoutRequest` before it is allowed to destroy any
+/// session (Single Logout).
+///
+/// SLO tears down sessions keyed by the request-supplied `NameID`, so an
+/// unauthenticated or unauthorized request would let anyone who can guess or
+/// observe a victim's `NameID` force-log-them-out (CWE-306 Missing
+/// Authentication, CWE-862 Missing Authorization). This function therefore
+/// gates the destructive path on three checks, performed *before* the session
+/// store is touched:
+///
+/// 1. the `Issuer` must resolve to trusted SP metadata (`sp`, resolved by the
+///    handler from the static registry or the MDQ resolver);
+/// 2. the `Destination`, when present, must address this IdP's SLO endpoint
+///    (`IdpConfig::slo_url`); and
+/// 3. the message must carry a valid signature from that SP, bound to the
+///    request (delegated to [`verify_sp_message_signature`]).
+///
+/// As an escape hatch, a deployment that authenticates the front channel at the
+/// transport layer may set [`IdpConfig::allow_unauthenticated_backchannel`], in
+/// which case the request is accepted without a message signature.
+///
+/// `sp` is the metadata resolved for `logout_req`'s issuer, or `None` if the
+/// issuer is unknown/untrusted. Returns `Ok(())` when the logout is authorized,
+/// otherwise a 403-mapped [`SamlActixError::Profile`] explaining the rejection
+/// (these are request authorization failures, not server faults).
+///
+/// # Examples
+///
+/// ```ignore
+/// // In the SLO handler, after structural validation and issuer resolution:
+/// authorize_slo_request(&config, &logout_req, xml_str, slo_sp.as_ref())?;
+/// // Safe to look up and destroy the principal's sessions now.
+/// ```
+fn authorize_slo_request(
+    config: &IdpConfig,
+    logout_req: &gamlastan::core::protocol::logout::LogoutRequest,
+    xml_str: &str,
+    sp: Option<&gamlastan::metadata::types::sp::SpSsoDescriptor>,
+) -> Result<(), SamlActixError> {
+    // Transport-authenticated deployments opt out of message-signature checks.
+    if config.allow_unauthenticated_backchannel {
+        return Ok(());
+    }
+
+    // The issuer must resolve to trusted SP metadata.
+    let issuer = logout_req.issuer.as_ref().map(|i| i.value.as_str());
+    // Untrusted/missing issuer and Destination mismatch are authorization
+    // failures on request input → 403 (via ProfileError), not 500.
+    let sp = match (issuer, sp) {
+        (Some(_), Some(sp)) => sp,
+        (Some(id), None) => {
+            return Err(SamlActixError::Profile(
+                gamlastan::profiles::ProfileError::AssertionValidation(format!(
+                    "LogoutRequest issuer {id:?} is not a trusted SP; refusing to destroy sessions"
+                )),
+            ))
+        }
+        (None, _) => {
+            return Err(SamlActixError::Profile(
+                gamlastan::profiles::ProfileError::AssertionValidation(
+                    "LogoutRequest has no Issuer; refusing to destroy sessions".into(),
+                ),
+            ))
+        }
+    };
+
+    // The Destination, when present, must address this IdP's SLO endpoint.
+    if let Some(dest) = logout_req.destination.as_deref() {
+        if !config.slo_url.is_empty() && dest != config.slo_url {
+            return Err(SamlActixError::Profile(
+                gamlastan::profiles::ProfileError::AssertionValidation(format!(
+                    "LogoutRequest Destination {dest:?} does not match this IdP's SLO endpoint"
+                )),
+            ));
+        }
+    }
+
+    verify_sp_message_signature(config, sp, xml_str, &logout_req.id, "LogoutRequest")
+}
+
+/// Authorize an incoming `ArtifactResolve` before the referenced artifact is
+/// looked up and consumed.
+///
+/// The SAML Artifact Resolution profile is a *mutually authenticated* SOAP
+/// back-channel: artifacts are one-time references to stored SAML messages, so
+/// an unauthenticated resolve endpoint lets anyone who obtains an artifact
+/// either drain it (receiving the stored message) or burn it to deny the
+/// legitimate resolver (CWE-306 Missing Authentication). Because the underlying
+/// store operation is destructive (resolve-and-consume), this function must run
+/// to completion *before* the store is queried.
+///
+/// It requires the `ArtifactResolve` `Issuer` to resolve to trusted SP metadata
+/// (`sp`, resolved by the handler from the static registry or the MDQ resolver)
+/// and the message to carry a valid, bound signature from that SP (delegated to
+/// [`verify_sp_message_signature`]). Deployments that authenticate the SOAP
+/// transport (e.g. mutual TLS) may instead set
+/// [`IdpConfig::allow_unauthenticated_backchannel`].
+///
+/// `sp` is the metadata resolved for `resolve`'s issuer, or `None` if the issuer
+/// is unknown/untrusted. Returns `Ok(())` when the requester is authorized,
+/// otherwise a 403-mapped [`SamlActixError::Profile`] describing the rejection
+/// (a requester-authentication failure, not a server fault).
+///
+/// # Examples
+///
+/// ```ignore
+/// // In the artifact-resolution handler, after parsing and issuer resolution:
+/// authorize_artifact_resolve(&config, &resolve, xml_str, ar_sp.as_ref())?;
+/// // Only now consume the one-time artifact from the store.
+/// ```
+fn authorize_artifact_resolve(
+    config: &IdpConfig,
+    resolve: &gamlastan::core::protocol::artifact::ArtifactResolve,
+    xml_str: &str,
+    sp: Option<&gamlastan::metadata::types::sp::SpSsoDescriptor>,
+) -> Result<(), SamlActixError> {
+    // Transport-authenticated deployments opt out of message-signature checks.
+    if config.allow_unauthenticated_backchannel {
+        return Ok(());
+    }
+
+    let issuer = resolve.issuer.as_ref().map(|i| i.value.as_str());
+    // Untrusted/missing requester is an authentication failure on
+    // attacker-controllable input → 403 (via ProfileError), not 500.
+    let sp = match (issuer, sp) {
+        (Some(_), Some(sp)) => sp,
+        (Some(id), None) => {
+            return Err(SamlActixError::Profile(
+                gamlastan::profiles::ProfileError::AssertionValidation(format!(
+                    "ArtifactResolve issuer {id:?} is not a trusted SP; refusing resolution"
+                )),
+            ))
+        }
+        (None, _) => {
+            return Err(SamlActixError::Profile(
+                gamlastan::profiles::ProfileError::AssertionValidation(
+                    "ArtifactResolve has no Issuer; refusing resolution".into(),
+                ),
+            ))
+        }
+    };
+
+    verify_sp_message_signature(config, sp, xml_str, &resolve.id, "ArtifactResolve")
 }
 
 /// IdP metadata handler: generate and return the IdP's SAML metadata.
@@ -643,6 +965,192 @@ async fn idp_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::config::TrustedSpResolver;
+    use gamlastan::core::assertion::issuer::Issuer;
+    use gamlastan::core::assertion::name_id::{NameId as CoreNameId, NameIdOrEncryptedId};
+    use gamlastan::core::identifiers::SamlVersion;
+    use gamlastan::core::protocol::artifact::ArtifactResolve;
+    use gamlastan::core::protocol::logout::LogoutRequest;
+    use gamlastan::metadata::types::role_descriptor::{RoleDescriptorBase, SsoDescriptorBase};
+    use gamlastan::metadata::types::sp::SpSsoDescriptor;
+
+    fn empty_sp_sso() -> SpSsoDescriptor {
+        SpSsoDescriptor {
+            sso_base: SsoDescriptorBase {
+                base: RoleDescriptorBase::new(vec![
+                    "urn:oasis:names:tc:SAML:2.0:protocol".to_string()
+                ]),
+                artifact_resolution_services: vec![],
+                single_logout_services: vec![],
+                manage_name_id_services: vec![],
+                name_id_formats: vec![],
+            },
+            authn_requests_signed: None,
+            want_assertions_signed: Some(true),
+            assertion_consumer_services: vec![],
+            attribute_consuming_services: vec![],
+        }
+    }
+
+    fn logout_request(issuer: Option<&str>) -> LogoutRequest {
+        LogoutRequest {
+            id: "_lr_1".to_string(),
+            version: SamlVersion::V2_0,
+            issue_instant: Utc::now(),
+            destination: None,
+            consent: None,
+            issuer: issuer.map(Issuer::entity),
+            has_signature: false,
+            not_on_or_after: None,
+            reason: None,
+            name_id: NameIdOrEncryptedId::NameId(CoreNameId {
+                value: "victim@example.com".to_string(),
+                format: None,
+                name_qualifier: None,
+                sp_name_qualifier: None,
+                sp_provided_id: None,
+            }),
+            session_indexes: vec![],
+        }
+    }
+
+    #[test]
+    fn test_slo_rejected_when_no_trusted_sps() {
+        // Finding #13 regression: the ready SLO handler must fail closed when no
+        // trusted SP is configured — an unsigned/issuerless LogoutRequest cannot
+        // be allowed to destroy sessions. (The handler resolves no SP, so `None`.)
+        let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso");
+        let req = logout_request(Some("https://sp.example.com"));
+        assert!(authorize_slo_request(&config, &req, "<LogoutRequest/>", None).is_err());
+
+        let req_no_issuer = logout_request(None);
+        assert!(authorize_slo_request(&config, &req_no_issuer, "<LogoutRequest/>", None).is_err());
+    }
+
+    #[test]
+    fn test_slo_rejected_for_untrusted_issuer() {
+        // Finding #13 regression: an issuer that is not a configured trusted SP
+        // resolves to no metadata (`None`) and is rejected.
+        let sp = empty_sp_sso();
+        let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
+            .with_trusted_sp("https://good-sp.example.com", sp);
+        let req = logout_request(Some("https://evil-sp.example.com"));
+        // `resolve_trusted_sp` would return None for the untrusted issuer.
+        assert!(authorize_slo_request(&config, &req, "<LogoutRequest/>", None).is_err());
+    }
+
+    #[test]
+    fn test_authz_failures_map_to_forbidden_not_internal_error() {
+        // PR #20 review: untrusted/missing issuer and other request-input
+        // authorization failures must surface as 403, not 500 — a 500 makes the
+        // endpoint look broken under attack and risks leaking detail in noisy
+        // error logs. They go through ProfileError, which maps to FORBIDDEN.
+        use actix_web::http::StatusCode;
+        use actix_web::ResponseError;
+
+        let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso");
+
+        let slo_err = authorize_slo_request(
+            &config,
+            &logout_request(Some("https://sp.example.com")),
+            "<LogoutRequest/>",
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(slo_err.status_code(), StatusCode::FORBIDDEN);
+
+        let slo_no_issuer_err =
+            authorize_slo_request(&config, &logout_request(None), "<LogoutRequest/>", None)
+                .unwrap_err();
+        assert_eq!(slo_no_issuer_err.status_code(), StatusCode::FORBIDDEN);
+
+        let resolve = ArtifactResolve {
+            id: "_ar_1".to_string(),
+            version: SamlVersion::V2_0,
+            issue_instant: Utc::now(),
+            destination: None,
+            consent: None,
+            issuer: Some(Issuer::entity("https://sp.example.com")),
+            has_signature: false,
+            artifact: "AAQAAD...".to_string(),
+        };
+        let ar_err =
+            authorize_artifact_resolve(&config, &resolve, "<ArtifactResolve/>", None).unwrap_err();
+        assert_eq!(ar_err.status_code(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_artifact_resolve_rejected_when_no_trusted_sps() {
+        // Finding #5 regression: artifact resolution must fail closed without a
+        // way to authenticate the requester.
+        let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso");
+        let resolve = ArtifactResolve {
+            id: "_ar_1".to_string(),
+            version: SamlVersion::V2_0,
+            issue_instant: Utc::now(),
+            destination: None,
+            consent: None,
+            issuer: Some(Issuer::entity("https://sp.example.com")),
+            has_signature: false,
+            artifact: "AAQAAD...".to_string(),
+        };
+        assert!(authorize_artifact_resolve(&config, &resolve, "<ArtifactResolve/>", None).is_err());
+    }
+
+    #[test]
+    fn test_backchannel_opt_in_allows_unauthenticated() {
+        // The explicit transport-auth opt-in (mTLS deployments) bypasses the
+        // message-signature requirement.
+        let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
+            .allow_unauthenticated_backchannel(true);
+        let req = logout_request(Some("https://sp.example.com"));
+        assert!(authorize_slo_request(&config, &req, "<LogoutRequest/>", None).is_ok());
+    }
+
+    #[actix_web::test]
+    async fn test_resolve_trusted_sp_uses_static_then_resolver() {
+        // Federation/MDQ support: an SP not in the static registry is resolved
+        // via the dynamic resolver, so the handlers do not fail closed when an
+        // MDQ-backed resolver is configured.
+        struct StubResolver;
+        impl TrustedSpResolver for StubResolver {
+            fn resolve_sp<'a>(&'a self, entity_id: &'a str) -> crate::config::ResolveSpFuture<'a> {
+                Box::pin(
+                    async move { (entity_id == "https://mdq-sp.example.com").then(empty_sp_sso) },
+                )
+            }
+        }
+
+        // No static SPs, no resolver -> unknown issuer is unresolved.
+        let bare = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso");
+        assert!(resolve_trusted_sp(&bare, "https://mdq-sp.example.com")
+            .await
+            .is_none());
+
+        // With an MDQ-style resolver, the SP is resolved dynamically.
+        let federated = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
+            .with_sp_resolver(std::sync::Arc::new(StubResolver));
+        assert!(resolve_trusted_sp(&federated, "https://mdq-sp.example.com")
+            .await
+            .is_some());
+        assert!(
+            resolve_trusted_sp(&federated, "https://unknown.example.com")
+                .await
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_trusted_sp_lookup() {
+        // Finding #4 support: the SSO handler binds the request issuer to trusted
+        // SP metadata; lookups must only succeed for registered entityIDs.
+        let sp = empty_sp_sso();
+        let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
+            .with_trusted_sp("https://sp.example.com", sp);
+        assert!(config.trusted_sp("https://sp.example.com").is_some());
+        assert!(config.trusted_sp("https://other.example.com").is_none());
+    }
 
     #[test]
     fn test_authn_callback_result_debug() {

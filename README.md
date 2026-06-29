@@ -65,6 +65,15 @@ at the metadata/constant and `SubjectConfirmation`-method level; the mutual-TLS
 transport requirement is a deployment concern outside the library. The DSS/SAP
 `SignRequest`/`SignResponse` envelope and SAD verification are out of scope.
 
+## Security
+
+gamlastan is built to fail closed against the SAML attack classes catalogued in
+[`samlattacks.md`](samlattacks.md). The enforced controls — signature binding
+against XML Signature Wrapping, request correlation, ready-handler trust
+boundaries, and fail-closed key extraction and input validation — are documented
+in [`docs/security-hardening.md`](docs/security-hardening.md), with the rationale
+for each decision captured in the [Architecture Decision Records](docs/adr/).
+
 ## License
 
 BSD-2-Clause

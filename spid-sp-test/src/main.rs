@@ -437,6 +437,58 @@ const SPID_VALID_ACRS: &[&str] = &[
 ];
 
 /// Handle SAML Response from IdP (HTTP-POST binding).
+/// Returns `true` when the cryptographically verified XML-DSig reference IDs
+/// cover `assertion_id`, i.e. the signature is bound to this exact assertion.
+///
+/// This is the XML Signature Wrapping (XSW) defence used by [`sp_acs`]: a
+/// SAMLResponse may legitimately verify against a trusted IdP key while the
+/// signature actually protects a *different* object (a sibling assertion, or the
+/// response envelope). Before reading identity or attributes from an assertion,
+/// the ACS must confirm the verified reference targets that assertion's `ID`.
+///
+/// `verified_signed_ids` is the list of reference targets (without the leading
+/// `#`) returned by [`gamlastan::crypto::VerifyResult::Valid`]; `assertion_id`
+/// is the `ID` attribute of the assertion about to be consumed.
+///
+/// # Examples
+///
+/// ```ignore
+/// // The verifier reported that "_assertion-1" was signed.
+/// let signed = vec!["_assertion-1".to_string()];
+/// assert!(assertion_signature_is_bound(&signed, "_assertion-1"));
+///
+/// // A signature over a sibling object does not protect "_assertion-1".
+/// let sibling = vec!["_response-envelope".to_string()];
+/// assert!(!assertion_signature_is_bound(&sibling, "_assertion-1"));
+/// ```
+fn assertion_signature_is_bound(verified_signed_ids: &[String], assertion_id: &str) -> bool {
+    verified_signed_ids.iter().any(|id| id == assertion_id)
+}
+
+/// Returns the first Assertion `ID` that occurs more than once in `assertions`,
+/// or `None` when every ID is unique.
+///
+/// The assertion-signature binding ([`assertion_signature_is_bound`]) matches an
+/// assertion's `ID` against the set of cryptographically verified reference IDs.
+/// If two assertions share an `ID`, a single valid signature over one would make
+/// the other — e.g. an attacker-injected sibling whose own `<ds:Signature>` is
+/// invalid or absent — appear "bound" as well, reintroducing XML Signature
+/// Wrapping confusion. SAML `ID`s must be document-unique, so a duplicate is
+/// rejected before the binding check runs.
+fn first_duplicate_assertion_id(
+    assertions: &[gamlastan::core::assertion::types::Assertion],
+) -> Option<&str> {
+    let mut seen = std::collections::HashSet::new();
+    for assertion in assertions {
+        if !seen.insert(assertion.id.as_str()) {
+            return Some(assertion.id.as_str());
+        }
+    }
+    None
+}
+
+/// SPID Assertion Consumer Service (ACS) endpoint: validate and consume a
+/// SAMLResponse posted by the IdP after authentication.
 ///
 /// This handler performs full SPID-compliant validation:
 /// 1. Base64 decode the SAMLResponse
@@ -445,6 +497,10 @@ const SPID_VALID_ACRS: &[&str] = &[
 /// 4. Run SPID-specific structural checks
 /// 5. Run the 32-check assertion validation
 /// 6. Return HTTP 200 for valid responses, HTTP 400/403/500 for invalid
+///
+/// Signature verification keeps the verified XML-DSig reference IDs and binds
+/// them to the consumed assertion via [`assertion_signature_is_bound`], so a
+/// valid signature over a sibling object cannot authorize a wrapped assertion.
 async fn sp_acs(state: web::Data<AppState>, form: web::Form<AcsForm>) -> HttpResponse {
     info!("ACS: received SAML Response");
 
@@ -486,20 +542,55 @@ async fn sp_acs(state: web::Data<AppState>, form: web::Form<AcsForm>) -> HttpRes
     // ── Step 3: Verify signatures ──────────────────────────────────────
     // We verify signatures on the raw XML before parsing into typed structs.
     // This catches wrong certs, missing signatures, XSW attacks, etc.
-    let sig_verified = match state.idp_verifier.verify_enveloped(&xml_str) {
-        Ok(result) => {
-            if result.is_valid() {
+    //
+    // A SPID Response is signed in TWO places: the Response element AND the
+    // Assertion (the Response signature appears first in document order). A
+    // single-signature verify only reports the first one (the Response), so the
+    // assertion's own signature would never be seen and the per-assertion binding
+    // below would reject every legitimately signed assertion. `verify_all_enveloped`
+    // verifies every <Signature> independently; we collect the reference targets
+    // from each VALID signature.
+    //
+    // Collect the IDs the signatures actually covered (from the verified XML-DSig
+    // references) rather than collapsing verification to a boolean. The consumed
+    // assertion is later required to be among these IDs, which defeats XML
+    // Signature Wrapping: a valid signature over a *sibling* object no longer
+    // counts as protecting the assertion whose identity/attributes we read.
+    //
+    // `sig_verified` tracks whether ANY signature returned `Valid`, independent
+    // of `verified_signed_ids` (which only collects `#`-prefixed targets): a valid
+    // signature over the document root or one referencing only the Response ID
+    // must not be misreported as "no valid signature". XSW protection does not
+    // depend on this flag — the per-assertion binding check requires the consumed
+    // assertion's ID to be among the verified references regardless.
+    let mut sig_verified = false;
+    let mut verified_signed_ids: Vec<String> = Vec::new();
+    match state.idp_verifier.verify_all_enveloped(&xml_str) {
+        Ok(results) => {
+            for result in results {
+                match result {
+                    gamlastan::crypto::VerifyResult::Valid { references, .. } => {
+                        sig_verified = true;
+                        for r in &references {
+                            if let Some(id) = r.uri.strip_prefix('#') {
+                                if !verified_signed_ids.iter().any(|e| e == id) {
+                                    verified_signed_ids.push(id.to_string());
+                                }
+                            }
+                        }
+                    }
+                    gamlastan::crypto::VerifyResult::Invalid { reason } => {
+                        log::warn!("ACS: a signature failed verification: {reason}");
+                    }
+                }
+            }
+            if sig_verified {
                 info!("ACS: Signature verification succeeded");
-                true
-            } else {
-                log::warn!("ACS: Signature verification failed: invalid signature");
-                false
             }
         }
         Err(e) => {
-            // ds:Object rejection (E91) or other crypto errors
+            // ds:Object rejection (E91), no <Signature> present, or crypto error.
             log::warn!("ACS: Signature verification error: {e}");
-            false
         }
     };
 
@@ -681,12 +772,33 @@ async fn sp_acs(state: web::Data<AppState>, form: web::Form<AcsForm>) -> HttpRes
         log::warn!("ACS: No assertions in response");
         return HttpResponse::BadRequest().body("No assertions in response");
     }
+
+    // Reject duplicate Assertion IDs before the binding check: a shared ID would
+    // let one valid signature "bind" an attacker-injected sibling assertion
+    // (XML Signature Wrapping). See first_duplicate_assertion_id.
+    if let Some(dup) = first_duplicate_assertion_id(&response.assertions) {
+        log::warn!("ACS: duplicate Assertion ID '{dup}' (XML Signature Wrapping)");
+        return HttpResponse::Forbidden().body("Duplicate Assertion ID");
+    }
+
     // SPID mandates that the Assertion itself MUST always be signed.
     // A signed Response alone is NOT sufficient (test [3]).
+    //
+    // Bind the cryptographic signature to the consumed assertion: it is not
+    // enough that the assertion *carries* a <ds:Signature> (parser markup) and
+    // that *some* signature in the document verified. The verified XML-DSig
+    // reference must target this exact assertion's ID, otherwise a signature over
+    // a sibling assertion/response (XML Signature Wrapping) would be accepted.
     for (idx, assertion) in response.assertions.iter().enumerate() {
         if !assertion.has_signature {
             log::warn!("ACS: Assertion[{idx}] is not signed (SPID requires signed assertions)");
             return HttpResponse::Forbidden().body("Assertion must be signed");
+        }
+        if !assertion_signature_is_bound(&verified_signed_ids, &assertion.id) {
+            log::warn!(
+                "ACS: Assertion[{idx}] signature is not bound to the assertion (XML Signature Wrapping)"
+            );
+            return HttpResponse::Forbidden().body("Assertion signature not bound to assertion");
         }
     }
 
@@ -1557,5 +1669,35 @@ mod tests {
             &state.security_config,
             &response,
         ));
+    }
+
+    #[test]
+    fn test_first_duplicate_assertion_id() {
+        let mut a = replay_test_response().assertions;
+        // Unique IDs -> None.
+        assert_eq!(first_duplicate_assertion_id(&a), None);
+
+        // Two assertions sharing an ID -> the duplicate is reported, so the ACS
+        // rejects before the binding check (XSW via duplicated ID).
+        let mut dup = a[0].clone();
+        dup.id = a[0].id.clone();
+        a.push(dup);
+        assert_eq!(first_duplicate_assertion_id(&a), Some(a[0].id.as_str()));
+    }
+
+    #[test]
+    fn test_assertion_signature_binding() {
+        // Finding #6 regression: the consumed assertion ID must be among the
+        // verified signed reference IDs.
+        let signed = vec!["_assertion-1".to_string(), "_response-1".to_string()];
+        assert!(assertion_signature_is_bound(&signed, "_assertion-1"));
+
+        // A signature that only covered a sibling object (e.g. the response
+        // envelope or another assertion) must NOT bind the consumed assertion.
+        let sibling_only = vec!["_response-1".to_string()];
+        assert!(!assertion_signature_is_bound(&sibling_only, "_assertion-1"));
+
+        // No verified references at all (collapsed/absent signature) is unbound.
+        assert!(!assertion_signature_is_bound(&[], "_assertion-1"));
     }
 }

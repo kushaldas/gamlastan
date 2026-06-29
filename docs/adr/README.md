@@ -36,3 +36,8 @@ rewriting history (mark the old one `Superseded by NNNN`).
 | [0025](0025-separate-authn-instant-from-issue-instant.md) | Separate the authentication instant from the issue instant in response construction | Accepted |
 | [0026](0026-runtime-owned-entity-category-policies.md) | Runtime, owned entity-category rules and policies | Accepted |
 | [0027](0027-registration-authority-attribute-release.md) | Registration-authority-based attribute-release policy selection | Accepted |
+| [0028](0028-signature-binding-to-consumed-object.md) | Signature verification binds to the consumed SAML object | Accepted |
+| [0029](0029-solicited-responses-require-inresponseto.md) | Solicited responses require a present, matching InResponseTo | Accepted |
+| [0030](0030-ready-idp-handlers-require-sp-trust.md) | Ready-made IdP handlers require SP trust and fail closed | Accepted |
+| [0031](0031-fail-closed-input-and-key-extraction.md) | Fail-closed metadata key extraction and input validation | Accepted |
+| [0032](0032-attribute-release-keys-on-trusted-name.md) | Attribute release matches on trusted Name, never SP FriendlyName | Accepted |

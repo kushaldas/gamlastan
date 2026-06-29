@@ -227,10 +227,21 @@ impl<'a> AssertionValidator<'a> {
                 // Unsolicited response with no InResponseTo - OK
                 result.add(ValidationCheck::pass(3, "InResponseTo matches"));
             }
-            (Some(_), None) => {
-                // Response has InResponseTo but we have no expected ID
-                // This is acceptable for unsolicited responses that include it
-                result.add(ValidationCheck::pass(3, "InResponseTo matches"));
+            (Some(irt), None) => {
+                // The response claims to answer a request (it carries
+                // InResponseTo) but no outstanding request was found — either the
+                // tracker had no such ID, or it expired/was already consumed. A
+                // genuinely IdP-initiated (unsolicited) response MUST NOT carry
+                // InResponseTo, so a dangling value signals a stale, replayed, or
+                // misdirected response. Fail closed rather than silently treating
+                // it as unsolicited (CWE-345 / session fixation).
+                result.add(ValidationCheck::fail(
+                    3,
+                    "InResponseTo matches",
+                    format!(
+                        "Response carries InResponseTo='{irt}' but no matching outstanding request"
+                    ),
+                ));
             }
             (None, Some(expected)) => {
                 result.add(ValidationCheck::fail(
@@ -272,14 +283,28 @@ impl<'a> AssertionValidator<'a> {
             result.add(ValidationCheck::pass(4, "Response signature valid"));
         }
 
-        // Also check response signature for ds:Object (E91)
+        // Also check response signature for ds:Object (E91). Fail closed: a
+        // signature fragment that cannot be parsed for this check must be
+        // rejected, not waved through as "no ds:Object found" (CWE-693).
         if let Some(sig_xml) = params.response_signature_xml {
-            if self.config.reject_signatures_with_ds_object && contains_ds_object(sig_xml) {
-                result.add(ValidationCheck::fail(
-                    7,
-                    "No ds:Object in signature",
-                    "Response signature contains ds:Object (E91)",
-                ));
+            if self.config.reject_signatures_with_ds_object {
+                match contains_ds_object(sig_xml) {
+                    Ok(true) => {
+                        result.add(ValidationCheck::fail(
+                            7,
+                            "No ds:Object in signature",
+                            "Response signature contains ds:Object (E91)",
+                        ));
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        result.add(ValidationCheck::fail(
+                            7,
+                            "No ds:Object in signature",
+                            format!("Could not parse response signature for E91 check: {e}"),
+                        ));
+                    }
+                }
             }
         }
     }
@@ -402,7 +427,21 @@ impl<'a> AssertionValidator<'a> {
             }
 
             // Check 11: AudienceRestriction (E46)
-            if evaluate_audience_restrictions(
+            //
+            // For SP-side Web Browser SSO validation an assertion MUST be
+            // audience-bound to this SP. The generic E46 helper treats an empty
+            // restriction list as "unconstrained" (returns true); accepting that
+            // here let an assertion with `<Conditions>` but no
+            // `<AudienceRestriction>` pass as if it were scoped to us. Fail
+            // closed when no restriction is present so a stolen/misissued
+            // assertion cannot be replayed against an arbitrary SP (CWE-345).
+            if conditions.audience_restrictions.is_empty() {
+                result.add(ValidationCheck::fail(
+                    11,
+                    "AudienceRestriction satisfied",
+                    "Assertion Conditions carry no AudienceRestriction binding this SP",
+                ));
+            } else if evaluate_audience_restrictions(
                 &conditions.audience_restrictions,
                 params.sp_entity_id,
             ) {
@@ -583,11 +622,17 @@ impl<'a> AssertionValidator<'a> {
                     "SubjectConfirmation InResponseTo",
                 ));
             }
-            (Some(_), None) => {
-                // Has InResponseTo but no expected ID (unsolicited context)
-                result.add(ValidationCheck::pass(
+            (Some(irt), None) => {
+                // Dangling InResponseTo on the bearer SubjectConfirmationData: it
+                // claims to answer a request we are not tracking. Same rationale
+                // as response check 3 — fail closed instead of treating it as an
+                // unsolicited context (CWE-345 / session fixation).
+                result.add(ValidationCheck::fail(
                     17,
                     "SubjectConfirmation InResponseTo",
+                    format!(
+                        "SubjectConfirmation carries InResponseTo='{irt}' but no matching outstanding request"
+                    ),
                 ));
             }
             (None, Some(expected)) => {
@@ -1188,6 +1233,60 @@ mod tests {
         let result = validator.validate_response(&response, &params);
         let failures = result.failures();
         assert!(failures.iter().any(|c| c.check_number == 3));
+    }
+
+    #[test]
+    fn test_dangling_in_response_to_rejected() {
+        // Finding #9 regression: a response that carries InResponseTo but for
+        // which we have no outstanding request (tracker miss / expired) must NOT
+        // be accepted as an unsolicited response.
+        let now = Utc::now();
+        let config = SecurityConfig {
+            require_signed_assertions: false,
+            ..SecurityConfig::default()
+        };
+        let validator = AssertionValidator::new(&config);
+        let response = make_valid_response(now); // base.in_response_to = Some(...)
+        let params = ValidationParams {
+            expected_request_id: None, // tracker found no matching request
+            ..make_params(now)
+        };
+
+        let result = validator.validate_response(&response, &params);
+        let failures = result.failures();
+        // Check 3 (response) and/or check 17 (SubjectConfirmation) must fail.
+        assert!(
+            failures
+                .iter()
+                .any(|c| c.check_number == 3 || c.check_number == 17),
+            "expected dangling InResponseTo to fail; failures: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn test_conditions_without_audience_restriction_rejected() {
+        // Finding #15 regression: Conditions present but with no
+        // AudienceRestriction must fail check 11 (fail closed for SP validation).
+        let now = Utc::now();
+        let config = SecurityConfig {
+            require_signed_assertions: false,
+            ..SecurityConfig::default()
+        };
+        let validator = AssertionValidator::new(&config);
+        let mut response = make_valid_response(now);
+        response.assertions[0]
+            .conditions
+            .as_mut()
+            .unwrap()
+            .audience_restrictions = vec![];
+        let params = make_params(now);
+
+        let result = validator.validate_response(&response, &params);
+        let failures = result.failures();
+        assert!(
+            failures.iter().any(|c| c.check_number == 11),
+            "expected empty AudienceRestriction to fail check 11; failures: {failures:?}"
+        );
     }
 
     #[test]

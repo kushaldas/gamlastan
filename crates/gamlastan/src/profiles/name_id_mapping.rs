@@ -44,18 +44,42 @@ pub fn create_name_id_mapping_request(
     }
 }
 
-/// Process a NameIDMappingResponse.
+/// Process a solicited `NameIDMappingResponse` and return the mapped `NameID`.
 ///
-/// Returns the mapped NameID on success.
+/// `expected_request_id` is the `ID` of the `NameIDMappingRequest` this response
+/// answers. The mapping result is returned only when the response's
+/// `InResponseTo` is **present and equal** to `expected_request_id` (a missing
+/// value is rejected so a replaying peer cannot supply a mapping for the wrong
+/// transaction — CWE-345) and its `Status` is success.
+///
+/// Returns the mapped identifier on success, or
+/// [`ProfileError::NameIdMappingFailed`] for a missing/mismatched `InResponseTo`
+/// or a non-success status, and [`ProfileError::MappingResponseMissingNameId`]
+/// if a successful response carried no identifier.
+///
+/// # Examples
+///
+/// ```ignore
+/// // After sending a NameIDMappingRequest with id `req_id`:
+/// let mapped = process_name_id_mapping_response(&response, &req_id)?;
+/// ```
 pub fn process_name_id_mapping_response(
     response: &NameIdMappingResponse,
     expected_request_id: &str,
 ) -> Result<NameIdOrEncryptedId, ProfileError> {
-    // Verify InResponseTo
-    if let Some(irt) = &response.in_response_to {
-        if irt != expected_request_id {
+    // Verify InResponseTo. This is a solicited response, so a missing
+    // InResponseTo must fail closed rather than skip correlation (CWE-345):
+    // require it present and equal to the request this answers.
+    match &response.in_response_to {
+        Some(irt) if irt == expected_request_id => {}
+        Some(irt) => {
             return Err(ProfileError::NameIdMappingFailed(format!(
                 "InResponseTo mismatch: expected {expected_request_id}, got {irt}"
+            )));
+        }
+        None => {
+            return Err(ProfileError::NameIdMappingFailed(format!(
+                "NameIDMappingResponse is missing InResponseTo (expected {expected_request_id})"
             )));
         }
     }
@@ -149,6 +173,26 @@ mod tests {
             }
             _ => panic!("expected NameId"),
         }
+    }
+
+    #[test]
+    fn test_process_name_id_mapping_response_missing_irt_rejected() {
+        // Finding #12 regression: a successful response with no InResponseTo must
+        // not return the mapped NameID for a solicited request.
+        let mapped = NameIdOrEncryptedId::NameId(NameId {
+            value: "mapped-persistent-id".to_string(),
+            format: Some(constants::NAMEID_PERSISTENT.to_string()),
+            name_qualifier: None,
+            sp_name_qualifier: None,
+            sp_provided_id: None,
+        });
+        let mut response =
+            create_name_id_mapping_response("https://idp.example.com", "_req123", mapped);
+        response.in_response_to = None;
+        assert!(matches!(
+            process_name_id_mapping_response(&response, "_req123"),
+            Err(ProfileError::NameIdMappingFailed(_))
+        ));
     }
 
     #[test]

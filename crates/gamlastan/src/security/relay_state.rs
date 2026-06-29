@@ -13,9 +13,11 @@ pub const MAX_RELAY_STATE_BYTES: usize = 80;
 ///
 /// Per E90: sanitize for XSS/CSRF attacks. Checks:
 /// 1. Length <= 80 bytes
-/// 2. No dangerous URI schemes (javascript:, data:, vbscript:)
-/// 3. No HTML tags
-/// 4. No null bytes
+/// 2. No null bytes
+/// 3. No control characters (C0/C1, TAB/CR/LF, DEL)
+/// 4. No dangerous URI schemes (javascript:, data:, vbscript:), matched after
+///    trimming surrounding whitespace
+/// 5. No HTML angle brackets
 ///
 /// Returns `Ok(())` if the RelayState is safe, or an error description.
 pub fn validate_relay_state(relay_state: &str) -> Result<(), String> {
@@ -33,29 +35,45 @@ pub fn validate_relay_state(relay_state: &str) -> Result<(), String> {
 
 /// Validate RelayState content for potentially dangerous patterns (E90).
 ///
+/// Rejects, in order: null bytes; any control character (C0/C1, including
+/// TAB/CR/LF and DEL); a dangerous URI scheme (`javascript:`, `data:`,
+/// `vbscript:`) matched case-insensitively *after* trimming surrounding
+/// whitespace, so a leading space cannot bypass the prefix check; and HTML
+/// angle brackets. Rejecting control characters and trimming before the scheme
+/// check close obfuscation vectors such as `java\tscript:` and ` javascript:`.
+///
 /// Does not check length (use `validate_relay_state` for full validation).
 pub fn validate_relay_state_content(relay_state: &str) -> Result<(), String> {
-    let lower = relay_state.to_lowercase();
-
-    // Reject dangerous URI schemes
-    if lower.starts_with("javascript:") {
-        return Err("RelayState contains javascript: URI scheme".to_string());
-    }
-    if lower.starts_with("data:") {
-        return Err("RelayState contains data: URI scheme".to_string());
-    }
-    if lower.starts_with("vbscript:") {
-        return Err("RelayState contains vbscript: URI scheme".to_string());
-    }
-
-    // Reject HTML tags
-    if relay_state.contains('<') || relay_state.contains('>') {
-        return Err("RelayState contains HTML angle brackets".to_string());
-    }
-
-    // Reject null bytes
+    // Reject null bytes (kept as a distinct message for clarity).
     if relay_state.contains('\0') {
         return Err("RelayState contains null bytes".to_string());
+    }
+
+    // Reject ALL control characters (C0/C1, including TAB/CR/LF and DEL). Besides
+    // being illegitimate in a RelayState, they are used to smuggle dangerous URI
+    // schemes past a naive prefix check, e.g. "java\tscript:alert(1)" which some
+    // browsers normalize back to "javascript:". Rejecting them outright closes
+    // that obfuscation vector before scheme parsing.
+    if relay_state.chars().any(char::is_control) {
+        return Err("RelayState contains control characters".to_string());
+    }
+
+    // Normalize surrounding ASCII whitespace before scheme parsing: a leading
+    // space (" javascript:...") is otherwise missed by `starts_with` even though
+    // URL parsers and browsers ignore it.
+    let normalized = relay_state.trim();
+    let lower = normalized.to_ascii_lowercase();
+
+    // Reject dangerous URI schemes.
+    for scheme in ["javascript:", "data:", "vbscript:"] {
+        if lower.starts_with(scheme) {
+            return Err(format!("RelayState contains {scheme} URI scheme"));
+        }
+    }
+
+    // Reject HTML tags.
+    if relay_state.contains('<') || relay_state.contains('>') {
+        return Err("RelayState contains HTML angle brackets".to_string());
     }
 
     Ok(())
@@ -126,6 +144,29 @@ mod tests {
         let result = validate_relay_state("abc\0def");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("null bytes"));
+    }
+
+    #[test]
+    fn test_relay_state_leading_whitespace_scheme() {
+        // Finding #14 regression: a leading space must not let a dangerous scheme
+        // slip past the prefix check.
+        assert!(validate_relay_state(" javascript:alert(1)").is_err());
+        assert!(validate_relay_state("\tjavascript:alert(1)").is_err());
+    }
+
+    #[test]
+    fn test_relay_state_embedded_control_char_scheme() {
+        // Finding #14 regression: a control char embedded in the scheme (which
+        // browsers may strip) must be rejected.
+        assert!(validate_relay_state("java\tscript:alert(1)").is_err());
+        assert!(validate_relay_state("java\u{0001}script:alert(1)").is_err());
+    }
+
+    #[test]
+    fn test_relay_state_control_chars_rejected() {
+        assert!(validate_relay_state("abc\rdef").is_err());
+        assert!(validate_relay_state("abc\ndef").is_err());
+        assert!(validate_relay_state("abc\u{007f}def").is_err());
     }
 
     #[test]

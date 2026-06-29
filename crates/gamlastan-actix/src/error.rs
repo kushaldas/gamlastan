@@ -90,6 +90,15 @@ mod tests {
             SamlActixError::Internal("test".to_string()).status_code(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
+        // Profile-level errors are request authentication/validation failures
+        // (e.g. an AuthnRequest ACS URL not in trusted metadata) and must map to
+        // 403, not 500 -- attacker-controlled input must not surface as an
+        // internal server error.
+        assert_eq!(
+            SamlActixError::Profile(gamlastan::profiles::ProfileError::AcsUrlMismatch)
+                .status_code(),
+            StatusCode::FORBIDDEN
+        );
     }
 
     #[test]

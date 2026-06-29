@@ -35,19 +35,54 @@ pub fn create_artifact_resolve(
     }
 }
 
-/// Process an ArtifactResponse.
+/// Process a solicited `ArtifactResponse` and return the embedded SAML message
+/// bytes on success.
 ///
-/// Validates the response status and returns the contained SAML message bytes.
+/// This is a *solicited* exchange: `expected_request_id` is the `ID` of the
+/// [`ArtifactResolve`] the caller sent. The response is accepted only when:
+///
+/// 1. its `InResponseTo` is **present and equal** to `expected_request_id` — a
+///    missing `InResponseTo` is rejected, since absence would let a replayed or
+///    substituted response be accepted (CWE-294); and
+/// 2. its `Status` is success.
+///
+/// On success returns `Ok(Some(bytes))` with the resolved SAML message (or
+/// `Ok(None)` if the peer returned success with no message). Returns
+/// [`ProfileError::ArtifactResolutionFailed`] for a missing/mismatched
+/// `InResponseTo`, and [`ProfileError::ArtifactResponseFailure`] for a
+/// non-success status.
+///
+/// Note that this helper only checks correlation and status; the SOAP transport
+/// is expected to be mutually authenticated and integrity-protected (typically
+/// over TLS), and the caller remains responsible for verifying any signature on
+/// the resolved message.
+///
+/// # Examples
+///
+/// ```ignore
+/// let request = create_artifact_resolve("https://sp.example.com", artifact, None);
+/// // ... send `request` over SOAP, receive `response` ...
+/// let message = process_artifact_response(&response, &request.id)?;
+/// ```
 pub fn process_artifact_response(
     response: &ArtifactResponse,
     expected_request_id: &str,
 ) -> Result<Option<Vec<u8>>, ProfileError> {
-    // Verify InResponseTo
-    if let Some(irt) = &response.in_response_to {
-        if irt != expected_request_id {
+    // Verify InResponseTo. This is a *solicited* exchange (the caller passes the
+    // ID of the ArtifactResolve it sent), so a missing InResponseTo is not
+    // acceptable: previously `if let Some(irt)` skipped the check entirely when
+    // absent, letting a replayed or substituted response be accepted. Require it
+    // to be present and equal to the outstanding request ID (CWE-294).
+    match &response.in_response_to {
+        Some(irt) if irt == expected_request_id => {}
+        Some(irt) => {
             return Err(ProfileError::ArtifactResolutionFailed(format!(
-                "InResponseTo mismatch: expected {}, got {}",
-                expected_request_id, irt
+                "InResponseTo mismatch: expected {expected_request_id}, got {irt}"
+            )));
+        }
+        None => {
+            return Err(ProfileError::ArtifactResolutionFailed(format!(
+                "ArtifactResponse is missing InResponseTo (expected {expected_request_id})"
             )));
         }
     }
@@ -148,6 +183,23 @@ mod tests {
         let response = create_artifact_response("https://idp.example.com", "_wrong", None);
         let result = process_artifact_response(&response, "_req123");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_process_artifact_response_missing_irt_rejected() {
+        // Finding #8 regression: a successful solicited response with no
+        // InResponseTo must be rejected, not accepted.
+        let mut response = create_artifact_response(
+            "https://idp.example.com",
+            "_req123",
+            Some(b"<samlp:Response>...</samlp:Response>".to_vec()),
+        );
+        response.in_response_to = None;
+        let result = process_artifact_response(&response, "_req123");
+        assert!(matches!(
+            result,
+            Err(ProfileError::ArtifactResolutionFailed(_))
+        ));
     }
 
     #[test]
