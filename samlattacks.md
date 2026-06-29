@@ -1,4 +1,4 @@
-# Golden SAML (SolarWinds / Solorigate) 
+# Golden SAML (SolarWinds / Solorigate)
 
 Description: A sophisticated attack technique used in the SolarWinds breach. Attackers compromised the ADFS server, stole the private key used to sign SAML assertions, and minted their own "Golden" SAML tokens to bypass authentication entirely and access any federated service (e.g., AWS, Office 365) as any user.
 

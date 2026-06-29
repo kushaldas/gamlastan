@@ -465,6 +465,28 @@ fn assertion_signature_is_bound(verified_signed_ids: &[String], assertion_id: &s
     verified_signed_ids.iter().any(|id| id == assertion_id)
 }
 
+/// Returns the first Assertion `ID` that occurs more than once in `assertions`,
+/// or `None` when every ID is unique.
+///
+/// The assertion-signature binding ([`assertion_signature_is_bound`]) matches an
+/// assertion's `ID` against the set of cryptographically verified reference IDs.
+/// If two assertions share an `ID`, a single valid signature over one would make
+/// the other — e.g. an attacker-injected sibling whose own `<ds:Signature>` is
+/// invalid or absent — appear "bound" as well, reintroducing XML Signature
+/// Wrapping confusion. SAML `ID`s must be document-unique, so a duplicate is
+/// rejected before the binding check runs.
+fn first_duplicate_assertion_id(
+    assertions: &[gamlastan::core::assertion::types::Assertion],
+) -> Option<&str> {
+    let mut seen = std::collections::HashSet::new();
+    for assertion in assertions {
+        if !seen.insert(assertion.id.as_str()) {
+            return Some(assertion.id.as_str());
+        }
+    }
+    None
+}
+
 /// SPID Assertion Consumer Service (ACS) endpoint: validate and consume a
 /// SAMLResponse posted by the IdP after authentication.
 ///
@@ -750,6 +772,15 @@ async fn sp_acs(state: web::Data<AppState>, form: web::Form<AcsForm>) -> HttpRes
         log::warn!("ACS: No assertions in response");
         return HttpResponse::BadRequest().body("No assertions in response");
     }
+
+    // Reject duplicate Assertion IDs before the binding check: a shared ID would
+    // let one valid signature "bind" an attacker-injected sibling assertion
+    // (XML Signature Wrapping). See first_duplicate_assertion_id.
+    if let Some(dup) = first_duplicate_assertion_id(&response.assertions) {
+        log::warn!("ACS: duplicate Assertion ID '{dup}' (XML Signature Wrapping)");
+        return HttpResponse::Forbidden().body("Duplicate Assertion ID");
+    }
+
     // SPID mandates that the Assertion itself MUST always be signed.
     // A signed Response alone is NOT sufficient (test [3]).
     //
@@ -1638,6 +1669,20 @@ mod tests {
             &state.security_config,
             &response,
         ));
+    }
+
+    #[test]
+    fn test_first_duplicate_assertion_id() {
+        let mut a = replay_test_response().assertions;
+        // Unique IDs -> None.
+        assert_eq!(first_duplicate_assertion_id(&a), None);
+
+        // Two assertions sharing an ID -> the duplicate is reported, so the ACS
+        // rejects before the binding check (XSW via duplicated ID).
+        let mut dup = a[0].clone();
+        dup.id = a[0].id.clone();
+        a.push(dup);
+        assert_eq!(first_duplicate_assertion_id(&a), Some(a[0].id.as_str()));
     }
 
     #[test]
