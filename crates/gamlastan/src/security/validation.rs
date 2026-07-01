@@ -1,7 +1,10 @@
 // SAML 2.0 Assertion Validator
 //
 // Comprehensive validation engine implementing the 32-check validation
-// checklist from Section 7.2 of the implementation plan.
+// checklist from Section 7.2 of the implementation plan, plus two
+// response-envelope checks (33-34). All checks are evaluated and recorded;
+// the validator does not short-circuit, so a failed check (including 33-34)
+// marks the result invalid without suppressing the remaining check outcomes.
 //
 // Response-level checks (1-4):
 //   1. Destination matches URL
@@ -52,6 +55,12 @@
 // RelayState checks (31-32):
 //   31. Max 80 bytes
 //   32. XSS/CSRF sanitized (E90)
+//
+// Response envelope checks:
+//   33. Response status is Success
+//   34. At least one plaintext (decrypted) assertion is present. This layer
+//       validates decrypted assertions only, so a response carrying solely
+//       EncryptedAssertion elements must be decrypted before validation.
 
 use chrono::{DateTime, Utc};
 
@@ -64,7 +73,7 @@ use crate::security::clock::{is_not_before_valid, is_not_on_or_after_valid, is_w
 use crate::security::conditions::{check_one_time_use, check_proxy_restriction};
 use crate::security::config::SecurityConfig;
 use crate::security::destination::verify_destination;
-use crate::security::error::{ValidationCheck, ValidationResult};
+use crate::security::error::{SecurityError, ValidationCheck, ValidationResult};
 use crate::security::name_id::PersistentIdStore;
 use crate::security::recipient::verify_recipient;
 use crate::security::relay_state::validate_relay_state_content;
@@ -104,7 +113,8 @@ pub struct ValidationParams<'a> {
     pub now: DateTime<Utc>,
 }
 
-/// The assertion validator implements the 32-check validation checklist.
+/// The assertion validator implements the 32-check validation checklist
+/// (Section 7.2) plus two response-envelope checks (33-34).
 pub struct AssertionValidator<'a> {
     config: &'a SecurityConfig,
     replay_cache: Option<&'a dyn ReplayCache>,
@@ -135,7 +145,8 @@ impl<'a> AssertionValidator<'a> {
 
     /// Validate a SAML Response and its contained assertions.
     ///
-    /// Runs all applicable checks from the 32-check validation checklist.
+    /// Runs all applicable checks from the 32-check validation checklist,
+    /// plus the response-envelope checks (33-34).
     /// Returns a `ValidationResult` containing all check outcomes.
     pub fn validate_response(
         &self,
@@ -146,6 +157,9 @@ impl<'a> AssertionValidator<'a> {
 
         // === Response-level checks (1-4) ===
         self.check_response_level(response, params, &mut result);
+
+        // === Response envelope checks ===
+        self.check_response_success_and_assertions(response, &mut result);
 
         // === Assertion-level checks ===
         for assertion in &response.assertions {
@@ -158,6 +172,46 @@ impl<'a> AssertionValidator<'a> {
         }
 
         result
+    }
+
+    fn check_response_success_and_assertions(
+        &self,
+        response: &Response,
+        result: &mut ValidationResult,
+    ) {
+        if response.base.status.is_success() {
+            result.add(ValidationCheck::pass(33, "Response status success"));
+        } else {
+            result.add(ValidationCheck::fail(
+                33,
+                "Response status success",
+                SecurityError::ResponseNotSuccess(response.base.status.status_code.value.clone())
+                    .to_string(),
+            ));
+        }
+
+        // This validator operates on decrypted assertions only, so check 34
+        // requires at least one plaintext `Assertion`. When the response
+        // carries only `EncryptedAssertion` elements, report that specifically
+        // so callers know decryption must run before validation rather than
+        // treating the response as having no assertion at all.
+        if response.assertions.is_empty() {
+            let detail = if response.encrypted_assertions.is_empty() {
+                SecurityError::MissingRequired("Assertion".to_string()).to_string()
+            } else {
+                "response carries only EncryptedAssertion; decrypt before validation".to_string()
+            };
+            result.add(ValidationCheck::fail(
+                34,
+                "Response contains plaintext assertion",
+                detail,
+            ));
+        } else {
+            result.add(ValidationCheck::pass(
+                34,
+                "Response contains plaintext assertion",
+            ));
+        }
     }
 
     /// Run response-level checks (1-4).
@@ -1046,6 +1100,77 @@ mod tests {
             "Expected no failures, got: {:?}",
             failures
         );
+    }
+
+    #[test]
+    fn test_response_status_must_be_success() {
+        let now = Utc::now();
+        let config = SecurityConfig {
+            require_signed_assertions: false,
+            ..SecurityConfig::default()
+        };
+        let validator = AssertionValidator::new(&config);
+        let mut response = make_valid_response(now);
+        response.base.status = Status::requester(Some("cancelled".to_string()));
+        let params = make_params(now);
+
+        let result = validator.validate_response(&response, &params);
+        assert!(result.failures().iter().any(|c| c.check_number == 33));
+        assert!(validator
+            .validate_response_simple(&response, &params)
+            .is_err());
+    }
+
+    #[test]
+    fn test_response_must_contain_assertion() {
+        let now = Utc::now();
+        let config = SecurityConfig {
+            require_signed_assertions: false,
+            ..SecurityConfig::default()
+        };
+        let validator = AssertionValidator::new(&config);
+        let mut response = make_valid_response(now);
+        response.assertions.clear();
+        let params = make_params(now);
+
+        let result = validator.validate_response(&response, &params);
+        assert!(result.failures().iter().any(|c| c.check_number == 34));
+        assert!(validator
+            .validate_response_simple(&response, &params)
+            .is_err());
+    }
+
+    #[test]
+    fn test_encrypted_only_response_reports_decrypt_needed() {
+        let now = Utc::now();
+        let config = SecurityConfig {
+            require_signed_assertions: false,
+            ..SecurityConfig::default()
+        };
+        let validator = AssertionValidator::new(&config);
+        let mut response = make_valid_response(now);
+        // Move the assertion out to the encrypted slot: no plaintext assertion
+        // remains, but the response is not truly assertionless.
+        response.assertions.clear();
+        response
+            .encrypted_assertions
+            .push(crate::core::assertion::types::EncryptedAssertion {
+                raw: b"<enc/>".to_vec(),
+            });
+        let params = make_params(now);
+
+        let result = validator.validate_response(&response, &params);
+        let check_34 = result
+            .checks
+            .iter()
+            .find(|c| c.check_number == 34)
+            .expect("check 34 present");
+        assert!(!check_34.passed);
+        assert!(check_34
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("decrypt before validation"));
     }
 
     #[test]

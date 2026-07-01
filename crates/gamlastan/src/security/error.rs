@@ -114,7 +114,12 @@ pub enum SecurityError {
 /// A single validation check result.
 #[derive(Debug, Clone)]
 pub struct ValidationCheck {
-    /// The check number (1-32 per Section 7.2).
+    /// The check number. Checks 1-32 map to the Section 7.2 checklist; checks
+    /// 33-34 are additional response-envelope checks (status is Success, and at
+    /// least one plaintext/decrypted `Assertion` present -- this layer does not
+    /// count `EncryptedAssertion` elements, which must be decrypted first). All
+    /// checks run and are recorded; a failure (including 33-34) marks the
+    /// result invalid but does not short-circuit the remaining checks.
     pub check_number: u32,
     /// Human-readable name of the check.
     pub check_name: &'static str,

@@ -147,8 +147,23 @@ fn normalize_server_url(mut url: String) -> String {
 impl MdqClient<ReqwestFetcher> {
     /// Create a dynamic MDQ client for `server_url` using the default
     /// reqwest-based transport (10s timeout).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the default HTTP client cannot be built (see
+    /// [`ReqwestFetcher::default`]). Use [`MdqClient::try_new`] to handle that
+    /// initialization failure explicitly.
     pub fn new(server_url: impl Into<String>) -> Self {
         Self::with_fetcher(server_url, ReqwestFetcher::default())
+    }
+
+    /// Create a dynamic MDQ client for `server_url`, returning an error instead
+    /// of panicking if the default HTTP transport cannot be constructed.
+    pub fn try_new(server_url: impl Into<String>) -> Result<Self, MdqError> {
+        Ok(Self::with_fetcher(
+            server_url,
+            ReqwestFetcher::try_default()?,
+        ))
     }
 }
 

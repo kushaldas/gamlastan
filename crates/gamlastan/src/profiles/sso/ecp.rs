@@ -98,6 +98,9 @@ pub struct EcpSpResponse {
     /// The SAML Response XML (process with the normal SP response pipeline,
     /// using the PAOS binding rules for validation).
     pub response_xml: String,
+    /// PAOS Response `refToMessageID`, echoed from the SP's phase-1
+    /// `paos:Request/@messageID` and used for conversation correlation.
+    pub ref_to_message_id: Option<String>,
     /// RelayState echoed by the ECP (from the ecp:RelayState header).
     pub relay_state: Option<String>,
 }
@@ -110,8 +113,30 @@ pub fn parse_ecp_response_at_sp(soap_xml: &[u8]) -> Result<EcpSpResponse, Profil
     let envelope = parse_envelope(soap_xml)?;
     Ok(EcpSpResponse {
         response_xml: envelope.body_xml,
+        ref_to_message_id: envelope.paos_response_ref_to_message_id,
         relay_state: envelope.relay_state,
     })
+}
+
+impl EcpSpResponse {
+    /// Verify that the phase-2 PAOS response references the phase-1
+    /// `paos:Request/@messageID`.
+    pub fn verify_ref_to_message_id(
+        &self,
+        expected_message_id: Option<&str>,
+    ) -> Result<(), ProfileError> {
+        let Some(expected) = expected_message_id else {
+            return Ok(());
+        };
+        match self.ref_to_message_id.as_deref() {
+            Some(actual) if actual == expected => Ok(()),
+            Some(actual) => Err(ProfileError::EcpMessageIdMismatch {
+                expected: expected.to_string(),
+                actual: actual.to_string(),
+            }),
+            None => Err(ProfileError::EcpMissingResponseReference),
+        }
+    }
 }
 
 /// Parsed phase-1 envelope: the ECP client's view of the SP's PAOS response,
@@ -317,6 +342,7 @@ struct EcpRequestHeader {
 struct ParsedEcpEnvelope {
     body_xml: String,
     paos_request: Option<(String, Option<String>)>,
+    paos_response_ref_to_message_id: Option<String>,
     ecp_request: Option<EcpRequestHeader>,
     ecp_response_acs_url: Option<String>,
     relay_state: Option<String>,
@@ -408,6 +434,9 @@ fn parse_header_blocks(
                 .ok_or(ProfileError::MissingPaosHeader)?;
             let message_id = doc.get_attribute(block, "messageID").map(|s| s.to_string());
             parsed.paos_request = Some((rcu.to_string(), message_id));
+        } else if elem.matches_name_ns(PAOS_NS, "Response") {
+            parsed.paos_response_ref_to_message_id =
+                doc.get_attribute(block, "refToMessageID").map(String::from);
         } else if elem.matches_name_ns(ECP_NS, "Request") {
             let mut h = EcpRequestHeader {
                 provider_name: doc.get_attribute(block, "ProviderName").map(String::from),
@@ -590,7 +619,46 @@ mod tests {
         // Phase 2: SP consumes
         let sp_response = parse_ecp_response_at_sp(relay.envelope.as_bytes()).unwrap();
         assert!(sp_response.response_xml.contains("Response"));
+        assert_eq!(
+            sp_response.ref_to_message_id.as_deref(),
+            Some("_paos_msg_1")
+        );
+        sp_response
+            .verify_ref_to_message_id(Some("_paos_msg_1"))
+            .unwrap();
         assert_eq!(sp_response.relay_state.as_deref(), Some("state-42"));
+    }
+
+    #[test]
+    fn test_parse_ecp_response_at_sp_exposes_and_verifies_ref_to_message_id() {
+        let paos_response = PaosResponse {
+            ref_to_message_id: Some("_expected".to_string()),
+        };
+        let envelope =
+            paos::build_ecp_phase2_envelope(SAML_RESPONSE, &paos_response, None).unwrap();
+
+        let parsed = parse_ecp_response_at_sp(envelope.as_bytes()).unwrap();
+        assert_eq!(parsed.ref_to_message_id.as_deref(), Some("_expected"));
+        parsed.verify_ref_to_message_id(Some("_expected")).unwrap();
+        assert!(matches!(
+            parsed.verify_ref_to_message_id(Some("_other")),
+            Err(ProfileError::EcpMessageIdMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_ecp_response_ref_to_message_id_required_when_expected() {
+        let paos_response = PaosResponse {
+            ref_to_message_id: None,
+        };
+        let envelope =
+            paos::build_ecp_phase2_envelope(SAML_RESPONSE, &paos_response, None).unwrap();
+
+        let parsed = parse_ecp_response_at_sp(envelope.as_bytes()).unwrap();
+        assert!(matches!(
+            parsed.verify_ref_to_message_id(Some("_expected")),
+            Err(ProfileError::EcpMissingResponseReference)
+        ));
     }
 
     #[test]
