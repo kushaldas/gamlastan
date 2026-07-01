@@ -17,8 +17,9 @@ in [`gamlastan`].
   MDQ servers (e.g. pyFF / thiss.io).
 - **Signature verification** against zero or more federation signing
   certificates (PEM/DER, supports key rollover). When ≥1 cert is configured,
-  unsigned or invalid metadata is rejected; with no cert the client warns once
-  that fetched metadata is unverified.
+  unsigned or invalid metadata is rejected. With no cert, fetched metadata is
+  rejected unless the caller explicitly opts into `allow_unverified()` for local
+  testing.
 - **E94-aware caching** — honors the document's `validUntil` (hard validity) and
   `cacheDuration` (refresh hint), with a configurable fallback TTL, via
   `gamlastan`'s `MetadataCache`.
@@ -27,6 +28,8 @@ in [`gamlastan`].
   child whose entityID matches the request).
 - **Pluggable transport** — generic over a `MetadataFetcher` trait, so tests
   inject a deterministic mock (the default is a `reqwest`-based fetcher).
+- **Fail-closed default transport** — the default `ReqwestFetcher` does not
+  follow HTTP redirects from untrusted MDQ responses.
 
 ## Usage
 
@@ -81,7 +84,8 @@ let from_url = MdqClient::new("")
 cargo test -p gamlastan-mdq
 ```
 
-All HTTP is mocked and time is driven by a controllable clock, so the suite is
-deterministic and never touches the network.
+Most HTTP is mocked and time is driven by a controllable clock, so the suite is
+deterministic. The default transport has one localhost-only regression test that
+proves redirects are not followed.
 
 [`gamlastan`]: ../gamlastan

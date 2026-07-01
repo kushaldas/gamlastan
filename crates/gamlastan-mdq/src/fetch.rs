@@ -26,11 +26,6 @@ pub const MAX_BODY_BYTES: usize = 200 * 1024 * 1024;
 /// even when the metadata body cap is much larger.
 const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
 
-/// Maximum number of HTTP redirects followed. MDQ responses are normally served
-/// directly; a small bound limits the redirect/SSRF surface a hostile server
-/// could use to bounce the client around.
-const MAX_REDIRECTS: usize = 2;
-
 /// Fetches raw metadata bytes from a URL.
 ///
 /// Implementations should map a non-2xx response to [`MdqError::Http`] and any
@@ -51,7 +46,7 @@ impl ReqwestFetcher {
     pub fn with_timeout(timeout: Duration) -> Result<Self, MdqError> {
         let client = reqwest::Client::builder()
             .timeout(timeout)
-            .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| MdqError::Transport(e.to_string()))?;
         Ok(Self { client })
@@ -65,10 +60,11 @@ impl ReqwestFetcher {
 
 impl Default for ReqwestFetcher {
     fn default() -> Self {
-        // A 10s timeout matches the Go reference; client construction only fails
-        // on TLS-backend init, so fall back to a default client if so.
+        // A 10s timeout matches the Go reference. Construction failures are
+        // exceptional; do not fall back to reqwest's default client because it
+        // follows redirects.
         Self::with_timeout(Duration::from_secs(10))
-            .unwrap_or_else(|_| Self::from_client(reqwest::Client::new()))
+            .expect("failed to build default MDQ HTTP client")
     }
 }
 
@@ -160,4 +156,37 @@ fn truncate(s: &str, max: usize) -> String {
         end -= 1;
     }
     s[..end].to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    #[tokio::test]
+    async fn reqwest_fetcher_does_not_follow_redirects() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/metadata\r\nContent-Length: 0\r\n\r\n",
+                )
+                .unwrap();
+        });
+
+        let fetcher = ReqwestFetcher::with_timeout(Duration::from_secs(1)).unwrap();
+        let err = fetcher
+            .fetch(&format!("http://{addr}/entities/example"))
+            .await
+            .unwrap_err();
+
+        handle.join().unwrap();
+        assert!(matches!(err, MdqError::Http { status: 302, .. }));
+    }
 }

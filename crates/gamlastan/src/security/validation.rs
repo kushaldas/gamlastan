@@ -52,6 +52,10 @@
 // RelayState checks (31-32):
 //   31. Max 80 bytes
 //   32. XSS/CSRF sanitized (E90)
+//
+// Response envelope checks:
+//   33. Response status is Success
+//   34. At least one assertion is present
 
 use chrono::{DateTime, Utc};
 
@@ -64,7 +68,7 @@ use crate::security::clock::{is_not_before_valid, is_not_on_or_after_valid, is_w
 use crate::security::conditions::{check_one_time_use, check_proxy_restriction};
 use crate::security::config::SecurityConfig;
 use crate::security::destination::verify_destination;
-use crate::security::error::{ValidationCheck, ValidationResult};
+use crate::security::error::{SecurityError, ValidationCheck, ValidationResult};
 use crate::security::name_id::PersistentIdStore;
 use crate::security::recipient::verify_recipient;
 use crate::security::relay_state::validate_relay_state_content;
@@ -147,6 +151,9 @@ impl<'a> AssertionValidator<'a> {
         // === Response-level checks (1-4) ===
         self.check_response_level(response, params, &mut result);
 
+        // === Response envelope checks ===
+        self.check_response_success_and_assertions(response, &mut result);
+
         // === Assertion-level checks ===
         for assertion in &response.assertions {
             self.check_assertion_level(response, assertion, params, &mut result);
@@ -158,6 +165,33 @@ impl<'a> AssertionValidator<'a> {
         }
 
         result
+    }
+
+    fn check_response_success_and_assertions(
+        &self,
+        response: &Response,
+        result: &mut ValidationResult,
+    ) {
+        if response.base.status.is_success() {
+            result.add(ValidationCheck::pass(33, "Response status success"));
+        } else {
+            result.add(ValidationCheck::fail(
+                33,
+                "Response status success",
+                SecurityError::ResponseNotSuccess(response.base.status.status_code.value.clone())
+                    .to_string(),
+            ));
+        }
+
+        if response.assertions.is_empty() {
+            result.add(ValidationCheck::fail(
+                34,
+                "Response contains assertion",
+                SecurityError::MissingRequired("Assertion".to_string()).to_string(),
+            ));
+        } else {
+            result.add(ValidationCheck::pass(34, "Response contains assertion"));
+        }
     }
 
     /// Run response-level checks (1-4).
@@ -1046,6 +1080,44 @@ mod tests {
             "Expected no failures, got: {:?}",
             failures
         );
+    }
+
+    #[test]
+    fn test_response_status_must_be_success() {
+        let now = Utc::now();
+        let config = SecurityConfig {
+            require_signed_assertions: false,
+            ..SecurityConfig::default()
+        };
+        let validator = AssertionValidator::new(&config);
+        let mut response = make_valid_response(now);
+        response.base.status = Status::requester(Some("cancelled".to_string()));
+        let params = make_params(now);
+
+        let result = validator.validate_response(&response, &params);
+        assert!(result.failures().iter().any(|c| c.check_number == 33));
+        assert!(validator
+            .validate_response_simple(&response, &params)
+            .is_err());
+    }
+
+    #[test]
+    fn test_response_must_contain_assertion() {
+        let now = Utc::now();
+        let config = SecurityConfig {
+            require_signed_assertions: false,
+            ..SecurityConfig::default()
+        };
+        let validator = AssertionValidator::new(&config);
+        let mut response = make_valid_response(now);
+        response.assertions.clear();
+        let params = make_params(now);
+
+        let result = validator.validate_response(&response, &params);
+        assert!(result.failures().iter().any(|c| c.check_number == 34));
+        assert!(validator
+            .validate_response_simple(&response, &params)
+            .is_err());
     }
 
     #[test]

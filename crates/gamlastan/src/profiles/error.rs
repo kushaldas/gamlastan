@@ -80,6 +80,12 @@ pub enum ProfileError {
     #[error("missing ecp:Response header in IdP response")]
     EcpMissingResponseHeader,
 
+    #[error("missing paos:Response refToMessageID for ECP response correlation")]
+    EcpMissingResponseReference,
+
+    #[error("paos:Response refToMessageID mismatch: expected {expected}, got {actual}")]
+    EcpMessageIdMismatch { expected: String, actual: String },
+
     // --- Subject Confirmation errors ---
     #[error("subject confirmation method not supported: {0}")]
     UnsupportedConfirmationMethod(String),

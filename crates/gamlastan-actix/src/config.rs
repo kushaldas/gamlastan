@@ -191,7 +191,10 @@ impl RequestIdTracker for InMemoryRequestIdTracker {
 
     fn consume(&self, request_id: &str) -> bool {
         let mut ids = self.ids.lock().unwrap();
-        ids.remove(request_id).is_some()
+        let Some(inserted) = ids.remove(request_id) else {
+            return false;
+        };
+        std::time::Instant::now().duration_since(inserted) < self.ttl
     }
 }
 
@@ -672,6 +675,17 @@ mod tests {
         tracker.store("_req_new");
         assert!(!tracker.consume("_req_expire"));
         assert!(tracker.consume("_req_new"));
+    }
+
+    #[test]
+    fn test_request_id_tracker_consume_rejects_expired_without_later_store() {
+        let tracker = InMemoryRequestIdTracker::with_ttl(std::time::Duration::from_millis(1));
+        tracker.store("_req_expire");
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        assert!(!tracker.consume("_req_expire"));
+        assert!(!tracker.consume("_req_expire"));
     }
 
     #[test]

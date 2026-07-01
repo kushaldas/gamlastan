@@ -52,7 +52,7 @@ Module layout (one concern per file):
 | `client.rs` | `MdqClient<F>`: dynamic queries, static file/URL modes, caching, trust material, clock injection |
 | `verify.rs` | `parse_verify_select`: parse → verify (if certs) → select entity → role-gate → **entityID binding** |
 | `transform.rs` | `MdqTransform` (`UrlEncoded`/`Sha1`), `request_path`, `parse_xs_duration` |
-| `fetch.rs` | `MetadataFetcher` trait + default `ReqwestFetcher` (size cap, redirect bound) |
+| `fetch.rs` | `MetadataFetcher` trait + default `ReqwestFetcher` (size cap, no automatic redirects; see ADR 0034) |
 | `error.rs` | `MdqError` |
 
 The builder is plain function composition over the existing dual-typed SAML
@@ -144,7 +144,7 @@ carrying compatibility shims.
 | H-1 | The single-`<EntityDescriptor>` path (the common MDQ response) verified the signature but **never compared the returned `entityID` to the requested one**. An untrusted server could answer a query for entity A with B's *validly federation-signed* metadata; it passed signature + role checks and was cached under A's key, letting the app trust B's signing key/endpoints as A's (IdP impersonation across the federation). | `finish` now binds request to response: `entity.entity_id != requested ⇒ MdqError::EntityIdMismatch`, on **both** the single-entity and aggregate paths (and at static load time). The signature attests provenance, not that it answers *this* query. |
 | M-1 | **Fail-open default:** a client with no certs silently accepted unverified metadata (warn-once only) — i.e. no authenticity at all under the MDQ threat model — which is the default state of `MdqClient::new`. | A no-cert client now returns `MdqError::VerificationNotConfigured`; the insecure mode is an explicit `allow_unverified()` opt-in. With certs configured, documents are always verified regardless. |
 | M-2 | `parse_xs_duration` used `Duration::from_secs_f64`, which **panics on overflow**; a crafted `cacheDuration` (e.g. `P10000000000000000000Y`) is finite-but-huge and passed the prior guards — an unauthenticated DoS in `allow_unverified` mode. | Use the fallible `Duration::try_from_secs_f64(...).map_err(BadDuration)`. |
-| M-3 | `ReqwestFetcher` buffered the entire body (`resp.bytes()`) with no size cap (memory-exhaustion DoS from a hostile server) and followed reqwest's default redirect chain. | Enforce an 8 MiB cap (advertised `Content-Length` pre-check **and** chunk-by-chunk streaming enforcement) and bound redirects to 2. |
+| M-3 | `ReqwestFetcher` buffered the entire body (`resp.bytes()`) with no size cap (memory-exhaustion DoS from a hostile server) and followed reqwest's default redirect chain. | Enforce a bounded streaming body read. The original small redirect bound was later superseded by ADR 0034: the default fetcher now disables automatic redirects entirely. |
 | INFO-1 | The `MetadataSigningProfile` profile pre-check is substring-based, not DOM-based. | Left as-is: it is a *pre-check*, not the security boundary. Cryptographic verification is `SamlVerifier::verify_enveloped` with bergshamra `strict_verification` (XML-Signature-Wrapping reference-position checks) + E91 `ds:Object` rejection. Recorded here as the relied-upon control. Hardening lives in `gamlastan`, out of this crate's scope. |
 
 The entityID-binding (H-1) and fail-closed default (M-1) are the two controls

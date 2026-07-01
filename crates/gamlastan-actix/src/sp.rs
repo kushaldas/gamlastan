@@ -239,13 +239,28 @@ async fn sp_acs(
     }
 
     // Default: return a simple success page
-    let name_id = &sp_result.authn.name_id;
+    let name_id = escape_html_text(&sp_result.authn.name_id);
     let body = format!(
         "<html><body><h1>Authentication Successful</h1><p>NameID: {name_id}</p></body></html>"
     );
     Ok(HttpResponse::Ok()
         .content_type("text/html; charset=utf-8")
         .body(body))
+}
+
+fn escape_html_text(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#x27;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 /// Verify the XML signatures carried by an ACS response and return the signed IDs.
@@ -846,6 +861,14 @@ mod tests {
     const SIGN_CERT_PEM: &str = include_str!("../../gamlastan-mdq/tests/fixtures/sign-cert.pem");
     const SIGN_KEY_PEM: &[u8] = include_bytes!("../../gamlastan-mdq/tests/fixtures/sign-key.pem");
     const OTHER_CERT_PEM: &str = include_str!("../tests/fixtures/other-cert.pem");
+
+    #[test]
+    fn test_escape_html_text_for_default_acs_page() {
+        assert_eq!(
+            escape_html_text(r#"<script>alert('xss')</script>&"name""#),
+            "&lt;script&gt;alert(&#x27;xss&#x27;)&lt;/script&gt;&amp;&quot;name&quot;"
+        );
+    }
 
     fn test_sp_config() -> SpConfig {
         let idp = IdpSsoDescriptor {

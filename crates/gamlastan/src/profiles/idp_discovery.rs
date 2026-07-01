@@ -304,8 +304,9 @@ fn split_url_query(url: &str) -> (&str, Option<&str>) {
 ///
 /// - The return URL is taken from the request, falling back to the SP's
 ///   default DiscoveryResponse endpoint.
-/// - When `registered` is non-empty, the return URL MUST match a registered
-///   endpoint or the request is rejected.
+/// - When the request carries a return URL, it MUST match a registered endpoint
+///   or the request is rejected. Empty metadata does not make a request-supplied
+///   return URL trustworthy.
 /// - `selected_idp = None` (e.g. an isPassive request with no known IdP)
 ///   redirects back without the returnIDParam, as the profile requires.
 pub fn create_discovery_service_response(
@@ -315,7 +316,7 @@ pub fn create_discovery_service_response(
 ) -> Result<String, ProfileError> {
     let return_url = match &request.return_url {
         Some(url) => {
-            if !registered.is_empty() && !verify_return_url(url, registered) {
+            if !verify_return_url(url, registered) {
                 return Err(ProfileError::DiscoveryReturnUrlNotRegistered(url.clone()));
             }
             url.clone()
@@ -610,6 +611,23 @@ mod tests {
             &registered_endpoints(),
             Some("https://idp.example.com"),
         );
+        assert!(matches!(
+            result,
+            Err(ProfileError::DiscoveryReturnUrlNotRegistered(_))
+        ));
+    }
+
+    #[test]
+    fn test_create_discovery_service_response_rejects_return_without_registered_endpoints() {
+        let req = DiscoveryServiceRequest {
+            entity_id: "https://sp.example.com".to_string(),
+            return_url: Some("https://evil.example.com/phish".to_string()),
+            return_id_param: "entityID".to_string(),
+            policy: None,
+            is_passive: false,
+        };
+
+        let result = create_discovery_service_response(&req, &[], Some("https://idp.example.com"));
         assert!(matches!(
             result,
             Err(ProfileError::DiscoveryReturnUrlNotRegistered(_))
