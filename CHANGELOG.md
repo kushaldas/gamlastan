@@ -19,6 +19,16 @@ where needed to correct protocol handling.
   schema ordering, so callers no longer hand-roll the template and splice. See
   ADR 0033.
 
+### Changed
+
+- `SwedenConnect` `build_authn_request` now carries the `SignMessage` /
+  `SADRequest` / `PrincipalSelection` extensions on the typed request's
+  `AuthnRequest::extensions` field, so serializing the request emits the
+  `<saml2p:Extensions>` block in the schema-correct position (after
+  `<saml:Issuer>`). The `SwedenConnectAuthnRequest::extensions_xml` field is
+  removed: callers no longer splice a separate extensions string into the
+  serialized XML - they just serialize and sign the request.
+
 ## [0.6.0] - 2026-06-28
 
 ### Added

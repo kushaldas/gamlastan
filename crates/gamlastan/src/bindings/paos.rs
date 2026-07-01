@@ -15,10 +15,9 @@
 // - Phase 1: SAML request in SOAP response from IdP
 // - Phase 2: SAML response in SOAP request to SP
 
-use bergshamra_c14n::escape::{escape_attr, escape_text};
-
 use crate::bindings::error::BindingError;
 use crate::bindings::soap::SOAP11_ACTOR_NEXT;
+use crate::xml::XmlWriter;
 
 /// PAOS content type.
 pub const PAOS_CONTENT_TYPE: &str = "application/vnd.paos+xml";
@@ -88,90 +87,111 @@ pub struct EcpRelayState {
 
 /// Serialize a PAOS Request header block to XML.
 pub fn paos_request_header_xml(req: &PaosRequest) -> String {
-    let mut xml = String::with_capacity(256);
-    xml.push_str(&format!(
-        r#"<paos:Request xmlns:paos="{}" soap:mustUnderstand="1" soap:actor="{}" responseConsumerURL="{}""#,
-        PAOS_NS,
-        SOAP11_ACTOR_NEXT,
-        escape_attr(&req.response_consumer_url)
-    ));
-    if let Some(ref svc) = req.service {
-        xml.push_str(&format!(r#" service="{}""#, escape_attr(svc)));
+    let mut w = XmlWriter::with_capacity(256);
+    let mut attrs: Vec<(&str, &str)> = vec![
+        ("xmlns:paos", PAOS_NS),
+        ("soap:mustUnderstand", "1"),
+        ("soap:actor", SOAP11_ACTOR_NEXT),
+        ("responseConsumerURL", req.response_consumer_url.as_str()),
+    ];
+    if let Some(svc) = &req.service {
+        attrs.push(("service", svc.as_str()));
     }
-    if let Some(ref mid) = req.message_id {
-        xml.push_str(&format!(r#" messageID="{}""#, escape_attr(mid)));
+    if let Some(mid) = &req.message_id {
+        attrs.push(("messageID", mid.as_str()));
     }
-    xml.push_str("/>");
-    xml
+    w.empty_element("paos:Request", &attrs);
+    w.into_string()
 }
 
 /// Serialize a PAOS Response header block to XML.
 pub fn paos_response_header_xml(resp: &PaosResponse) -> String {
-    let mut xml = String::with_capacity(128);
-    xml.push_str(&format!(
-        r#"<paos:Response xmlns:paos="{}" soap:mustUnderstand="1" soap:actor="{}""#,
-        PAOS_NS, SOAP11_ACTOR_NEXT
-    ));
-    if let Some(ref mid) = resp.ref_to_message_id {
-        xml.push_str(&format!(r#" refToMessageID="{}""#, mid));
+    let mut w = XmlWriter::with_capacity(128);
+    let mut attrs: Vec<(&str, &str)> = vec![
+        ("xmlns:paos", PAOS_NS),
+        ("soap:mustUnderstand", "1"),
+        ("soap:actor", SOAP11_ACTOR_NEXT),
+    ];
+    if let Some(mid) = &resp.ref_to_message_id {
+        attrs.push(("refToMessageID", mid.as_str()));
     }
-    xml.push_str("/>");
-    xml
+    w.empty_element("paos:Response", &attrs);
+    w.into_string()
 }
 
 /// Serialize an ECP Request header block to XML.
 pub fn ecp_request_header_xml(req: &EcpRequest) -> String {
-    let mut xml = String::with_capacity(256);
-    xml.push_str(&format!(
-        r#"<ecp:Request xmlns:ecp="{}" soap:mustUnderstand="1" soap:actor="{}" IsPassive="{}""#,
-        ECP_NS, SOAP11_ACTOR_NEXT, req.is_passive
-    ));
-    if let Some(ref pn) = req.provider_name {
-        xml.push_str(&format!(r#" ProviderName="{}""#, escape_attr(pn)));
+    let is_passive = req.is_passive.to_string();
+    let mut attrs: Vec<(&str, &str)> = vec![
+        ("xmlns:ecp", ECP_NS),
+        ("soap:mustUnderstand", "1"),
+        ("soap:actor", SOAP11_ACTOR_NEXT),
+        ("IsPassive", is_passive.as_str()),
+    ];
+    if let Some(pn) = &req.provider_name {
+        attrs.push(("ProviderName", pn.as_str()));
     }
+
+    let mut w = XmlWriter::with_capacity(256);
     if req.issuer.is_none() && req.idp_list.is_empty() {
-        xml.push_str("/>");
-        return xml;
+        w.empty_element("ecp:Request", &attrs);
+        return w.into_string();
     }
-    xml.push('>');
-    if let Some(ref issuer) = req.issuer {
-        xml.push_str(&format!(
-            r#"<saml:Issuer xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">{}</saml:Issuer>"#,
-            escape_text(issuer)
-        ));
+    w.start_element("ecp:Request", &attrs);
+    if let Some(issuer) = &req.issuer {
+        w.start_element(
+            "saml:Issuer",
+            &[("xmlns:saml", "urn:oasis:names:tc:SAML:2.0:assertion")],
+        );
+        w.text(issuer);
+        w.end_element("saml:Issuer");
     }
     if !req.idp_list.is_empty() {
-        xml.push_str(r#"<samlp:IDPList xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol">"#);
+        w.start_element(
+            "samlp:IDPList",
+            &[("xmlns:samlp", "urn:oasis:names:tc:SAML:2.0:protocol")],
+        );
         for idp in &req.idp_list {
-            xml.push_str(&format!(
-                r#"<samlp:IDPEntry ProviderID="{}"/>"#,
-                escape_attr(idp)
-            ));
+            w.empty_element("samlp:IDPEntry", &[("ProviderID", idp.as_str())]);
         }
-        xml.push_str("</samlp:IDPList>");
+        w.end_element("samlp:IDPList");
     }
-    xml.push_str("</ecp:Request>");
-    xml
+    w.end_element("ecp:Request");
+    w.into_string()
 }
 
 /// Serialize an ECP Response header block to XML.
 pub fn ecp_response_header_xml(resp: &EcpResponse) -> String {
-    format!(
-        r#"<ecp:Response xmlns:ecp="{}" soap:mustUnderstand="1" soap:actor="{}" AssertionConsumerServiceURL="{}"/>"#,
-        ECP_NS,
-        SOAP11_ACTOR_NEXT,
-        escape_attr(&resp.assertion_consumer_service_url)
-    )
+    let mut w = XmlWriter::new();
+    w.empty_element(
+        "ecp:Response",
+        &[
+            ("xmlns:ecp", ECP_NS),
+            ("soap:mustUnderstand", "1"),
+            ("soap:actor", SOAP11_ACTOR_NEXT),
+            (
+                "AssertionConsumerServiceURL",
+                resp.assertion_consumer_service_url.as_str(),
+            ),
+        ],
+    );
+    w.into_string()
 }
 
 /// Serialize an ECP RelayState header block to XML.
 pub fn ecp_relay_state_header_xml(rs: &EcpRelayState) -> String {
-    format!(
-        r#"<ecp:RelayState xmlns:ecp="{}" soap:mustUnderstand="1" soap:actor="{}">{}</ecp:RelayState>"#,
-        ECP_NS,
-        SOAP11_ACTOR_NEXT,
-        escape_text(&rs.relay_state)
-    )
+    let mut w = XmlWriter::new();
+    w.start_element(
+        "ecp:RelayState",
+        &[
+            ("xmlns:ecp", ECP_NS),
+            ("soap:mustUnderstand", "1"),
+            ("soap:actor", SOAP11_ACTOR_NEXT),
+        ],
+    );
+    w.text(&rs.relay_state);
+    w.end_element("ecp:RelayState");
+    w.into_string()
 }
 
 /// Check if an HTTP request is a PAOS request (from an ECP).

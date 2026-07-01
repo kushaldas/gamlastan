@@ -16,9 +16,9 @@
 
 use crate::metadata::types::extensions::Extensions;
 use crate::xml::uppsala;
+use crate::xml::XmlWriter;
 
 use super::constants;
-use super::xmlutil::{escape_attr, escape_text};
 
 /// A logotype reference for `<mdui:Logo>` (section 2.1.1.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,46 +48,35 @@ pub struct UiInfo {
 impl UiInfo {
     /// Serialize the `<mdui:UIInfo>` element (namespace-qualified).
     pub fn to_xml_string(&self) -> String {
-        let mut out = String::new();
-        out.push_str("<mdui:UIInfo xmlns:mdui=\"");
-        out.push_str(constants::NS_MDUI);
-        out.push_str("\">");
+        let mut w = XmlWriter::new();
+        w.start_element("mdui:UIInfo", &[("xmlns:mdui", constants::NS_MDUI)]);
         for (lang, val) in &self.display_names {
-            push_localized(&mut out, "mdui:DisplayName", lang, val);
+            write_localized(&mut w, "mdui:DisplayName", lang, val);
         }
         for (lang, val) in &self.descriptions {
-            push_localized(&mut out, "mdui:Description", lang, val);
+            write_localized(&mut w, "mdui:Description", lang, val);
         }
         for logo in &self.logos {
-            out.push_str("<mdui:Logo height=\"");
-            out.push_str(&logo.height.to_string());
-            out.push_str("\" width=\"");
-            out.push_str(&logo.width.to_string());
-            out.push('"');
+            let height = logo.height.to_string();
+            let width = logo.width.to_string();
+            let mut attrs: Vec<(&str, &str)> =
+                vec![("height", height.as_str()), ("width", width.as_str())];
             if let Some(lang) = &logo.lang {
-                out.push_str(" xml:lang=\"");
-                out.push_str(&escape_attr(lang));
-                out.push('"');
+                attrs.push(("xml:lang", lang.as_str()));
             }
-            out.push('>');
-            out.push_str(&escape_text(&logo.url));
-            out.push_str("</mdui:Logo>");
+            w.start_element("mdui:Logo", &attrs);
+            w.text(&logo.url);
+            w.end_element("mdui:Logo");
         }
-        out.push_str("</mdui:UIInfo>");
-        out
+        w.end_element("mdui:UIInfo");
+        w.into_string()
     }
 }
 
-fn push_localized(out: &mut String, elem: &str, lang: &str, value: &str) {
-    out.push('<');
-    out.push_str(elem);
-    out.push_str(" xml:lang=\"");
-    out.push_str(&escape_attr(lang));
-    out.push_str("\">");
-    out.push_str(&escape_text(value));
-    out.push_str("</");
-    out.push_str(elem);
-    out.push('>');
+fn write_localized(w: &mut XmlWriter, elem: &str, lang: &str, value: &str) {
+    w.start_element(elem, &[("xml:lang", lang)]);
+    w.text(value);
+    w.end_element(elem);
 }
 
 /// Build an `<mdattr:EntityAttributes>` fragment declaring the given entity
@@ -101,70 +90,88 @@ pub fn entity_attributes_xml(
     entity_categories: &[&str],
     assurance_certifications: &[&str],
 ) -> String {
-    let mut out = String::new();
-    out.push_str("<mdattr:EntityAttributes xmlns:mdattr=\"");
-    out.push_str(constants::NS_MDATTR);
-    out.push_str("\" xmlns:saml2=\"");
-    out.push_str(constants::NS_SAML_ASSERTION);
-    out.push_str("\">");
+    let mut w = XmlWriter::new();
+    w.start_element(
+        "mdattr:EntityAttributes",
+        &[
+            ("xmlns:mdattr", constants::NS_MDATTR),
+            ("xmlns:saml2", constants::NS_SAML_ASSERTION),
+        ],
+    );
     if !entity_categories.is_empty() {
-        push_uri_attribute(&mut out, constants::ENTITY_CATEGORY_ATTR, entity_categories);
+        write_uri_attribute(&mut w, constants::ENTITY_CATEGORY_ATTR, entity_categories);
     }
     if !assurance_certifications.is_empty() {
-        push_uri_attribute(
-            &mut out,
+        write_uri_attribute(
+            &mut w,
             constants::ASSURANCE_CERTIFICATION_ATTR,
             assurance_certifications,
         );
     }
-    out.push_str("</mdattr:EntityAttributes>");
-    out
+    w.end_element("mdattr:EntityAttributes");
+    w.into_string()
 }
 
-fn push_uri_attribute(out: &mut String, name: &str, values: &[&str]) {
-    out.push_str("<saml2:Attribute Name=\"");
-    out.push_str(&escape_attr(name));
-    out.push_str("\" NameFormat=\"");
-    out.push_str(constants::ATTRNAME_FORMAT_URI);
-    out.push_str("\">");
+fn write_uri_attribute(w: &mut XmlWriter, name: &str, values: &[&str]) {
+    w.start_element(
+        "saml2:Attribute",
+        &[
+            ("Name", name),
+            ("NameFormat", constants::ATTRNAME_FORMAT_URI),
+        ],
+    );
     for v in values {
-        out.push_str("<saml2:AttributeValue>");
-        out.push_str(&escape_text(v));
-        out.push_str("</saml2:AttributeValue>");
+        w.start_element("saml2:AttributeValue", &[]);
+        w.text(v);
+        w.end_element("saml2:AttributeValue");
     }
-    out.push_str("</saml2:Attribute>");
+    w.end_element("saml2:Attribute");
 }
 
 /// Build a `<shibmd:Scope>` fragment (section 2.1.3.1).
 pub fn scope_xml(value: &str, regexp: bool) -> String {
-    format!(
-        "<shibmd:Scope xmlns:shibmd=\"{}\" regexp=\"{}\">{}</shibmd:Scope>",
-        constants::NS_SHIBMD,
-        if regexp { "true" } else { "false" },
-        escape_text(value)
-    )
+    let mut w = XmlWriter::new();
+    w.start_element(
+        "shibmd:Scope",
+        &[
+            ("xmlns:shibmd", constants::NS_SHIBMD),
+            ("regexp", if regexp { "true" } else { "false" }),
+        ],
+    );
+    w.text(value);
+    w.end_element("shibmd:Scope");
+    w.into_string()
 }
 
 /// Build an `<idpdisc:DiscoveryResponse>` fragment (section 2.1.2).
 pub fn discovery_response_xml(index: u16, location: &str) -> String {
-    format!(
-        "<idpdisc:DiscoveryResponse xmlns:idpdisc=\"{}\" Binding=\"urn:oasis:names:tc:SAML:profiles:SSO:idp-discovery-protocol\" index=\"{}\" Location=\"{}\"/>",
-        constants::NS_IDPDISCO,
-        index,
-        escape_attr(location)
-    )
+    let index = index.to_string();
+    let mut w = XmlWriter::new();
+    w.empty_element(
+        "idpdisc:DiscoveryResponse",
+        &[
+            ("xmlns:idpdisc", constants::NS_IDPDISCO),
+            (
+                "Binding",
+                "urn:oasis:names:tc:SAML:profiles:SSO:idp-discovery-protocol",
+            ),
+            ("index", index.as_str()),
+            ("Location", location),
+        ],
+    );
+    w.into_string()
 }
 
 /// Wrap one or more element fragments in an `<md:Extensions>` container.
 pub fn extensions(fragments: &[String]) -> Extensions {
-    let mut out = String::from("<md:Extensions xmlns:md=\"");
-    out.push_str(constants::NS_MD);
-    out.push_str("\">");
+    let mut w = XmlWriter::new();
+    w.start_element("md:Extensions", &[("xmlns:md", constants::NS_MD)]);
     for f in fragments {
-        out.push_str(f);
+        // Fragments are already-serialized, trusted XML element snippets.
+        w.raw(f);
     }
-    out.push_str("</md:Extensions>");
-    Extensions::new(out)
+    w.end_element("md:Extensions");
+    Extensions::new(w.into_string())
 }
 
 // ── Readers ─────────────────────────────────────────────────────────────────

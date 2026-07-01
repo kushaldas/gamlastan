@@ -21,20 +21,21 @@ pub const SOAP11_ACTOR_NEXT: &str = "http://schemas.xmlsoap.org/soap/actor/next"
 /// Produces a SOAP envelope with the given SAML XML as the sole Body child.
 /// Optional SOAP header blocks can be included (e.g., for PAOS).
 pub fn soap_envelope_wrap(saml_xml: &str, header_blocks: Option<&str>) -> String {
-    let mut env = String::with_capacity(256 + saml_xml.len());
-    env.push_str(r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">"#);
+    let mut w = crate::xml::XmlWriter::with_capacity(256 + saml_xml.len());
+    w.start_element("soap:Envelope", &[("xmlns:soap", SOAP11_NS)]);
 
     if let Some(headers) = header_blocks {
-        env.push_str("<soap:Header>");
-        env.push_str(headers);
-        env.push_str("</soap:Header>");
+        w.start_element("soap:Header", &[]);
+        // Header blocks and the SAML body are already-serialized, trusted XML.
+        w.raw(headers);
+        w.end_element("soap:Header");
     }
 
-    env.push_str("<soap:Body>");
-    env.push_str(saml_xml);
-    env.push_str("</soap:Body>");
-    env.push_str("</soap:Envelope>");
-    env
+    w.start_element("soap:Body", &[]);
+    w.raw(saml_xml);
+    w.end_element("soap:Body");
+    w.end_element("soap:Envelope");
+    w.into_string()
 }
 
 /// Extract the SAML element from a SOAP 1.1 envelope body.
@@ -168,26 +169,39 @@ pub struct SoapUnwrapped {
 }
 
 /// Create a SOAP 1.1 Fault envelope.
+///
+/// `faultcode` (a QName such as `"soap:Server"`) and `faultstring` (a
+/// human-readable reason) are plain text and are XML-escaped.
+///
+/// `detail`, when present, is emitted **verbatim** into `<detail>`: SOAP 1.1
+/// allows the fault detail to carry application-specific XML elements, so the
+/// caller is responsible for passing already-serialized, well-formed XML (or
+/// plain text with no markup). It is not escaped - matching the behaviour before
+/// this function moved to `XmlWriter`.
 pub fn soap_fault(faultcode: &str, faultstring: &str, detail: Option<&str>) -> String {
-    let mut env = String::with_capacity(256);
-    env.push_str(r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">"#);
-    env.push_str("<soap:Body>");
-    env.push_str("<soap:Fault>");
-    env.push_str("<faultcode>");
-    env.push_str(faultcode);
-    env.push_str("</faultcode>");
-    env.push_str("<faultstring>");
-    env.push_str(faultstring);
-    env.push_str("</faultstring>");
+    let mut w = crate::xml::XmlWriter::with_capacity(256);
+    w.start_element("soap:Envelope", &[("xmlns:soap", SOAP11_NS)]);
+    w.start_element("soap:Body", &[]);
+    w.start_element("soap:Fault", &[]);
+    w.start_element("faultcode", &[]);
+    // faultcode is a QName like "soap:Client"; text() leaves it intact while
+    // escaping any special characters in the human-readable fields.
+    w.text(faultcode);
+    w.end_element("faultcode");
+    w.start_element("faultstring", &[]);
+    w.text(faultstring);
+    w.end_element("faultstring");
     if let Some(d) = detail {
-        env.push_str("<detail>");
-        env.push_str(d);
-        env.push_str("</detail>");
+        w.start_element("detail", &[]);
+        // Verbatim: <detail> commonly carries XML detail entries; the caller
+        // supplies well-formed XML. Preserves the pre-XmlWriter raw semantics.
+        w.raw(d);
+        w.end_element("detail");
     }
-    env.push_str("</soap:Fault>");
-    env.push_str("</soap:Body>");
-    env.push_str("</soap:Envelope>");
-    env
+    w.end_element("soap:Fault");
+    w.end_element("soap:Body");
+    w.end_element("soap:Envelope");
+    w.into_string()
 }
 
 /// Decode a SAML message from a SOAP request.

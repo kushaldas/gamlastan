@@ -31,22 +31,24 @@ const DSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 /// The returned XML is intended for
 /// [`AuthnRequestOptions::extensions`](crate::profiles::sso::web_browser::AuthnRequestOptions).
 pub fn sp_cert_enc_extensions_xml(certs_b64: &[&str], verify_depth: Option<u8>) -> String {
-    let mut xml = String::with_capacity(256);
-    xml.push_str(&format!(r#"<samlp:Extensions xmlns:samlp="{SAMLP_NS}">"#));
+    let mut w = crate::xml::XmlWriter::with_capacity(256);
+    w.start_element("samlp:Extensions", &[("xmlns:samlp", SAMLP_NS)]);
     for cert in certs_b64 {
         let normalized: String = cert.chars().filter(|c| !c.is_whitespace()).collect();
-        xml.push_str(&format!(r#"<pefim:SPCertEnc xmlns:pefim="{PEFIM_NS}""#));
-        if let Some(depth) = verify_depth {
-            xml.push_str(&format!(r#" VerifyDepth="{depth}""#));
+        // `depth` is declared before `attrs` so it outlives the borrow it lends.
+        let depth = verify_depth.map(|d| d.to_string());
+        let mut attrs: Vec<(&str, &str)> = vec![("xmlns:pefim", PEFIM_NS)];
+        if let Some(d) = &depth {
+            attrs.push(("VerifyDepth", d.as_str()));
         }
-        xml.push('>');
-        xml.push_str(&format!(
-            r#"<ds:KeyInfo xmlns:ds="{DSIG_NS}"><ds:X509Data><ds:X509Certificate>{normalized}</ds:X509Certificate></ds:X509Data></ds:KeyInfo>"#
-        ));
-        xml.push_str("</pefim:SPCertEnc>");
+        w.start_element("pefim:SPCertEnc", &attrs);
+        // The <ds:KeyInfo> block is built by the upstream bergshamra-keys helper
+        // (auto-escaping XML writer); it carries its own xmlns:ds.
+        w.raw(&crate::crypto::build_x509_key_info(&[normalized.as_str()]));
+        w.end_element("pefim:SPCertEnc");
     }
-    xml.push_str("</samlp:Extensions>");
-    xml
+    w.end_element("samlp:Extensions");
+    w.into_string()
 }
 
 /// Extract base64 DER certificates from `pefim:SPCertEnc` elements in raw

@@ -2,9 +2,9 @@
 // used for "Authentication for Signature" (section 7).
 
 use crate::bindings::encoding::base64_encode;
+use crate::xml::XmlWriter;
 
 use super::constants;
-use super::xmlutil::{escape_attr, escape_text};
 
 /// The MIME type of a sign message (section 7.1.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,46 +73,36 @@ impl SignMessage {
 
     /// Serialize the `<csig:SignMessage>` element (namespace-qualified).
     pub fn to_xml_string(&self) -> String {
-        let mut out = String::new();
-        out.push_str("<csig:SignMessage xmlns:csig=\"");
-        out.push_str(constants::NS_DSS_EXT);
-        out.push('"');
+        let mut w = XmlWriter::new();
+        let mut attrs: Vec<(&str, &str)> = vec![("xmlns:csig", constants::NS_DSS_EXT)];
         if let Some(de) = &self.display_entity {
-            out.push_str(" DisplayEntity=\"");
-            out.push_str(&escape_attr(de));
-            out.push('"');
+            attrs.push(("DisplayEntity", de.as_str()));
         }
         if let Some(mt) = self.mime_type {
-            out.push_str(" MimeType=\"");
-            out.push_str(mt.as_str());
-            out.push('"');
+            attrs.push(("MimeType", mt.as_str()));
         }
         if self.must_show {
-            out.push_str(" MustShow=\"true\"");
+            attrs.push(("MustShow", "true"));
         }
-        out.push('>');
+        w.start_element("csig:SignMessage", &attrs);
         let elem = if self.encrypted {
             "csig:EncryptedMessage"
         } else {
             "csig:Message"
         };
-        out.push('<');
-        out.push_str(elem);
-        out.push('>');
+        w.start_element(elem, &[]);
         if self.encrypted {
             // The body is a raw `<xenc:EncryptedData>` element; emit it verbatim.
             // Escaping it would turn the element into inert text and corrupt the
             // message.
-            out.push_str(&self.message_base64);
+            w.raw(&self.message_base64);
         } else {
-            // Base64 content is XML-safe, but escape defensively.
-            out.push_str(&escape_text(&self.message_base64));
+            // Base64 content is XML-safe, but text() escapes defensively.
+            w.text(&self.message_base64);
         }
-        out.push_str("</");
-        out.push_str(elem);
-        out.push('>');
-        out.push_str("</csig:SignMessage>");
-        out
+        w.end_element(elem);
+        w.end_element("csig:SignMessage");
+        w.into_string()
     }
 }
 
@@ -151,26 +141,25 @@ impl SadRequest {
 
     /// Serialize the `<sap:SADRequest>` element (namespace-qualified).
     pub fn to_xml_string(&self) -> String {
-        let mut out = String::new();
-        out.push_str("<sap:SADRequest xmlns:sap=\"");
-        out.push_str(constants::NS_SAP);
-        out.push_str("\" ID=\"");
-        out.push_str(&escape_attr(&self.id));
-        out.push_str("\">");
-        out.push_str("<sap:RequesterID>");
-        out.push_str(&escape_text(&self.requester_id));
-        out.push_str("</sap:RequesterID>");
-        out.push_str("<sap:SignRequestID>");
-        out.push_str(&escape_text(&self.sign_request_id));
-        out.push_str("</sap:SignRequestID>");
-        out.push_str("<sap:DocCount>");
-        out.push_str(&self.doc_count.to_string());
-        out.push_str("</sap:DocCount>");
-        out.push_str("<sap:RequestedVersion>");
-        out.push_str(&escape_text(&self.requested_version));
-        out.push_str("</sap:RequestedVersion>");
-        out.push_str("</sap:SADRequest>");
-        out
+        let mut w = XmlWriter::new();
+        w.start_element(
+            "sap:SADRequest",
+            &[("xmlns:sap", constants::NS_SAP), ("ID", &self.id)],
+        );
+        w.start_element("sap:RequesterID", &[]);
+        w.text(&self.requester_id);
+        w.end_element("sap:RequesterID");
+        w.start_element("sap:SignRequestID", &[]);
+        w.text(&self.sign_request_id);
+        w.end_element("sap:SignRequestID");
+        w.start_element("sap:DocCount", &[]);
+        w.text(&self.doc_count.to_string());
+        w.end_element("sap:DocCount");
+        w.start_element("sap:RequestedVersion", &[]);
+        w.text(&self.requested_version);
+        w.end_element("sap:RequestedVersion");
+        w.end_element("sap:SADRequest");
+        w.into_string()
     }
 }
 
