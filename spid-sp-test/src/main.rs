@@ -1467,8 +1467,9 @@ async fn main() -> io::Result<()> {
     idp_keys_manager.add_trusted_cert(idp_cert_der);
     let mut idp_verifier = SamlVerifier::new(idp_keys_manager);
     // Skip the X.509 NotBefore/NotAfter check on the *signing certificate*.
-    // The trust anchor here is the IdP key pinned via metadata (identity of the
-    // key), not the PKI validity window of its certificate; the assertion's own
+    // The trust anchor here is the IdP key pinned above (loaded from the local
+    // idp-cert.pem and added to the KeysManager) - i.e. the identity of the key,
+    // not the PKI validity window of its certificate; the assertion's own
     // temporal validity is enforced separately by the AssertionValidator /
     // SecurityConfig. bergshamra 0.6.2 began enforcing signing-cert expiry during
     // DSig verification (0.6.1 did not), which would otherwise reject a

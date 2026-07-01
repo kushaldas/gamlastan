@@ -328,7 +328,9 @@ mod tests {
         use crate::xml::serialize::SamlSerialize;
         let xml = built.request.to_xml_string().unwrap();
         let issuer_end = xml.find("</saml:Issuer>").expect("issuer serialized");
-        let ext_at = xml.find(":Extensions").expect("extensions serialized");
+        let ext_at = xml
+            .find("<saml2p:Extensions")
+            .expect("extensions serialized");
         assert!(issuer_end < ext_at, "Extensions must follow the Issuer");
 
         // Scoping/RequesterID present.
