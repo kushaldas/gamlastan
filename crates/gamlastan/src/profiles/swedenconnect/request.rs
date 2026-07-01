@@ -13,7 +13,7 @@
 // The `SignMessage`, `SADRequest`, and `PrincipalSelection` extensions are
 // carried on the typed request's `AuthnRequest::extensions` field (a serialized
 // `<saml2p:Extensions>` block). The `SamlSerialize` writer emits it in the
-// schema-correct position (after `<saml2:Issuer>`), so callers just serialize
+// schema-correct position (after `<saml:Issuer>`), so callers just serialize
 // and sign - no post-hoc string splice into the serialized XML is needed.
 
 use crate::core::protocol::request::{AuthnRequest, Scoping};
