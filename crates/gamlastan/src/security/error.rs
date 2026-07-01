@@ -114,7 +114,9 @@ pub enum SecurityError {
 /// A single validation check result.
 #[derive(Debug, Clone)]
 pub struct ValidationCheck {
-    /// The check number (1-32 per Section 7.2).
+    /// The check number. Checks 1-32 map to the Section 7.2 checklist; checks
+    /// 33-34 are the response-envelope checks (status is Success, at least one
+    /// assertion present) that gate the Section 7.2 checks.
     pub check_number: u32,
     /// Human-readable name of the check.
     pub check_name: &'static str,

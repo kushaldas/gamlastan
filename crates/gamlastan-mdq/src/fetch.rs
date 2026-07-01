@@ -52,6 +52,17 @@ impl ReqwestFetcher {
         Ok(Self { client })
     }
 
+    /// Build a fetcher with the default 10s timeout, returning an error instead
+    /// of panicking if the HTTP client cannot be constructed.
+    ///
+    /// Prefer this over [`ReqwestFetcher::default`] when the caller wants to
+    /// handle TLS-backend / platform initialization failures explicitly rather
+    /// than aborting the process.
+    pub fn try_default() -> Result<Self, MdqError> {
+        // A 10s timeout matches the Go reference.
+        Self::with_timeout(Duration::from_secs(10))
+    }
+
     /// Wrap a pre-built [`reqwest::Client`].
     pub fn from_client(client: reqwest::Client) -> Self {
         Self { client }
@@ -59,12 +70,18 @@ impl ReqwestFetcher {
 }
 
 impl Default for ReqwestFetcher {
+    /// Build a fetcher with the default 10s timeout.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying HTTP client cannot be constructed (e.g. the TLS
+    /// backend fails to initialize) — the same exceptional condition under which
+    /// [`reqwest::Client::new`] itself panics. We deliberately do **not** fall
+    /// back to reqwest's default client, because that follows redirects and
+    /// would reopen the SSRF/redirect vector this fetcher closes. Use
+    /// [`ReqwestFetcher::try_default`] to handle the failure explicitly.
     fn default() -> Self {
-        // A 10s timeout matches the Go reference. Construction failures are
-        // exceptional; do not fall back to reqwest's default client because it
-        // follows redirects.
-        Self::with_timeout(Duration::from_secs(10))
-            .expect("failed to build default MDQ HTTP client")
+        Self::try_default().expect("failed to build default MDQ HTTP client")
     }
 }
 

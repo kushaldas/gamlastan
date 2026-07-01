@@ -1,7 +1,8 @@
 // SAML 2.0 Assertion Validator
 //
 // Comprehensive validation engine implementing the 32-check validation
-// checklist from Section 7.2 of the implementation plan.
+// checklist from Section 7.2 of the implementation plan, plus two
+// response-envelope checks (33-34) that gate the Section 7.2 checks.
 //
 // Response-level checks (1-4):
 //   1. Destination matches URL
@@ -108,7 +109,8 @@ pub struct ValidationParams<'a> {
     pub now: DateTime<Utc>,
 }
 
-/// The assertion validator implements the 32-check validation checklist.
+/// The assertion validator implements the 32-check validation checklist
+/// (Section 7.2) plus two response-envelope checks (33-34).
 pub struct AssertionValidator<'a> {
     config: &'a SecurityConfig,
     replay_cache: Option<&'a dyn ReplayCache>,
@@ -139,7 +141,8 @@ impl<'a> AssertionValidator<'a> {
 
     /// Validate a SAML Response and its contained assertions.
     ///
-    /// Runs all applicable checks from the 32-check validation checklist.
+    /// Runs all applicable checks from the 32-check validation checklist,
+    /// plus the response-envelope checks (33-34).
     /// Returns a `ValidationResult` containing all check outcomes.
     pub fn validate_response(
         &self,
