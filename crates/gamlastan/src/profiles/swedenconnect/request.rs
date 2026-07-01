@@ -11,10 +11,10 @@
 // - response delivered via HTTP-POST.
 //
 // The `SignMessage`, `SADRequest`, and `PrincipalSelection` extensions are
-// returned as a serialized `<saml2p:Extensions>` block via
-// [`SwedenConnectAuthnRequest::extensions_xml`], because the core
-// `AuthnRequest` type does not model a generic extensions container. Callers
-// inject this block into the serialized request before signing.
+// carried on the typed request's `AuthnRequest::extensions` field (a serialized
+// `<saml2p:Extensions>` block). The `SamlSerialize` writer emits it in the
+// schema-correct position (after `<saml2:Issuer>`), so callers just serialize
+// and sign - no post-hoc string splice into the serialized XML is needed.
 
 use crate::core::protocol::request::{AuthnRequest, Scoping};
 use crate::profiles::sso::sp as sp_profile;
@@ -93,13 +93,12 @@ impl SwedenConnectAuthnOptions {
 #[derive(Debug, Clone)]
 pub struct SwedenConnectAuthnRequest {
     /// The typed `AuthnRequest` (serialize with `SamlSerialize`).
+    ///
+    /// Any requested `SignMessage` / `SADRequest` / `PrincipalSelection`
+    /// extension is already carried on [`AuthnRequest::extensions`], so
+    /// serializing this request emits the `<saml2p:Extensions>` block in the
+    /// schema-correct position - no separate splice step is required.
     pub request: AuthnRequest,
-
-    /// The serialized `<saml2p:Extensions>` block, if any extension
-    /// (SignMessage / SADRequest / PrincipalSelection) was requested. This must
-    /// be spliced into the serialized request immediately after the
-    /// `<saml2:Issuer>` element, before signing.
-    pub extensions_xml: Option<String>,
 }
 
 /// Combine extension element fragments into a single `<saml2p:Extensions>`
@@ -148,6 +147,21 @@ pub fn build_authn_request(
         opts.force_authn
     };
 
+    // Assemble the `<saml2p:Extensions>` block up front so it can be carried on
+    // the typed request (serialized in schema position) rather than spliced into
+    // the serialized XML afterwards.
+    let mut fragments = Vec::new();
+    if let Some(sm) = &opts.sign_message {
+        fragments.push(sm.to_xml_string());
+    }
+    if let Some(sad) = &opts.sad_request {
+        fragments.push(sad.to_xml_string());
+    }
+    if let Some(ps) = &opts.principal_selection {
+        fragments.push(ps.to_xml_string());
+    }
+    let extensions = request_extensions_xml(&fragments);
+
     let builder_opts = AuthnRequestOptions {
         sp_entity_id: cfg.entity_id.clone(),
         acs_url: opts.acs_url.clone(),
@@ -167,7 +181,7 @@ pub fn build_authn_request(
         proxy_count: opts.proxy_count,
         requester_ids: opts.requester_ids.clone(),
         attribute_consuming_service_index: opts.attribute_consuming_service_index,
-        extensions: None,
+        extensions,
     };
 
     let mut request = sp_profile::create_authn_request(&builder_opts)?;
@@ -190,23 +204,7 @@ pub fn build_authn_request(
         request.requested_authn_context = Some(requested_authn_context(&cfg.requested_loas));
     }
 
-    // Assemble the extensions block.
-    let mut fragments = Vec::new();
-    if let Some(sm) = &opts.sign_message {
-        fragments.push(sm.to_xml_string());
-    }
-    if let Some(sad) = &opts.sad_request {
-        fragments.push(sad.to_xml_string());
-    }
-    if let Some(ps) = &opts.principal_selection {
-        fragments.push(ps.to_xml_string());
-    }
-    let extensions_xml = request_extensions_xml(&fragments);
-
-    Ok(SwedenConnectAuthnRequest {
-        request,
-        extensions_xml,
-    })
+    Ok(SwedenConnectAuthnRequest { request })
 }
 
 #[cfg(test)]
@@ -257,7 +255,7 @@ mod tests {
             vec![constants::LOA3.to_string()]
         );
         // No extensions in the basic case.
-        assert!(built.extensions_xml.is_none());
+        assert!(built.request.extensions.is_none());
     }
 
     #[test]
@@ -317,11 +315,22 @@ mod tests {
         };
         let built = build_authn_request(&cfg, &opts).unwrap();
         assert_eq!(built.request.force_authn, Some(true));
-        let ext = built.extensions_xml.unwrap();
+
+        // The extensions are carried on the typed request ...
+        let ext = built.request.extensions.as_deref().unwrap();
         assert!(ext.contains("saml2p:Extensions"));
         assert!(ext.contains("csig:SignMessage"));
         assert!(ext.contains("sap:SADRequest"));
         assert!(ext.contains("psc:PrincipalSelection"));
+
+        // ... and serialize in the schema-correct position: after <saml2:Issuer>,
+        // no manual splice needed.
+        use crate::xml::serialize::SamlSerialize;
+        let xml = built.request.to_xml_string().unwrap();
+        let issuer_end = xml.find("</saml:Issuer>").expect("issuer serialized");
+        let ext_at = xml.find(":Extensions").expect("extensions serialized");
+        assert!(issuer_end < ext_at, "Extensions must follow the Issuer");
+
         // Scoping/RequesterID present.
         let scoping = built.request.scoping.as_ref().unwrap();
         assert_eq!(
