@@ -679,10 +679,11 @@ mod tests {
 
     #[test]
     fn test_request_id_tracker_consume_rejects_expired_without_later_store() {
-        let tracker = InMemoryRequestIdTracker::with_ttl(std::time::Duration::from_millis(1));
+        // A zero TTL makes every stored entry expired at consume time, so this
+        // exercises the "expired-at-consume" path deterministically without a
+        // real sleep (time-based purge is covered by the TTL-expiry test).
+        let tracker = InMemoryRequestIdTracker::with_ttl(std::time::Duration::ZERO);
         tracker.store("_req_expire");
-
-        std::thread::sleep(std::time::Duration::from_millis(10));
 
         assert!(!tracker.consume("_req_expire"));
         assert!(!tracker.consume("_req_expire"));

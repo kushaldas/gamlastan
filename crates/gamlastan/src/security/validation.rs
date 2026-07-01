@@ -2,7 +2,9 @@
 //
 // Comprehensive validation engine implementing the 32-check validation
 // checklist from Section 7.2 of the implementation plan, plus two
-// response-envelope checks (33-34) that gate the Section 7.2 checks.
+// response-envelope checks (33-34). All checks are evaluated and recorded;
+// the validator does not short-circuit, so a failed check (including 33-34)
+// marks the result invalid without suppressing the remaining check outcomes.
 //
 // Response-level checks (1-4):
 //   1. Destination matches URL
