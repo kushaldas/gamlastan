@@ -58,7 +58,9 @@
 //
 // Response envelope checks:
 //   33. Response status is Success
-//   34. At least one assertion is present
+//   34. At least one plaintext (decrypted) assertion is present. This layer
+//       validates decrypted assertions only, so a response carrying solely
+//       EncryptedAssertion elements must be decrypted before validation.
 
 use chrono::{DateTime, Utc};
 
@@ -188,14 +190,27 @@ impl<'a> AssertionValidator<'a> {
             ));
         }
 
+        // This validator operates on decrypted assertions only, so check 34
+        // requires at least one plaintext `Assertion`. When the response
+        // carries only `EncryptedAssertion` elements, report that specifically
+        // so callers know decryption must run before validation rather than
+        // treating the response as having no assertion at all.
         if response.assertions.is_empty() {
+            let detail = if response.encrypted_assertions.is_empty() {
+                SecurityError::MissingRequired("Assertion".to_string()).to_string()
+            } else {
+                "response carries only EncryptedAssertion; decrypt before validation".to_string()
+            };
             result.add(ValidationCheck::fail(
                 34,
-                "Response contains assertion",
-                SecurityError::MissingRequired("Assertion".to_string()).to_string(),
+                "Response contains plaintext assertion",
+                detail,
             ));
         } else {
-            result.add(ValidationCheck::pass(34, "Response contains assertion"));
+            result.add(ValidationCheck::pass(
+                34,
+                "Response contains plaintext assertion",
+            ));
         }
     }
 
@@ -1123,6 +1138,39 @@ mod tests {
         assert!(validator
             .validate_response_simple(&response, &params)
             .is_err());
+    }
+
+    #[test]
+    fn test_encrypted_only_response_reports_decrypt_needed() {
+        let now = Utc::now();
+        let config = SecurityConfig {
+            require_signed_assertions: false,
+            ..SecurityConfig::default()
+        };
+        let validator = AssertionValidator::new(&config);
+        let mut response = make_valid_response(now);
+        // Move the assertion out to the encrypted slot: no plaintext assertion
+        // remains, but the response is not truly assertionless.
+        response.assertions.clear();
+        response
+            .encrypted_assertions
+            .push(crate::core::assertion::types::EncryptedAssertion {
+                raw: b"<enc/>".to_vec(),
+            });
+        let params = make_params(now);
+
+        let result = validator.validate_response(&response, &params);
+        let check_34 = result
+            .checks
+            .iter()
+            .find(|c| c.check_number == 34)
+            .expect("check 34 present");
+        assert!(!check_34.passed);
+        assert!(check_34
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("decrypt before validation"));
     }
 
     #[test]
