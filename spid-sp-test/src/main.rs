@@ -1465,7 +1465,16 @@ async fn main() -> io::Result<()> {
     idp_keys_manager.add_key(idp_key);
     // Also add as trusted cert for chain validation
     idp_keys_manager.add_trusted_cert(idp_cert_der);
-    let idp_verifier = Arc::new(SamlVerifier::new(idp_keys_manager));
+    let mut idp_verifier = SamlVerifier::new(idp_keys_manager);
+    // Skip the X.509 NotBefore/NotAfter check on the *signing certificate*.
+    // The trust anchor here is the IdP key pinned via metadata (identity of the
+    // key), not the PKI validity window of its certificate; the assertion's own
+    // temporal validity is enforced separately by the AssertionValidator /
+    // SecurityConfig. bergshamra 0.6.2 began enforcing signing-cert expiry during
+    // DSig verification (0.6.1 did not), which would otherwise reject a
+    // legitimately signed Response whenever the IdP cert has passed notAfter.
+    idp_verifier.set_skip_time_checks(true);
+    let idp_verifier = Arc::new(idp_verifier);
 
     // Create replay cache and security config
     let replay_cache = Arc::new(InMemoryReplayCache::new());
