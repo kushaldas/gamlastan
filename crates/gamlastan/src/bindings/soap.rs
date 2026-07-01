@@ -169,6 +169,15 @@ pub struct SoapUnwrapped {
 }
 
 /// Create a SOAP 1.1 Fault envelope.
+///
+/// `faultcode` (a QName such as `"soap:Server"`) and `faultstring` (a
+/// human-readable reason) are plain text and are XML-escaped.
+///
+/// `detail`, when present, is emitted **verbatim** into `<detail>`: SOAP 1.1
+/// allows the fault detail to carry application-specific XML elements, so the
+/// caller is responsible for passing already-serialized, well-formed XML (or
+/// plain text with no markup). It is not escaped - matching the behaviour before
+/// this function moved to `XmlWriter`.
 pub fn soap_fault(faultcode: &str, faultstring: &str, detail: Option<&str>) -> String {
     let mut w = crate::xml::XmlWriter::with_capacity(256);
     w.start_element("soap:Envelope", &[("xmlns:soap", SOAP11_NS)]);
@@ -184,7 +193,9 @@ pub fn soap_fault(faultcode: &str, faultstring: &str, detail: Option<&str>) -> S
     w.end_element("faultstring");
     if let Some(d) = detail {
         w.start_element("detail", &[]);
-        w.text(d);
+        // Verbatim: <detail> commonly carries XML detail entries; the caller
+        // supplies well-formed XML. Preserves the pre-XmlWriter raw semantics.
+        w.raw(d);
         w.end_element("detail");
     }
     w.end_element("soap:Fault");
