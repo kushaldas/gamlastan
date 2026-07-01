@@ -51,7 +51,6 @@ pub mod principal_selection;
 pub mod request;
 pub mod response;
 pub mod sign_message;
-mod xmlutil;
 
 // Re-export the most commonly used items at the module root.
 pub use authn_context::{requested_authn_context, validate_authn_context, LevelOfAssurance};

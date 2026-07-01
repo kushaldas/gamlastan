@@ -108,14 +108,17 @@ pub fn request_extensions_xml(fragments: &[String]) -> Option<String> {
     if fragments.is_empty() {
         return None;
     }
-    let mut out = String::from("<saml2p:Extensions xmlns:saml2p=\"");
-    out.push_str(constants::NS_SAML_PROTOCOL);
-    out.push_str("\">");
+    let mut w = crate::xml::XmlWriter::new();
+    w.start_element(
+        "saml2p:Extensions",
+        &[("xmlns:saml2p", constants::NS_SAML_PROTOCOL)],
+    );
     for f in fragments {
-        out.push_str(f);
+        // Fragments are already-serialized, trusted XML element snippets.
+        w.raw(f);
     }
-    out.push_str("</saml2p:Extensions>");
-    Some(out)
+    w.end_element("saml2p:Extensions");
+    Some(w.into_string())
 }
 
 /// Build a Sweden Connect conformant `AuthnRequest`.

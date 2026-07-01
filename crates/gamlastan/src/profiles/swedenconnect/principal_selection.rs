@@ -2,9 +2,9 @@
 // sections 5.3.3 and 2.1.3.
 
 use crate::metadata::types::extensions::Extensions;
+use crate::xml::XmlWriter;
 
 use super::constants;
-use super::xmlutil::{escape_attr, escape_text};
 
 /// A single `<psc:MatchValue>` carrying a known attribute value for the
 /// principal that is about to be authenticated.
@@ -39,19 +39,14 @@ impl MatchValue {
         MatchValue::new(constants::ATTR_C, code)
     }
 
-    fn write(&self, out: &mut String) {
-        out.push_str("<psc:MatchValue");
-        out.push_str(" Name=\"");
-        out.push_str(&escape_attr(&self.name));
-        out.push('"');
+    fn write(&self, w: &mut XmlWriter) {
+        let mut attrs: Vec<(&str, &str)> = vec![("Name", self.name.as_str())];
         if let Some(nf) = &self.name_format {
-            out.push_str(" NameFormat=\"");
-            out.push_str(&escape_attr(nf));
-            out.push('"');
+            attrs.push(("NameFormat", nf.as_str()));
         }
-        out.push('>');
-        out.push_str(&escape_text(&self.value));
-        out.push_str("</psc:MatchValue>");
+        w.start_element("psc:MatchValue", &attrs);
+        w.text(&self.value);
+        w.end_element("psc:MatchValue");
     }
 }
 
@@ -73,15 +68,16 @@ impl PrincipalSelection {
     /// The result is intended to be placed inside a `<saml2p:Extensions>`
     /// element of an `AuthnRequest` (see [`super::request::request_extensions_xml`]).
     pub fn to_xml_string(&self) -> String {
-        let mut out = String::new();
-        out.push_str("<psc:PrincipalSelection xmlns:psc=\"");
-        out.push_str(constants::NS_PSC);
-        out.push_str("\">");
+        let mut w = XmlWriter::new();
+        w.start_element(
+            "psc:PrincipalSelection",
+            &[("xmlns:psc", constants::NS_PSC)],
+        );
         for mv in &self.match_values {
-            mv.write(&mut out);
+            mv.write(&mut w);
         }
-        out.push_str("</psc:PrincipalSelection>");
-        out
+        w.end_element("psc:PrincipalSelection");
+        w.into_string()
     }
 }
 
@@ -98,32 +94,30 @@ pub struct RequestedPrincipalSelection {
 impl RequestedPrincipalSelection {
     /// Serialize the `<psc:RequestedPrincipalSelection>` element.
     pub fn to_xml_string(&self) -> String {
-        let mut out = String::new();
-        out.push_str("<psc:RequestedPrincipalSelection xmlns:psc=\"");
-        out.push_str(constants::NS_PSC);
-        out.push_str("\">");
+        let mut w = XmlWriter::new();
+        w.start_element(
+            "psc:RequestedPrincipalSelection",
+            &[("xmlns:psc", constants::NS_PSC)],
+        );
         for (name, name_format) in &self.match_attributes {
-            out.push_str("<psc:MatchValue Name=\"");
-            out.push_str(&escape_attr(name));
-            out.push('"');
+            let mut attrs: Vec<(&str, &str)> = vec![("Name", name.as_str())];
             if let Some(nf) = name_format {
-                out.push_str(" NameFormat=\"");
-                out.push_str(&escape_attr(nf));
-                out.push('"');
+                attrs.push(("NameFormat", nf.as_str()));
             }
-            out.push_str("/>");
+            w.empty_element("psc:MatchValue", &attrs);
         }
-        out.push_str("</psc:RequestedPrincipalSelection>");
-        out
+        w.end_element("psc:RequestedPrincipalSelection");
+        w.into_string()
     }
 
     /// Wrap this extension in an `<md:Extensions>` container for placement under
     /// an `<md:IDPSSODescriptor>`.
     pub fn to_extensions(&self) -> Extensions {
-        Extensions::new(format!(
-            "<md:Extensions>{}</md:Extensions>",
-            self.to_xml_string()
-        ))
+        let mut w = XmlWriter::new();
+        w.start_element("md:Extensions", &[]);
+        w.raw(&self.to_xml_string());
+        w.end_element("md:Extensions");
+        Extensions::new(w.into_string())
     }
 }
 
@@ -148,8 +142,9 @@ mod tests {
         // The Name lives in an attribute (quotes escaped); the value is element
         // text (quotes left intact, but `&`/`<`/`>` escaped).
         let mv = MatchValue::new("a\"b", "x&y<z");
-        let mut s = String::new();
-        mv.write(&mut s);
+        let mut w = XmlWriter::new();
+        mv.write(&mut w);
+        let s = w.into_string();
         assert!(s.contains("Name=\"a&quot;b\""));
         assert!(s.contains(">x&amp;y&lt;z<"));
     }
