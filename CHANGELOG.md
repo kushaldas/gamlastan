@@ -7,6 +7,23 @@ where needed to correct protocol handling.
 
 ## [0.7.0] - unreleased
 
+### Security
+
+- Upgraded the XML stack to uppsala 0.8.0 and bergshamra 0.6.4, resolving the
+  workspace to a single parser instance so signature verification and SAML
+  validation run on the same hardened parser. uppsala 0.8.0 enforces the
+  reserved namespace-binding rules of Namespaces in XML 1.0 §3 (rejecting
+  `xmlns:xml` / `xmlns:xmlns` abuse that made serialization non-idempotent)
+  and is fuzz-hardened across its parse/serialize round trip.
+- `gamlastan::xml::parse_secure` now rejects DTDs **at parse time** via
+  `uppsala::Parser::with_forbid_dtd`: a `<!DOCTYPE …>` is refused at its
+  opening token, before any internal-subset parsing or entity expansion
+  occurs. Previously the document was fully parsed (within uppsala's resource
+  limits) and rejected afterwards, so an attacker could still trigger bounded
+  DTD/entity parse work; that window is gone. The rejection error carries the
+  exact line/column of the declaration, and the `locate_doctype` byte-search
+  fallback (with its exotic-spelling blind spot) is removed.
+
 ### Added
 
 - `profiles::sso::idp` response/assertion signing helpers: `signature_template`

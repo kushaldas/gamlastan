@@ -53,74 +53,34 @@ pub fn parse_saml<'a, T: SamlDeserialize<'a>>(doc: &'a Document<'a>) -> Result<T
 ///    256). These bound classic billion-laughs / quadratic-blowup
 ///    amplification and deep-nesting stack exhaustion.
 ///
-/// 2. **DTD rejection** — any document carrying a `<!DOCTYPE …>` is refused.
-///    Legitimate SAML messages never contain a DTD, so no DTD-bearing document
-///    is ever accepted past this parse boundary, removing the XXE / entity-
-///    smuggling entry point from all downstream SAML handling.
-///
-/// Note on ordering: uppsala parses the document (including any internal DTD
-/// subset, expanding internal entities within the byte/depth budgets above)
-/// *before* this function inspects [`Document::doctype`] and rejects it. The
-/// guarantee is therefore "nothing with a DTD is handed to SAML code", not
-/// "no DTD parsing work occurs" — the bounded parse work that happens before
-/// rejection is capped by uppsala's resource limits, never unbounded.
+/// 2. **DTD rejection at parse time** — the parser is built with
+///    [`uppsala::Parser::with_forbid_dtd`], so any `<!DOCTYPE …>` is refused at
+///    its opening token, before any internal-subset parsing or entity
+///    expansion occurs. Legitimate SAML messages never contain a DTD, so no
+///    DTD-bearing document is ever accepted past this parse boundary, removing
+///    the XXE / entity-smuggling entry point from all downstream SAML
+///    handling. The error carries the exact line/column of the declaration.
 ///
 /// Trusted XML the library produces itself (serialize-then-reparse round trips,
 /// unit-test fixtures) may continue to call [`uppsala::parse`] directly.
 pub fn parse_secure(xml: &str) -> Result<Document<'_>, uppsala::XmlError> {
-    let doc = uppsala::parse(xml)?;
-    if doc.doctype.is_some() {
-        let (line, column) = locate_doctype(xml).unwrap_or((1, 1));
-        return Err(uppsala::XmlError::well_formedness(
-            "DOCTYPE/DTD declarations are forbidden in SAML messages",
-            line,
-            column,
-        ));
-    }
-    Ok(doc)
-}
-
-/// Locate the `<!DOCTYPE` token and return its 1-based `(line, column)`.
-///
-/// Reports the actual position of the offending declaration so error logs point
-/// at it rather than at a misleading `1:1`. Returns `None` when the literal
-/// cannot be found (e.g. an exotic-but-valid spelling uppsala accepted that this
-/// byte search misses), so callers fall back to `1:1`.
-fn locate_doctype(xml: &str) -> Option<(usize, usize)> {
-    let offset = xml.find("<!DOCTYPE")?;
-    let mut line = 1usize;
-    let mut line_start = 0usize;
-    for (i, b) in xml.as_bytes()[..offset].iter().enumerate() {
-        if *b == b'\n' {
-            line += 1;
-            line_start = i + 1;
-        }
-    }
-    // Column counts UTF-8 characters from the line start, not raw bytes.
-    let column = xml[line_start..offset].chars().count() + 1;
-    Some((line, column))
+    uppsala::Parser::new().with_forbid_dtd(true).parse(xml)
 }
 
 #[cfg(test)]
 mod parse_secure_tests {
-    use super::{locate_doctype, parse_secure};
+    use super::parse_secure;
 
     #[test]
     fn reports_doctype_position() {
-        // DOCTYPE on its own line: line 2, column 1.
-        assert_eq!(
-            locate_doctype("<?xml version=\"1.0\"?>\n<!DOCTYPE x [ ]>\n<x/>"),
-            Some((2, 1))
+        // DOCTYPE on its own line: the parser rejects at its opening token
+        // and reports that position (line 2), not a generic 1:1.
+        let err = parse_secure("<?xml version=\"1.0\"?>\n<!DOCTYPE x [ ]>\n<x/>")
+            .expect_err("DTD-bearing document must be rejected");
+        assert!(
+            err.to_string().contains("at 2:1"),
+            "error should point at the DOCTYPE declaration, got: {err}"
         );
-        // Indented DOCTYPE on the first line: column is 1-based from line start.
-        assert_eq!(locate_doctype("   <!DOCTYPE x><x/>"), Some((1, 4)));
-        // Column counts characters, not bytes (the leading text is multi-byte).
-        assert_eq!(
-            locate_doctype("<!-- café -->\n<!DOCTYPE x><x/>"),
-            Some((2, 1))
-        );
-        // No DOCTYPE present.
-        assert_eq!(locate_doctype("<x/>"), None);
     }
 
     #[test]
