@@ -42,8 +42,8 @@ thiserror = { workspace = true }
 # Encoding
 base64 = { workspace = true }
 flate2 = { workspace = true }
+md-5 = { workspace = true }
 
 # RNG (pinned to 0.8 as in gamlastan core)
 rand = "0.8"
 regex = "1.12.4"
-
