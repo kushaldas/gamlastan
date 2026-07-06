@@ -1,7 +1,7 @@
 // gamlastan crypto encryptor - SAML encryption wrapping bergshamra::enc.
 
 use base64::Engine;
-use bergshamra_enc::{encrypt::encrypt, EncContext};
+use bergshamra_enc::{context::DEFAULT_MAX_PBKDF2_ITERATIONS, encrypt::encrypt, EncContext};
 use bergshamra_keys::{loader, KeysManager};
 
 use crate::crypto::error::CryptoError;
@@ -17,12 +17,30 @@ pub const DEFAULT_KEY_TRANSPORT_ALGORITHM: &str = "http://www.w3.org/2001/04/xml
 /// Per E93: prefer GCM modes over CBC for built-in integrity protection.
 pub struct SamlEncryptor {
     keys_manager: KeysManager,
+    max_pbkdf2_iterations: u32,
 }
 
 impl SamlEncryptor {
     /// Create a new SAML encryptor with the given key manager.
     pub fn new(keys_manager: KeysManager) -> Self {
-        Self { keys_manager }
+        Self {
+            keys_manager,
+            max_pbkdf2_iterations: DEFAULT_MAX_PBKDF2_ITERATIONS,
+        }
+    }
+
+    /// Set the maximum XML-controlled PBKDF2 iteration count accepted while
+    /// processing XML Encryption templates.
+    ///
+    /// Most SAML encryption templates do not use PBKDF2. When they do, this cap
+    /// prevents the XML template from selecting an unbounded CPU work factor.
+    pub fn set_max_pbkdf2_iterations(&mut self, max_iterations: u32) {
+        self.max_pbkdf2_iterations = max_iterations;
+    }
+
+    /// Return the configured XML Encryption PBKDF2 iteration cap.
+    pub fn max_pbkdf2_iterations(&self) -> u32 {
+        self.max_pbkdf2_iterations
     }
 
     /// Encrypt a SAML element.
@@ -33,7 +51,7 @@ impl SamlEncryptor {
     /// Per E93: prefer GCM modes (AES-128-GCM, AES-256-GCM) over CBC
     /// for built-in integrity protection.
     pub fn encrypt(&self, template_xml: &str, plaintext: &[u8]) -> Result<String, CryptoError> {
-        let ctx = EncContext::new(self.keys_manager.clone());
+        let ctx = self.enc_context();
         let encrypted = encrypt(&ctx, template_xml, plaintext)?;
         Ok(encrypted)
     }
@@ -56,6 +74,11 @@ impl SamlEncryptor {
         let mut km = KeysManager::new();
         km.add_key(key);
         Ok(SamlEncryptor::new(km))
+    }
+
+    fn enc_context(&self) -> EncContext {
+        EncContext::new(self.keys_manager.clone())
+            .with_max_pbkdf2_iterations(self.max_pbkdf2_iterations)
     }
 }
 

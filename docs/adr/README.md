@@ -43,3 +43,4 @@ rewriting history (mark the old one `Superseded by NNNN`).
 | [0032](0032-attribute-release-keys-on-trusted-name.md) | Attribute release matches on trusted Name, never SP FriendlyName | Accepted |
 | [0033](0033-idp-response-signing-helpers.md) | In-core IdP response/assertion signing helpers | Accepted |
 | [0034](0034-fail-closed-federation-boundaries.md) | Fail-closed federation helper boundaries | Accepted |
+| [0035](0035-uppsala-0.9-bergshamra-0.7-hardening-controls.md) | Adopt uppsala 0.9 and bergshamra 0.7 hardening controls | Accepted |

@@ -23,20 +23,20 @@ gamlastan-actix = { version = "0.7.0", path = "crates/gamlastan-actix" }
 gamlastan-mdq = { version = "0.7.0", path = "crates/gamlastan-mdq" }
 
 # XML parsing
-uppsala = "0.7.0"
+uppsala = "0.9.0"
 
 # XML security
-# 0.6.1 adds bergshamra_dsig::verify::verify_all, used to verify every
-# <Signature> in a multiply-signed SAML Response (Response + Assertion) and bind
-# the consumed assertion to its own signature. 0.6.2 tracks uppsala 0.7 and
-# kryptering 0.4.1 (single-instance wave).
-bergshamra = "0.6.2"
-bergshamra-core = "0.6.2"
-bergshamra-dsig = "0.6.2"
-bergshamra-enc = "0.6.2"
-bergshamra-c14n = "0.6.2"
-bergshamra-crypto = "0.6.2"
-bergshamra-keys = "0.6.2"
+# 0.7.0 tracks uppsala 0.9 and adds fail-closed DSig reference-digest,
+# inline-KeyInfo, duplicate-ID, detached-reference, and XML-Enc PBKDF2
+# hardening. Keep the stack on one bergshamra minor to avoid duplicate XML
+# security crates in the lockfile.
+bergshamra = "0.7.0"
+bergshamra-core = "0.7.0"
+bergshamra-dsig = "0.7.0"
+bergshamra-enc = "0.7.0"
+bergshamra-c14n = "0.7.0"
+bergshamra-crypto = "0.7.0"
+bergshamra-keys = "0.7.0"
 
 # HSM / PKCS#11 signing backend (the low-level crypto provider beneath
 # bergshamra). This direct dependency exists so gamlastan can re-export the
@@ -76,4 +76,3 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 
 # Tokio
 tokio = { version = "1", features = ["full"] }
-
