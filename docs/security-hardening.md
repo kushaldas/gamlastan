@@ -157,4 +157,4 @@ rather than enforces them:
 | 15 Empty AudienceRestriction | Input validation | 0031 | `test_conditions_without_audience_restriction_rejected` |
 | 16 E91 fail-open | Signature binding | 0028 | `test_unparseable_xml_fails_closed` |
 | 17 Example IdP unbound AuthnRequest | Signature binding | 0028 | `test_request_reference_covers` |
-| 2026 direct assertion-signature policy | Direct assertion signatures | 0037 | `test_response_signature_does_not_satisfy_required_assertion_signature`, `test_acs_response_signature_does_not_satisfy_assertion_signature_requirement` |
+| 18 Direct assertion-signature policy | Direct assertion signatures | 0037 | `test_response_signature_does_not_satisfy_required_assertion_signature`, `test_acs_response_signature_does_not_satisfy_assertion_signature_requirement` |

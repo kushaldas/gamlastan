@@ -478,7 +478,18 @@ pub fn verify_and_process_response(
     //    every verified XML-DSig reference so the signature can be *bound* to
     //    the Response we consume — discarding them is the XML Signature
     //    Wrapping bug.
-    let response_signature_results = verifier.verify_all_enveloped(response_xml)?;
+    let response_signature_results = match verifier.verify_all_enveloped(response_xml) {
+        Ok(results) => results,
+        Err(crate::crypto::CryptoError::BergshamraError(
+            bergshamra_core::Error::MissingElement(element),
+        )) if element == "Signature" => {
+            return Err(SwedenConnectError::ResponseNotSigned);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if response_signature_results.is_empty() {
+        return Err(SwedenConnectError::ResponseNotSigned);
+    }
 
     // 2. Decrypt the assertion (rejects cleartext assertions per section 6.1).
     let (response, was_encrypted, plaintext_assertions) =
@@ -488,11 +499,6 @@ pub fn verify_and_process_response(
     // reference is "#ID"; an empty URI signs the document root, which here is
     // the parsed `<saml2p:Response>`.
     let mut verified_signed_id_values = Vec::new();
-    if response_signature_results.is_empty() {
-        return Err(SwedenConnectError::InvalidResponseSignature(
-            "response has signature markup but no XML Signature was verified".to_string(),
-        ));
-    }
     for verify_result in response_signature_results {
         match verify_result {
             VerifyResult::Valid { references, .. } => {
@@ -810,6 +816,34 @@ mod tests {
             process_response(&cfg(), &resp, &p),
             Err(SwedenConnectError::ResponseNotSigned)
         ));
+    }
+
+    #[test]
+    fn test_verify_and_process_unsigned_response_is_not_signed() {
+        use crate::crypto::{KeysManager, SamlDecryptor, SamlVerifier};
+
+        let now = Utc::now();
+        let cache = InMemoryReplayCache::new();
+        let xml = format!(
+            r#"<saml2p:Response xmlns:saml2p="{p}" xmlns:saml2="{a}" ID="{resp}" Version="2.0" IssueInstant="2024-01-01T00:00:00Z">
+                 <saml2:Issuer>{idp}</saml2:Issuer>
+                 <saml2p:Status><saml2p:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/></saml2p:Status>
+               </saml2p:Response>"#,
+            p = constants::NS_SAML_PROTOCOL,
+            a = constants::NS_SAML_ASSERTION,
+            resp = RESP_ID,
+            idp = IDP,
+        );
+        let verifier = SamlVerifier::new(KeysManager::new());
+        let decryptor = SamlDecryptor::new(KeysManager::new());
+
+        let err =
+            verify_and_process_response(&cfg(), &xml, &verifier, &decryptor, &params(now, &cache))
+                .expect_err("unsigned response should be rejected as unsigned");
+        assert!(
+            matches!(err, SwedenConnectError::ResponseNotSigned),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
