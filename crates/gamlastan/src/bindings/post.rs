@@ -1,12 +1,16 @@
-// HTTP POST Binding (SAML Bindings Section 3.5).
-//
-// Encoding:
-// - Base64-encode the full XML message (may include signature)
-// - Place in hidden form field: <input type="hidden" name="SAMLRequest" value="...">
-// - Generate XHTML 1.0 document with onload auto-submit + noscript fallback
-// - Optional RelayState hidden field (max 80 bytes)
-// - Form action = endpoint URL, method = POST
-// - Destination attribute validation when signed
+//! HTTP POST Binding (SAML Bindings Section 3.5).
+//!
+//! POST binding carries the complete SAML XML message in an HTML form. It is the
+//! usual choice for IdP-to-SP responses and for large requests that should not
+//! be squeezed into a URL.
+//!
+//! Encoding:
+//!
+//! - base64-encode the full XML message, including any XML signatures;
+//! - place it in a hidden `SAMLRequest` or `SAMLResponse` form field;
+//! - generate an XHTML auto-submit document with a `noscript` fallback;
+//! - include RelayState as a hidden field when present;
+//! - post to the binding endpoint URL.
 
 use crate::bindings::encoding::{base64_decode, base64_encode, parse_query_string_raw, url_decode};
 use crate::bindings::error::BindingError;

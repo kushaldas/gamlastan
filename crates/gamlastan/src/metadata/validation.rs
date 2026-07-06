@@ -1,6 +1,11 @@
-// SAML 2.0 Metadata - Validation
-//
-// Validates metadata structure and resolves endpoints.
+//! Metadata validation and endpoint resolution.
+//!
+//! The type system captures the metadata shape, but runtime validation still
+//! checks required endpoint lists, forbidden `ResponseLocation` attributes on
+//! some services, protocol support declarations, and entityID constraints.
+//!
+//! Endpoint helpers implement the default and binding-preference selection rules
+//! used by SAML profiles.
 
 use crate::metadata::error::MetadataError;
 use crate::metadata::types::endpoint::{Endpoint, IndexedEndpoint};

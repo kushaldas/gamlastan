@@ -1,14 +1,71 @@
-// eduPersonTargetedID generation (pysaml2 `Eptid` equivalent).
-//
-// Generates a deterministic, per-(IdP, SP, user) opaque identifier of the
-// form `idp-entity-id!sp-entity-id!hash` and caches it in a pluggable
-// store so the same subject always receives the same value.
-//
-// Divergence from pysaml2: the default hash is SHA-256 instead of MD5, so the
-// generated values differ from a pysaml2 deployment with the same secret
-// (they are stable within gamlastan). A guarded PySAML2 MD5 compatibility mode
-// exists for migrations that must keep already-issued identifiers byte-stable;
-// prefer importing previously issued values into the store when possible.
+//! eduPersonTargetedID generation (PySAML2 `Eptid` equivalent).
+//!
+//! `Eptid` generates a deterministic, per-(IdP, SP, user) opaque identifier of
+//! the form `idp-entity-id!sp-entity-id!hash` and caches it in a pluggable
+//! store so the same subject always receives the same value.
+//!
+//! # Default profile
+//!
+//! gamlastan's default profile computes the hash with SHA-256:
+//!
+//! ```text
+//! idp_entity_id + "!" + sp_entity_id + "!" + sha256(user_id || sp_entity_id || secret)
+//! ```
+//!
+//! This is what [`Eptid::new`] and [`Eptid::with_store`] use. It is stable
+//! within gamlastan, but it is intentionally not byte-compatible with stock
+//! PySAML2's historical MD5 EPTID values.
+//!
+//! # PySAML2 MD5 compatibility
+//!
+//! Stock PySAML2's `saml2.eptid.Eptid` computed:
+//!
+//! ```text
+//! idp_entity_id + "!" + sp_entity_id + "!" + md5(user_id || sp_entity_id || secret)
+//! ```
+//!
+//! That legacy value can matter during migration because some SPs store the
+//! EPTID, or a persistent NameID derived from it, as the user's account key. If
+//! the value changes at cutover, those SPs can see the same person as a new
+//! account.
+//!
+//! Use the legacy mode only when all of these are true:
+//!
+//! - the old deployment used stock PySAML2 EPTID generation;
+//! - the old IdP entityID, SP entityID, user identifier, and EPTID secret are
+//!   known and unchanged;
+//! - the target SP has been audited and really keys accounts on this value;
+//! - there is a retirement plan for the MD5 compatibility path.
+//!
+//! Import existing mappings instead of recomputing when the old store contains
+//! hand-edited values, imported values, custom code output, or different input
+//! normalization.
+//!
+//! The compatibility path is behind an explicit guard. Selecting
+//! [`EptidDigest::Pysaml2Md5Legacy`] without `allow_legacy_md5 = true` fails at
+//! construction time:
+//!
+//! ```
+//! use gamlastan::idp::eptid::{Eptid, EptidOptions};
+//!
+//! let eptid = Eptid::try_new_with_options(
+//!     "s3cr3t",
+//!     EptidOptions::pysaml2_md5_legacy(true),
+//! )?;
+//!
+//! let value = eptid.get(
+//!     "https://idp.example.com",
+//!     "https://sp.example.com",
+//!     "alice",
+//! );
+//!
+//! assert_eq!(
+//!     value,
+//!     "https://idp.example.com!https://sp.example.com!f6ecff9c9e19881f47d0078989d14d59"
+//! );
+//!
+//! # Ok::<(), gamlastan::idp::eptid::EptidConfigError>(())
+//! ```
 
 use crate::attribute_map::eptid_attribute;
 use crate::core::assertion::attribute::Attribute;

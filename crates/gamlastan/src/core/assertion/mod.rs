@@ -1,4 +1,12 @@
-// Assertion module - SAML 2.0 assertion types in dual Ref<'a>/Owned pattern
+//! SAML 2.0 assertion types.
+//!
+//! Assertion types model subjects, NameIDs, conditions, authentication
+//! statements, authorization decision statements, attributes, and the Assertion
+//! wrapper itself. Parsed forms use borrowed `*Ref<'a>` structs; constructed
+//! forms use owned structs.
+//!
+//! Use these types when building an IdP response, inspecting an SP response, or
+//! writing profile code that needs direct access to assertion internals.
 
 pub mod attribute;
 pub mod authn;

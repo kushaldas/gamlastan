@@ -1,66 +1,19 @@
-// SAML 2.0 Assertion Validator
-//
-// Comprehensive validation engine implementing the 32-check validation
-// checklist from Section 7.2 of the implementation plan, plus two
-// response-envelope checks (33-34). All checks are evaluated and recorded;
-// the validator does not short-circuit, so a failed check (including 33-34)
-// marks the result invalid without suppressing the remaining check outcomes.
-//
-// Response-level checks (1-4):
-//   1. Destination matches URL
-//   2. Issuer format entity or omitted
-//   3. InResponseTo matches or absent for unsolicited
-//   4. Response signature valid if present
-//
-// Assertion-level checks (5-13):
-//   5. Issuer matches expected IdP
-//   6. Signature valid (MUST for POST)
-//   7. No ds:Object in signature (E91)
-//   8. Algorithm supported (E81)
-//   9. NotBefore valid with clock skew (E92)
-//   10. NotOnOrAfter valid with clock skew (E92)
-//   11. AudienceRestriction satisfied (E46)
-//   12. OneTimeUse condition
-//   13. ProxyRestriction count
-//
-// SubjectConfirmation (Bearer) checks (14-19):
-//   14. Method = bearer
-//   15. Recipient matches ACS URL
-//   16. NotOnOrAfter not expired
-//   17. InResponseTo matches
-//   18. NotBefore NOT present
-//   19. Address matches IP (optional)
-//
-// Replay check (20):
-//   20. Assertion ID not reused
-//
-// AuthnStatement checks (21-23):
-//   21. At least one present
-//   22. SessionIndex present for SLO
-//   23. SessionNotOnOrAfter upper bound (E79)
-//
-// Encryption check (24):
-//   24. CBC needs integrity (E93)
-//
-// NameID checks (25-27):
-//   25. NameIDPolicy Format adherence (E15)
-//   26. Persistent IDs never reassigned (E78)
-//   27. AllowCreate = create OR associate (E14)
-//
-// Artifact checks (28-30):
-//   28. Single-use
-//   29. Mutual auth for resolution
-//   30. Integrity+confidentiality
-//
-// RelayState checks (31-32):
-//   31. Max 80 bytes
-//   32. XSS/CSRF sanitized (E90)
-//
-// Response envelope checks:
-//   33. Response status is Success
-//   34. At least one plaintext (decrypted) assertion is present. This layer
-//       validates decrypted assertions only, so a response carrying solely
-//       EncryptedAssertion elements must be decrypted before validation.
+//! SAML 2.0 assertion and response validator.
+//!
+//! [`AssertionValidator`] implements the response/assertion validation checklist
+//! used by the SP-side profile code. All applicable checks are evaluated and
+//! recorded; a failed check marks the result invalid without hiding other
+//! failures.
+//!
+//! Response-level checks include Destination, Issuer format, InResponseTo, and
+//! response-signature status. Assertion-level checks include Issuer, signature
+//! provenance, `ds:Object` rejection, time conditions, audience restrictions,
+//! bearer SubjectConfirmation, replay, AuthnStatement, encryption, NameID, and
+//! RelayState checks. Response envelope checks ensure success status and at
+//! least one plaintext assertion.
+//!
+//! This layer validates decrypted assertions only. A response carrying only
+//! `EncryptedAssertion` elements must be decrypted before validation.
 
 use chrono::{DateTime, Utc};
 

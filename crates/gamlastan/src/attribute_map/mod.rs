@@ -1,13 +1,56 @@
-// Attribute name conversion between local (friendly) names and on-the-wire
-// SAML attribute names (pysaml2 `AttributeConverter` equivalent).
-//
-// A converter is keyed by the attribute NameFormat it understands and holds
-// case-insensitive bidirectional maps:
-// - `fro`: wire name (e.g. `urn:oid:0.9.2342.19200300.100.1.3`) -> local name (`mail`)
-// - `to`:  local name -> wire name
-//
-// The shipped maps (eduPerson, SCHAC, eIDAS, X.500, ADFS, ...) live in
-// [`maps`] and are generated from pysaml2's curated attribute maps.
+//! Attribute name conversion between local names and SAML wire names.
+//!
+//! SAML attributes carry a `Name`, usually an OID such as
+//! `urn:oid:0.9.2342.19200300.100.1.3`, and often a `NameFormat`. Application
+//! code usually wants local names such as `mail`, `givenName`, or
+//! `eduPersonPrincipalName`. This module is the bridge between those forms.
+//!
+//! The model mirrors PySAML2's `AttributeConverter`:
+//!
+//! - an [`AttributeConverter`] handles one NameFormat;
+//! - an [`AttributeConverterSet`] groups the converters an SP or IdP uses;
+//! - conversion is case-insensitive;
+//! - unknown attributes are dropped by default and can be passed through with
+//!   [`AttributeConverterSet::allow_unknown_attributes`].
+//!
+//! The shipped maps in [`maps`] are generated from PySAML2's curated attribute
+//! maps and cover eduPerson, SCHAC, eduOrg, eIDAS, X.500, Shibboleth, and ADFS
+//! naming conventions.
+//!
+//! # When to Use This Module
+//!
+//! Use this module when:
+//!
+//! - reading attributes from a SAML response and mapping them into your
+//!   application's internal names;
+//! - emitting attributes from an IdP while preserving the correct NameFormat and
+//!   wire name;
+//! - evaluating IdP release policy against local names while SP metadata names
+//!   attributes by OID;
+//! - constructing or parsing NameID-valued `eduPersonTargetedID` attributes.
+//!
+//! # Example
+//!
+//! ```
+//! use gamlastan::attribute_map::{AttributeConverterSet, LocalAttribute};
+//! use gamlastan::core::constants::ATTRNAME_FORMAT_URI;
+//!
+//! let converters = AttributeConverterSet::with_default_maps();
+//!
+//! let wire = converters.from_local(
+//!     &[
+//!         LocalAttribute::from_strings("mail", &["alice@example.org"]),
+//!         LocalAttribute::from_strings("displayName", &["Alice Example"]),
+//!     ],
+//!     ATTRNAME_FORMAT_URI,
+//! );
+//!
+//! assert_eq!(wire.len(), 2);
+//! assert_eq!(wire[0].friendly_name.as_deref(), Some("mail"));
+//!
+//! let local = converters.to_local(&wire);
+//! assert_eq!(local[0].name, "mail");
+//! ```
 
 pub mod maps;
 

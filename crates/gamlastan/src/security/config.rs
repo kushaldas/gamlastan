@@ -1,12 +1,18 @@
-// SAML 2.0 Security configuration
-//
-// Configurable parameters for the security validation engine.
-// Per Errata:
-// - E91: reject ds:Object in signatures (default true)
-// - E92: clock skew tolerance 3-5 minutes (default 180 seconds)
-// - E93: CBC mode requires integrity (default true)
-// - E90: sanitize RelayState (default true)
-// - E78: persistent ID uniqueness enforcement (default true)
+//! Security configuration for SAML validation.
+//!
+//! [`SecurityConfig::new`] gives the default SP-friendly policy: signed
+//! assertions are required, response signatures are optional, encrypted
+//! assertions are optional, Destination/Recipient checks are on, and clock skew
+//! is 180 seconds. [`SecurityConfig::strict`] enables the optional high-security
+//! requirements as well. [`SecurityConfig::permissive`] is only for tests.
+//!
+//! Relevant errata:
+//!
+//! - E78: persistent ID uniqueness enforcement;
+//! - E90: RelayState sanitization;
+//! - E91: reject `ds:Object` in signatures;
+//! - E92: configurable clock skew;
+//! - E93: CBC mode requires integrity protection.
 
 /// Security configuration for SAML validation.
 ///

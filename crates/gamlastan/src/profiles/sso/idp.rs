@@ -1,11 +1,21 @@
-// SAML 2.0 Web Browser SSO Profile - IdP side
-//
-// SAML Profiles Section 4.1
-//
-// IdP-side operations:
-// - process_authn_request: Validate incoming AuthnRequest from SP
-// - create_response: Build Response with assertions for SP
-// - create_unsolicited_response: Build unsolicited (IdP-initiated) Response
+//! IdP-side operations for the SAML 2.0 Web Browser SSO Profile.
+//!
+//! This module validates incoming AuthnRequests, extracts the SP-facing response
+//! parameters, builds SAML Responses and Assertions, creates unsolicited
+//! responses, and provides helpers for response/assertion signing and
+//! certificate-based assertion encryption.
+//!
+//! A typical IdP flow is:
+//!
+//! 1. decode the incoming message with [`crate::bindings`];
+//! 2. deserialize the AuthnRequest with [`crate::xml`];
+//! 3. resolve the trusted SP and its ACS from [`crate::metadata`];
+//! 4. call [`process_authn_request`];
+//! 5. authenticate the user and choose attributes with [`crate::idp::policy`];
+//! 6. build a response with [`create_response`] or [`create_signed_response`];
+//! 7. send the serialized response with the POST binding.
+//!
+//! SAML Profiles Section 4.1.
 
 use chrono::{DateTime, TimeDelta, Utc};
 

@@ -1,16 +1,19 @@
-// IdP attribute release policy engine (pysaml2 `Policy` equivalent).
-//
-// A `ReleasePolicy` holds per-SP entries plus a `default` entry. Each entry
-// can constrain:
-// - which attributes (and which values, via regexes) are released,
-// - entity-category based release (see `idp::entity_category`),
-// - assertion lifetime, NameID format, attribute NameFormat,
-// - signing behavior (response / assertion / on demand),
-// - whether missing SP-required attributes are an error.
-//
-// Attribute names are matched on their *local* (friendly) names,
-// case-insensitively, resolved through an `AttributeConverterSet` so that
-// wire names (`urn:oid:...`) and FriendlyNames both work.
+//! IdP attribute release policy engine.
+//!
+//! [`ReleasePolicy`] is the PySAML2 `Policy` analogue. It holds per-SP entries,
+//! registration-authority entries, and a `default` entry. Each entry can
+//! constrain:
+//!
+//! - which attributes, and optionally which values, are released;
+//! - entity-category based release through [`crate::idp::entity_category`];
+//! - assertion lifetime;
+//! - NameID format and attribute NameFormat;
+//! - signing behavior for response/assertion/on-demand signing;
+//! - whether missing SP-required attributes are an error.
+//!
+//! Attribute names are matched on local names, case-insensitively, resolved
+//! through [`crate::attribute_map::AttributeConverterSet`] so OIDs and local
+//! names can meet at a single policy surface.
 
 use std::collections::HashMap;
 

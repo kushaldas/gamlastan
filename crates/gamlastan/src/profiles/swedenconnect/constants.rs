@@ -15,11 +15,11 @@ pub const NS_SAML_ASSERTION: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
 pub const NS_SAML_PROTOCOL: &str = "urn:oasis:names:tc:SAML:2.0:protocol";
 /// SAML 2.0 metadata namespace.
 pub const NS_MD: &str = "urn:oasis:names:tc:SAML:2.0:metadata";
-/// Metadata UI extension namespace [SAML2MetaUI].
+/// Metadata UI extension namespace \[SAML2MetaUI].
 pub const NS_MDUI: &str = "urn:oasis:names:tc:SAML:metadata:ui";
-/// Metadata entity-attributes extension namespace [SAML2MetaAttr].
+/// Metadata entity-attributes extension namespace \[SAML2MetaAttr].
 pub const NS_MDATTR: &str = "urn:oasis:names:tc:SAML:metadata:attribute";
-/// Metadata algorithm-support extension namespace [SAML2MetaAlgSupport].
+/// Metadata algorithm-support extension namespace \[SAML2MetaAlgSupport].
 pub const NS_ALG: &str = "urn:oasis:names:tc:SAML:metadata:algsupport";
 /// Shibboleth metadata namespace (used for `<shibmd:Scope>`).
 pub const NS_SHIBMD: &str = "urn:mace:shibboleth:metadata:1.0";
@@ -54,7 +54,7 @@ pub const CM_HOLDER_OF_KEY: &str = "urn:oasis:names:tc:SAML:2.0:cm:holder-of-key
 pub const BINDING_HTTP_REDIRECT: &str = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect";
 /// HTTP-POST binding — used by IdPs to send Responses (and optionally requests).
 pub const BINDING_HTTP_POST: &str = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST";
-/// Holder-of-key Web Browser SSO Profile binding [SAML2HokProf].
+/// Holder-of-key Web Browser SSO Profile binding \[SAML2HokProf].
 pub const BINDING_HOK_BROWSER: &str =
     "urn:oasis:names:tc:SAML:2.0:profiles:holder-of-key:SSO:browser";
 
@@ -94,11 +94,11 @@ pub const EIDAS_NF_HIGH: &str = "http://id.elegnamnden.se/loa/1.0/eidas-nf-high"
 
 // ── Entity categories (section 2.1, [SC.EntCat]) ────────────────────────────
 
-/// Entity-category attribute name [EntCat / RFC8409].
+/// Entity-category attribute name \[EntCat / RFC8409].
 pub const ENTITY_CATEGORY_ATTR: &str = "http://macedir.org/entity-category";
-/// Entity-category-support attribute name [EntCat / RFC8409].
+/// Entity-category-support attribute name \[EntCat / RFC8409].
 pub const ENTITY_CATEGORY_SUPPORT_ATTR: &str = "http://macedir.org/entity-category-support";
-/// Assurance-certification attribute name [SAML2IAP].
+/// Assurance-certification attribute name \[SAML2IAP].
 pub const ASSURANCE_CERTIFICATION_ATTR: &str =
     "urn:oasis:names:tc:SAML:attribute:assurance-certification";
 

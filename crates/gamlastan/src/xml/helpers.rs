@@ -73,7 +73,7 @@ pub fn parse_optional_datetime_attr(
     }
 }
 
-/// Parse an xs:dateTime string into a chrono DateTime<Utc>.
+/// Parse an xs:dateTime string into a chrono `DateTime<Utc>`.
 pub fn parse_datetime(s: &str) -> Result<DateTime<Utc>, XmlError> {
     // Try RFC 3339 format first (most common in SAML)
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
@@ -89,7 +89,7 @@ pub fn parse_datetime(s: &str) -> Result<DateTime<Utc>, XmlError> {
     Err(XmlError::InvalidDateTime(s.to_string()))
 }
 
-/// Format a DateTime<Utc> as xs:dateTime string (ISO 8601 / RFC 3339).
+/// Format a `DateTime<Utc>` as xs:dateTime string (ISO 8601 / RFC 3339).
 pub fn format_datetime(dt: &DateTime<Utc>) -> String {
     dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }

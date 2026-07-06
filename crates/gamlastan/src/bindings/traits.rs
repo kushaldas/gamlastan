@@ -1,9 +1,17 @@
-// Framework-agnostic HTTP transport traits for SAML bindings.
-//
-// These traits abstract over the HTTP framework (actix-web, axum, etc.)
-// to keep the binding logic reusable.
-//
-// Reference: saml-bindings-2.0-os Section 3
+//! Framework-agnostic HTTP transport traits for SAML bindings.
+//!
+//! gamlastan binding code does not depend on actix-web, axum, hyper, or any
+//! other framework. Framework integration crates provide small adapters for
+//! these traits:
+//!
+//! - [`HttpRequest`] gives binding decoders access to query parameters, form
+//!   parameters, headers, body bytes, and the received URL;
+//! - [`HttpResponseBuilder`] lets a profile return redirects, POST forms, SOAP
+//!   envelopes, or errors in the host framework's response type;
+//! - [`SoapTransport`] abstracts the HTTP client used for back-channel SOAP;
+//! - [`ArtifactStore`] stores one-time-use artifacts.
+//!
+//! Reference: `saml-bindings-2.0-os` Section 3.
 
 /// Framework-agnostic HTTP request abstraction.
 ///

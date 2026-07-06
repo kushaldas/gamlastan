@@ -14,6 +14,39 @@
 //! - **Canonicalization** - Re-exported C14N from bergshamra
 //! - **Configuration** - Algorithm preferences and security policy
 //!
+//! ## Where Crypto Fits
+//!
+//! This module answers cryptographic questions: does a signature verify against
+//! trusted keys, which XML IDs were covered by verified references, can this
+//! ciphertext be decrypted, and how should XML be canonicalized before signing?
+//! It does not decide whether a response is acceptable for a specific SP. Feed
+//! verified signature facts into [`crate::security`] for semantic validation
+//! before consuming claims.
+//!
+//! ## Examples
+//!
+//! Compute a digest for code that needs a SAML/XML-Security algorithm URI:
+//!
+//! ```
+//! use gamlastan::crypto::digest::sha256;
+//!
+//! let digest = sha256(b"payload")?;
+//! assert_eq!(digest.len(), 32);
+//!
+//! # Ok::<(), gamlastan::crypto::CryptoError>(())
+//! ```
+//!
+//! Canonicalize XML before comparing/signing bytes:
+//!
+//! ```
+//! use gamlastan::crypto::exc_c14n;
+//!
+//! let canonical = exc_c14n("<root><child/></root>", &[])?;
+//! assert!(!canonical.is_empty());
+//!
+//! # Ok::<(), gamlastan::crypto::CryptoError>(())
+//! ```
+//!
 //! ## Errata Compliance
 //!
 //! - **E81**: Any algorithm supported by bergshamra is allowed

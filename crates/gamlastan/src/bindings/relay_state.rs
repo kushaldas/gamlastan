@@ -1,12 +1,13 @@
-// RelayState handling for SAML 2.0 protocol bindings.
-//
-// Per SAML Bindings spec:
-// - Max 80 bytes
-// - If present in request, MUST be echoed exactly in response
-// - SHOULD be integrity-protected independently
-//
-// Per Erratum E90:
-// - Sanitize for XSS/CSRF: reject javascript:, data:, HTML tags, null bytes
+//! RelayState handling for SAML 2.0 protocol bindings.
+//!
+//! RelayState is opaque application state carried next to a SAML message. The
+//! SAML bindings specification limits it to 80 bytes and requires a responder to
+//! echo a request's RelayState exactly. Applications should integrity-protect
+//! their own state before putting it here.
+//!
+//! This module also implements erratum E90 sanitization: dangerous URI schemes,
+//! HTML tags, null bytes, and control characters are rejected by
+//! [`RelayState::new`].
 
 use crate::bindings::error::BindingError;
 
