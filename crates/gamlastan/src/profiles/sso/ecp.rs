@@ -55,7 +55,7 @@ pub struct EcpAuthnRequestOptions<'a> {
 /// One-call SP-side entry point: serialize an AuthnRequest (see
 /// [`crate::profiles::sso::sp::create_authn_request`]), then wrap it here.
 /// The response must be served with Content-Type
-/// [`PAOS_CONTENT_TYPE`](crate::bindings::paos::PAOS_CONTENT_TYPE).
+/// [`PAOS_CONTENT_TYPE`].
 pub fn create_ecp_authn_request_envelope(
     options: &EcpAuthnRequestOptions<'_>,
 ) -> Result<String, ProfileError> {

@@ -1,6 +1,11 @@
-// SAML 2.0 Web Browser SSO Profile - Common types and helpers
-//
-// SAML Profiles Section 4.1
+//! Common types and helpers for the SAML 2.0 Web Browser SSO Profile.
+//!
+//! This module contains option/result structs shared by SP-side and IdP-side
+//! Web SSO code. Use [`AuthnRequestOptions`] when creating an SP AuthnRequest,
+//! [`ResponseOptions`] when creating an IdP response, and [`AuthnResult`] for
+//! data extracted from a successfully processed response.
+//!
+//! SAML Profiles Section 4.1.
 
 use crate::core::assertion::attribute::{Attribute, AttributeStatement};
 use crate::core::assertion::authn::{AuthnContext, AuthnStatement};

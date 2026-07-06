@@ -1,6 +1,13 @@
-// SAML 2.0 Metadata type definitions
-//
-// All types follow the dual Ref<'a>/Owned pattern from gamlastan core.
+//! SAML 2.0 metadata type definitions.
+//!
+//! These are typed representations of `EntityDescriptor`, role descriptors,
+//! endpoints, keys, organizations, contacts, localized strings, and supported
+//! metadata extensions. Like the core protocol model, parsed metadata uses
+//! borrowed `*Ref<'a>` structs and constructed/stored metadata uses owned
+//! structs.
+//!
+//! Use the re-exports from [`crate::metadata`] for most application code. Use
+//! this module directly when you need a specific metadata type path.
 
 pub mod additional;
 pub mod affiliation;

@@ -18,6 +18,59 @@
 //! `HttpResponseBuilder`, `SoapTransport`) that can be implemented for
 //! any web framework (actix-web, axum, etc.).
 //!
+//! ## When to Use Each Binding
+//!
+//! - Use [`redirect`] for typical SP -> IdP AuthnRequest messages. Redirect
+//!   binding compresses the XML and puts it in the query string.
+//! - Use [`post`] for large requests and most IdP -> SP responses. POST binding
+//!   base64-encodes the XML in an auto-submitting HTML form.
+//! - Use [`soap`] for back-channel profiles such as artifact resolution and
+//!   query profiles.
+//! - Use [`artifact`] when the browser carries only a short artifact and the
+//!   receiver resolves the real message over SOAP.
+//! - Use [`paos`] for ECP clients.
+//!
+//! ## Redirect Example
+//!
+//! ```
+//! use gamlastan::bindings::{redirect_encode, RedirectEncodeParams, RelayState};
+//!
+//! let relay_state = RelayState::new("state-123")?;
+//! let url = redirect_encode(&RedirectEncodeParams {
+//!     saml_xml: br#"<samlp:AuthnRequest ID="_abc"/>"#,
+//!     is_request: true,
+//!     destination: "https://idp.example.org/sso",
+//!     relay_state: Some(&relay_state),
+//!     signer: None,
+//! })?;
+//!
+//! assert!(url.starts_with("https://idp.example.org/sso?"));
+//! assert!(url.contains("SAMLRequest="));
+//! assert!(url.contains("RelayState=state-123"));
+//!
+//! # Ok::<(), gamlastan::bindings::BindingError>(())
+//! ```
+//!
+//! ## POST Example
+//!
+//! ```
+//! use gamlastan::bindings::post::post_encode;
+//! use gamlastan::bindings::RelayState;
+//!
+//! let relay_state = RelayState::new("state-123")?;
+//! let html = post_encode(
+//!     br#"<samlp:Response ID="_response"/>"#,
+//!     false,
+//!     "https://sp.example.org/acs",
+//!     Some(&relay_state),
+//! );
+//!
+//! assert!(html.contains("SAMLResponse"));
+//! assert!(html.contains("https://sp.example.org/acs"));
+//!
+//! # Ok::<(), gamlastan::bindings::BindingError>(())
+//! ```
+//!
 //! ## Errata Compliance
 //!
 //! - **E1**: RelayState covered by redirect signature

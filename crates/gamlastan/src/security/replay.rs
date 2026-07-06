@@ -1,8 +1,10 @@
-// SAML 2.0 Replay cache
-//
-// Prevents assertion replay attacks by tracking previously seen assertion IDs.
-// Per Profiles 4.1.4.5: Assertion ID must not have been previously used within
-// the validity window.
+//! Replay cache support for SAML assertion IDs.
+//!
+//! SAML Web SSO requires assertion IDs to be single-use within their validity
+//! window. [`ReplayCache`] is the storage abstraction used by
+//! [`crate::security::AssertionValidator`]. [`InMemoryReplayCache`] is suitable
+//! for tests and single-process deployments; multi-instance deployments should
+//! implement the trait over shared storage.
 
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;

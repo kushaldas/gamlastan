@@ -1,10 +1,21 @@
-// SAML 2.0 Web Browser SSO Profile - SP side
-//
-// SAML Profiles Section 4.1
-//
-// SP-side operations:
-// - create_authn_request: Build AuthnRequest for sending to IdP
-// - process_response: Validate and extract identity from Response
+//! SP-side operations for the SAML 2.0 Web Browser SSO Profile.
+//!
+//! This module builds AuthnRequests, selects IdP endpoints, selects ACS
+//! endpoints from SP metadata, and turns validated SAML Responses into
+//! [`AuthnResult`].
+//!
+//! A typical SP flow is:
+//!
+//! 1. load and validate IdP metadata with [`crate::metadata`];
+//! 2. build an AuthnRequest with [`create_authn_request`];
+//! 3. serialize and send it via [`crate::bindings::redirect`] or
+//!    [`crate::bindings::post`];
+//! 4. verify signatures with [`crate::crypto`];
+//! 5. validate response semantics with [`crate::security`];
+//! 6. call [`process_response_with_verified_signatures`] to extract the
+//!    authenticated subject and attributes.
+//!
+//! SAML Profiles Section 4.1.
 
 use chrono::{DateTime, Utc};
 

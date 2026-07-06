@@ -53,7 +53,7 @@ pub struct SwedenConnectResponseParams<'a> {
     pub response_signature_verified: bool,
     /// The SAML object IDs that the caller's signature verification actually
     /// covered, derived from the verified XML-DSig reference URIs (empty URI =
-    /// document root = the Response). When [`response_signature_verified`] is
+    /// document root = the Response). When `response_signature_verified` is
     /// `true`, this MUST contain the consumed Response ID, otherwise the
     /// signature protects some *other* object and the response is rejected as an
     /// XML Signature Wrapping attempt. Prefer [`verify_and_process_response`],

@@ -1,15 +1,23 @@
-// HTTP Redirect Binding (SAML Bindings Section 3.4).
-//
-// Encoding steps per Section 3.4.4.1:
-// 1. Strip <ds:Signature> from message XML (keep embedded assertion signatures)
-// 2. DEFLATE compress (RFC 1951 raw deflate)
-// 3. Base64 encode with NO linefeeds
-// 4. URL-encode and add as SAMLRequest= or SAMLResponse= query param
-// 5. Add RelayState= if present (URL-encoded, max 80 bytes)
-// 6. If signing: add SigAlg= param; compute signature over query string;
-//    add Signature= param
-//
-// CRITICAL: verify signature using original URL-encoded param values, NOT re-encoded.
+//! HTTP Redirect Binding (SAML Bindings Section 3.4).
+//!
+//! Redirect binding is most often used for SP-to-IdP AuthnRequest messages.
+//! The SAML XML is raw-DEFLATE compressed, base64-encoded, URL-encoded, and
+//! placed in a `SAMLRequest` or `SAMLResponse` query parameter.
+//!
+//! Encoding follows Section 3.4.4.1:
+//!
+//! 1. strip the top-level `ds:Signature` from the message XML, while keeping
+//!    embedded assertion signatures;
+//! 2. DEFLATE compress with RFC 1951 raw deflate;
+//! 3. base64 encode with no line feeds;
+//! 4. URL-encode and add `SAMLRequest=` or `SAMLResponse=`;
+//! 5. add `RelayState=` when present;
+//! 6. when signing, add `SigAlg=`, sign the exact query string, then add
+//!    `Signature=`.
+//!
+//! Signature verification must use the original URL-encoded parameter values,
+//! not a re-encoded query string. [`RedirectDecoded::signature_input`] preserves
+//! the bytes that need verification.
 
 use crate::bindings::deflate::{deflate_compress, deflate_decompress};
 use crate::bindings::encoding::{

@@ -1,4 +1,15 @@
-// Protocol module - SAML 2.0 protocol message types
+//! SAML 2.0 protocol message types.
+//!
+//! This module contains typed representations of SAML protocol messages:
+//! AuthnRequest, Response, LogoutRequest/Response, ArtifactResolve/Response,
+//! ManageNameID, NameIDMapping, AssertionIDRequest, AuthnQuery,
+//! AttributeQuery, AuthzDecisionQuery, Status, and common request/response
+//! bases.
+//!
+//! Most applications should use the profile helpers in [`crate::profiles`] to
+//! construct and validate messages. Use these types directly when implementing a
+//! custom profile, testing low-level XML behavior, or inspecting parsed protocol
+//! messages.
 
 pub mod artifact;
 pub mod logout;

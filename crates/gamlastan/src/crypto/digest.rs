@@ -1,6 +1,8 @@
-// gamlastan crypto digest - Digest computation wrapping bergshamra::crypto::digest.
-//
-// Used for: artifact SourceID (SHA-1 of entityID), reference digests, etc.
+//! Digest helpers wrapping `bergshamra_crypto`.
+//!
+//! Use this module when SAML/XML-Security specifies a digest algorithm URI.
+//! SHA-1 is exposed for protocol interoperability, notably SAML artifact
+//! SourceID computation, not as a general-purpose security recommendation.
 
 use crate::crypto::error::CryptoError;
 

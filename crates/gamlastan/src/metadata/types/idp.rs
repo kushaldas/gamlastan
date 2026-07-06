@@ -99,7 +99,9 @@ impl IdpSsoDescriptor {
     /// `use="encryption"` are skipped. Certificates are returned in document
     /// order across all matching key descriptors.
     ///
-    /// As with [`KeyDescriptor::x509_certificates_der`], an empty result means
+    /// As with
+    /// [`KeyDescriptor::x509_certificates_der`](crate::metadata::types::key_descriptor::KeyDescriptor::x509_certificates_der),
+    /// an empty result means
     /// "no signing trust anchor could be extracted" — whether the IdP
     /// advertises none or the KeyInfo was unparseable is deliberately
     /// indistinguishable. Callers MUST fail closed on an empty result and
