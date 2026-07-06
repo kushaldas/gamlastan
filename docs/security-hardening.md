@@ -33,6 +33,30 @@ sibling object does not authorize a wrapped object.
   with `MdqError::SignatureNotBound`.
 - See **ADR 0028** (binding) and **ADR 0020** (E91). Findings 1, 3, 6, 16, 17.
 
+## Direct assertion-signature policy
+
+> **Invariant:** when a deployment asks for signed assertions, the consumed
+> assertion must carry its own verified signature.
+
+`SecurityConfig::require_signed_assertions`, SAML metadata
+`WantAssertionsSigned`, and Sweden Connect `want_assertions_signed` are direct
+assertion-signature requirements. A trusted signature over the enclosing
+`<saml2p:Response>` protects the response envelope, but it does not satisfy
+that policy. The consumed Assertion ID must come from a verified assertion-level
+XML-DSig reference.
+
+The ready Actix ACS handler verifies all enveloped signatures before validation,
+so double-signed responses where the Response signature appears before the
+Assertion signature still work. Sweden Connect `verify_and_process_response`
+verifies decrypted assertion signatures after decryption, because those
+signatures are inside `EncryptedAssertion` plaintext.
+
+Deployments that intentionally accept signed Responses with unsigned Assertions
+should configure `require_signed_assertions = false` and
+`require_signed_responses = true`.
+
+- See **ADR 0037**.
+
 ## Request correlation (replay / capture-replay)
 
 > **Invariant:** a solicited response must carry and match the request it
@@ -133,3 +157,4 @@ rather than enforces them:
 | 15 Empty AudienceRestriction | Input validation | 0031 | `test_conditions_without_audience_restriction_rejected` |
 | 16 E91 fail-open | Signature binding | 0028 | `test_unparseable_xml_fails_closed` |
 | 17 Example IdP unbound AuthnRequest | Signature binding | 0028 | `test_request_reference_covers` |
+| 18 Direct assertion-signature policy | Direct assertion signatures | 0037 | `test_response_signature_does_not_satisfy_required_assertion_signature`, `test_acs_response_signature_does_not_satisfy_assertion_signature_requirement` |

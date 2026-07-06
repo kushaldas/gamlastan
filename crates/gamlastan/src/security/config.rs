@@ -1,7 +1,7 @@
 //! Security configuration for SAML validation.
 //!
 //! [`SecurityConfig::new`] gives the default SP-friendly policy: signed
-//! assertions are required, response signatures are optional, encrypted
+//! direct assertion signatures are required, response signatures are optional, encrypted
 //! assertions are optional, Destination/Recipient checks are on, and clock skew
 //! is 180 seconds. [`SecurityConfig::strict`] enables the optional high-security
 //! requirements as well. [`SecurityConfig::permissive`] is only for tests.
@@ -22,7 +22,12 @@ pub struct SecurityConfig {
     /// Clock skew tolerance in seconds (E92: default 180 = 3 minutes, recommended 180-300).
     pub clock_skew_seconds: u64,
 
-    /// Whether signed assertions are required (true for HTTP POST binding).
+    /// Whether each consumed assertion must carry its own verified signature.
+    ///
+    /// This is a direct assertion-signature policy: a verified signature over
+    /// the enclosing Response does not satisfy it. Deployments that accept
+    /// response-envelope signatures instead should set this to `false` and set
+    /// [`require_signed_responses`](Self::require_signed_responses) to `true`.
     pub require_signed_assertions: bool,
 
     /// Whether signed responses are required.

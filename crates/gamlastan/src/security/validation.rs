@@ -58,7 +58,10 @@ pub struct ValidationParams<'a> {
     ///
     /// These IDs must come from trusted XML-DSig verification over the exact
     /// response XML being validated. Signature element presence alone is not
-    /// sufficient for this list.
+    /// sufficient for this list. When
+    /// [`SecurityConfig::require_signed_assertions`] is enabled, include IDs
+    /// from all verified assertion signatures; a verified Response ID does not
+    /// satisfy the direct assertion-signature check.
     pub verified_signed_ids: &'a [&'a str],
     /// Current proxy depth (for ProxyRestriction check).
     pub current_proxy_depth: u32,
@@ -319,7 +322,7 @@ impl<'a> AssertionValidator<'a> {
     /// Run assertion-level checks (5-27) for a single assertion.
     fn check_assertion_level(
         &self,
-        response: &Response,
+        _response: &Response,
         assertion: &Assertion,
         params: &ValidationParams<'_>,
         result: &mut ValidationResult,
@@ -342,40 +345,22 @@ impl<'a> AssertionValidator<'a> {
         if assertion.has_signature {
             // A forged assertion can include a syntactically valid-looking
             // `<ds:Signature>` element. Accept it only when XML-DSig verification
-            // proved that either this assertion ID or the enclosing response ID
-            // was actually signed by a trusted key.
-            if params.verified_signed_ids.contains(&assertion.id.as_str())
-                || params
-                    .verified_signed_ids
-                    .contains(&response.base.id.as_str())
-            {
-                result.add(ValidationCheck::pass(
-                    6,
-                    "Assertion protected by verified signature",
-                ));
+            // proved that this assertion's own ID was signed by a trusted key.
+            if params.verified_signed_ids.contains(&assertion.id.as_str()) {
+                result.add(ValidationCheck::pass(6, "Assertion signature verified"));
             } else {
                 result.add(ValidationCheck::fail(
                     6,
-                    "Assertion protected by verified signature",
-                    "Assertion has signature markup but no verified signature references this assertion or its enclosing response",
+                    "Assertion signature verified",
+                    "Assertion has signature markup but no verified signature references this assertion",
                 ));
             }
         } else if self.config.require_signed_assertions {
-            if params
-                .verified_signed_ids
-                .contains(&response.base.id.as_str())
-            {
-                result.add(ValidationCheck::pass(
-                    6,
-                    "Assertion protected by verified signature",
-                ));
-            } else {
-                result.add(ValidationCheck::fail(
-                    6,
-                    "Assertion protected by verified signature",
-                    "Assertion signature required but neither assertion nor response signature was verified",
-                ));
-            }
+            result.add(ValidationCheck::fail(
+                6,
+                "Assertion signature verified",
+                "Assertion signature required but no verified assertion signature was found",
+            ));
         } else {
             result.add(ValidationCheck::pass(6, "Assertion signature not required"));
         }
@@ -1052,6 +1037,51 @@ mod tests {
             failures.is_empty(),
             "Expected no failures, got: {:?}",
             failures
+        );
+    }
+
+    #[test]
+    fn test_response_signature_does_not_satisfy_required_assertion_signature() {
+        let now = Utc::now();
+        let config = SecurityConfig::default();
+        let validator = AssertionValidator::new(&config);
+        let mut response = make_valid_response(now);
+        response.base.has_signature = true;
+        let response_id = response.base.id.as_str();
+        let verified_ids = [response_id];
+        let params = ValidationParams {
+            response_signature_verified: Some(true),
+            verified_signed_ids: &verified_ids,
+            ..make_params(now)
+        };
+
+        let result = validator.validate_response(&response, &params);
+        let failures = result.failures();
+        assert!(
+            failures.iter().any(|c| c.check_number == 6),
+            "response signature must not satisfy direct assertion-signature requirement; failures: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn test_required_assertion_signature_accepts_direct_verified_assertion_id() {
+        let now = Utc::now();
+        let config = SecurityConfig::default();
+        let validator = AssertionValidator::new(&config);
+        let mut response = make_valid_response(now);
+        response.assertions[0].has_signature = true;
+        let assertion_id = response.assertions[0].id.as_str();
+        let verified_ids = [assertion_id];
+        let params = ValidationParams {
+            verified_signed_ids: &verified_ids,
+            ..make_params(now)
+        };
+
+        let result = validator.validate_response(&response, &params);
+        assert!(
+            result.is_valid(),
+            "directly verified assertion signature should pass; failures: {:?}",
+            result.failures()
         );
     }
 

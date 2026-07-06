@@ -193,7 +193,10 @@ pub fn process_response(
 ///
 /// `verified_signed_ids` must contain only IDs returned by a trusted
 /// [`crate::crypto::SamlVerifier`] verification of the exact XML response
-/// being processed.
+/// being processed. If `config.require_signed_assertions` is enabled, callers
+/// must verify every relevant enveloped signature and include the consumed
+/// Assertion ID; a verified Response ID alone only proves response-envelope
+/// integrity.
 #[allow(clippy::too_many_arguments)]
 pub fn process_response_with_verified_signatures(
     response: &Response,

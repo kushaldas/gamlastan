@@ -21,7 +21,7 @@ use chrono::{DateTime, Utc};
 use crate::core::assertion::name_id::NameIdOrEncryptedId;
 use crate::core::assertion::types::{Assertion, AssertionRef};
 use crate::core::protocol::response::{Response, ResponseRef};
-use crate::crypto::{SamlDecryptor, SamlVerifier, VerifyResult};
+use crate::crypto::{SamlDecryptor, SamlVerifier, VerifiedReference, VerifyResult};
 use crate::profiles::error::ProfileError;
 use crate::profiles::sso::web_browser::{self, AuthnResult};
 use crate::security::replay::ReplayCache;
@@ -56,8 +56,11 @@ pub struct SwedenConnectResponseParams<'a> {
     /// document root = the Response). When `response_signature_verified` is
     /// `true`, this MUST contain the consumed Response ID, otherwise the
     /// signature protects some *other* object and the response is rejected as an
-    /// XML Signature Wrapping attempt. Prefer [`verify_and_process_response`],
-    /// which populates this for you.
+    /// XML Signature Wrapping attempt. When
+    /// [`SwedenConnectConfig::want_assertions_signed`] is enabled, it must also
+    /// contain the consumed Assertion ID from the decrypted assertion's own
+    /// verified signature. Prefer [`verify_and_process_response`], which
+    /// populates this for you.
     pub verified_signed_ids: &'a [&'a str],
     /// Whether the assertion arrived encrypted (set by [`decrypt_response`]).
     pub assertion_was_encrypted: bool,
@@ -187,16 +190,10 @@ fn validate_algorithms_recursive<'a>(
     Ok(())
 }
 
-/// Decrypt all `<saml2:EncryptedAssertion>` elements in a parsed response XML,
-/// returning a `Response` whose `assertions` hold the decrypted assertions and
-/// a flag indicating whether any encrypted assertion was present.
-///
-/// The response signature MUST be verified before calling this (decryption does
-/// not by itself authenticate the message).
-pub fn decrypt_response(
+fn decrypt_response_with_plaintexts(
     response_xml: &str,
     decryptor: &SamlDecryptor,
-) -> Result<(Response, bool), SwedenConnectError> {
+) -> Result<(Response, bool, Vec<String>), SwedenConnectError> {
     let doc = crate::xml::parse_secure(response_xml)
         .map_err(|e| SwedenConnectError::Xml(crate::xml::XmlError::ParseError(e)))?;
     let response_ref = parse_saml::<ResponseRef<'_>>(&doc)?;
@@ -215,16 +212,34 @@ pub fn decrypt_response(
     let was_encrypted = !response.encrypted_assertions.is_empty();
 
     let encrypted = std::mem::take(&mut response.encrypted_assertions);
+    let mut plaintexts = Vec::with_capacity(encrypted.len());
     for ea in &encrypted {
         let enc_xml = std::str::from_utf8(&ea.raw)
             .map_err(|e| SwedenConnectError::Other(format!("non-UTF8 EncryptedAssertion: {e}")))?;
         let plaintext = decryptor.decrypt(enc_xml)?;
-        let assertion_doc = crate::xml::parse_secure(&plaintext)
-            .map_err(|e| SwedenConnectError::Xml(crate::xml::XmlError::ParseError(e)))?;
-        let assertion_ref = parse_saml::<AssertionRef<'_>>(&assertion_doc)?;
-        response.assertions.push(assertion_ref.to_owned());
+        {
+            let assertion_doc = crate::xml::parse_secure(&plaintext)
+                .map_err(|e| SwedenConnectError::Xml(crate::xml::XmlError::ParseError(e)))?;
+            let assertion_ref = parse_saml::<AssertionRef<'_>>(&assertion_doc)?;
+            response.assertions.push(assertion_ref.to_owned());
+        }
+        plaintexts.push(plaintext);
     }
 
+    Ok((response, was_encrypted, plaintexts))
+}
+
+/// Decrypt all `<saml2:EncryptedAssertion>` elements in a parsed response XML,
+/// returning a `Response` whose `assertions` hold the decrypted assertions and
+/// a flag indicating whether any encrypted assertion was present.
+///
+/// The response signature MUST be verified before calling this (decryption does
+/// not by itself authenticate the message).
+pub fn decrypt_response(
+    response_xml: &str,
+    decryptor: &SamlDecryptor,
+) -> Result<(Response, bool), SwedenConnectError> {
+    let (response, was_encrypted, _) = decrypt_response_with_plaintexts(response_xml, decryptor)?;
     Ok((response, was_encrypted))
 }
 
@@ -437,13 +452,15 @@ pub fn process_response(
 /// supplies), this function establishes those facts itself, binding them to the
 /// exact `response_xml` bytes:
 ///
-/// 1. it verifies the enveloped XML signature over `response_xml` with
+/// 1. it verifies the enveloped Response signature over `response_xml` with
 ///    `verifier` — whose default configuration enforces trusted-keys-only,
 ///    XML-Signature-Wrapping reference-position checks, and E91 `ds:Object`
 ///    rejection (section 6.1, 6.3.1);
 /// 2. it decrypts the `<saml2:EncryptedAssertion>` with `decryptor`, rejecting
 ///    any response that also carries a cleartext assertion (section 6.1);
-/// 3. it runs [`process_response`] with the verified signature and encryption
+/// 3. it verifies decrypted assertion signatures when present, which is
+///    required when `cfg.want_assertions_signed` is enabled;
+/// 4. it runs [`process_response`] with the verified signature and encryption
 ///    facts established here.
 ///
 /// The `response_signature_verified` and `assertion_was_encrypted` fields of
@@ -457,38 +474,85 @@ pub fn verify_and_process_response(
 ) -> Result<SwedenConnectAuthnResult, SwedenConnectError> {
     validate_response_algorithms(response_xml)?;
 
-    // 1. Verify the response signature over the exact received bytes and keep the
-    //    verified XML-DSig references so the signature can be *bound* to the
-    //    Response we consume — discarding them is the XML Signature Wrapping bug.
-    let references = match verifier.verify_enveloped(response_xml)? {
-        VerifyResult::Valid { references, .. } => references,
-        VerifyResult::Invalid { reason } => {
-            return Err(SwedenConnectError::InvalidResponseSignature(reason));
+    // 1. Verify the response signature over the exact received bytes and keep
+    //    every verified XML-DSig reference so the signature can be *bound* to
+    //    the Response we consume — discarding them is the XML Signature
+    //    Wrapping bug.
+    let response_signature_results = match verifier.verify_all_enveloped(response_xml) {
+        Ok(results) => results,
+        Err(crate::crypto::CryptoError::BergshamraError(
+            bergshamra_core::Error::MissingElement(element),
+        )) if element == "Signature" => {
+            return Err(SwedenConnectError::ResponseNotSigned);
         }
+        Err(e) => return Err(e.into()),
     };
+    if response_signature_results.is_empty() {
+        return Err(SwedenConnectError::ResponseNotSigned);
+    }
 
     // 2. Decrypt the assertion (rejects cleartext assertions per section 6.1).
-    let (response, was_encrypted) = decrypt_response(response_xml, decryptor)?;
+    let (response, was_encrypted, plaintext_assertions) =
+        decrypt_response_with_plaintexts(response_xml, decryptor)?;
 
     // Convert the verified reference URIs into SAML object IDs. A same-document
     // reference is "#ID"; an empty URI signs the document root, which here is
-    // the parsed `<saml2p:Response>`. The assertion arrives encrypted, so the
-    // profile binds trust to the signed Response root rather than the assertion.
-    let mut verified_signed_ids: Vec<&str> = Vec::new();
-    for reference in &references {
-        let id = if reference.uri.is_empty() {
-            Some(response.base.id.as_str())
-        } else {
-            reference.uri.strip_prefix('#')
-        };
-        if let Some(id) = id {
-            if !verified_signed_ids.contains(&id) {
-                verified_signed_ids.push(id);
+    // the parsed `<saml2p:Response>`.
+    let mut verified_signed_id_values = Vec::new();
+    for verify_result in response_signature_results {
+        match verify_result {
+            VerifyResult::Valid { references, .. } => {
+                push_verified_reference_ids(
+                    &mut verified_signed_id_values,
+                    &references,
+                    response.base.id.as_str(),
+                );
+            }
+            VerifyResult::Invalid { reason } => {
+                return Err(SwedenConnectError::InvalidResponseSignature(reason));
             }
         }
     }
 
-    // 3. Process with the signature/encryption facts established above rather
+    // Assertion signatures are inside the encrypted plaintext, so they cannot
+    // be collected from `response_xml`. Verify them after decryption whenever
+    // the decrypted assertion actually carries signature markup; if the SP set
+    // WantAssertionsSigned and the assertion is unsigned, the shared validator
+    // below rejects it with the direct assertion-signature check.
+    for (assertion, plaintext) in response.assertions.iter().zip(plaintext_assertions.iter()) {
+        if !assertion.has_signature {
+            continue;
+        }
+
+        let assertion_results = verifier.verify_all_enveloped(plaintext)?;
+        if assertion_results.is_empty() {
+            return Err(SwedenConnectError::InvalidAssertionSignature(
+                "assertion has signature markup but no XML Signature was verified".to_string(),
+            ));
+        }
+
+        for verify_result in assertion_results {
+            match verify_result {
+                VerifyResult::Valid { references, .. } => {
+                    push_verified_reference_ids(
+                        &mut verified_signed_id_values,
+                        &references,
+                        assertion.id.as_str(),
+                    );
+                }
+                VerifyResult::Invalid { reason } => {
+                    return Err(SwedenConnectError::InvalidAssertionSignature(reason));
+                }
+            }
+        }
+    }
+
+    let verified_signed_ids: Vec<&str> = verified_signed_id_values
+        .iter()
+        .map(String::as_str)
+        .collect();
+
+    // 4. Process with the signature/encryption facts established above rather
     //    than trusted from the caller. `process_response` rejects the message if
     //    none of these verified IDs is the consumed Response ID.
     let resolved = SwedenConnectResponseParams {
@@ -498,6 +562,25 @@ pub fn verify_and_process_response(
         ..*params
     };
     process_response(cfg, &response, &resolved)
+}
+
+fn push_verified_reference_ids(
+    ids: &mut Vec<String>,
+    references: &[VerifiedReference],
+    empty_uri_id: &str,
+) {
+    for reference in references {
+        let id = if reference.uri.is_empty() {
+            Some(empty_uri_id)
+        } else {
+            reference.uri.strip_prefix('#')
+        };
+        if let Some(id) = id {
+            if !ids.iter().any(|existing| existing == id) {
+                ids.push(id.to_string());
+            }
+        }
+    }
 }
 
 fn check_confirmation_method(assertion: &Assertion) -> Result<(), SwedenConnectError> {
@@ -733,6 +816,67 @@ mod tests {
             process_response(&cfg(), &resp, &p),
             Err(SwedenConnectError::ResponseNotSigned)
         ));
+    }
+
+    #[test]
+    fn test_verify_and_process_unsigned_response_is_not_signed() {
+        use crate::crypto::{KeysManager, SamlDecryptor, SamlVerifier};
+
+        let now = Utc::now();
+        let cache = InMemoryReplayCache::new();
+        let xml = format!(
+            r#"<saml2p:Response xmlns:saml2p="{p}" xmlns:saml2="{a}" ID="{resp}" Version="2.0" IssueInstant="2024-01-01T00:00:00Z">
+                 <saml2:Issuer>{idp}</saml2:Issuer>
+                 <saml2p:Status><saml2p:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/></saml2p:Status>
+               </saml2p:Response>"#,
+            p = constants::NS_SAML_PROTOCOL,
+            a = constants::NS_SAML_ASSERTION,
+            resp = RESP_ID,
+            idp = IDP,
+        );
+        let verifier = SamlVerifier::new(KeysManager::new());
+        let decryptor = SamlDecryptor::new(KeysManager::new());
+
+        let err =
+            verify_and_process_response(&cfg(), &xml, &verifier, &decryptor, &params(now, &cache))
+                .expect_err("unsigned response should be rejected as unsigned");
+        assert!(
+            matches!(err, SwedenConnectError::ResponseNotSigned),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_want_assertions_signed_rejects_response_only_signature() {
+        let now = Utc::now();
+        let cache = InMemoryReplayCache::new();
+        let mut c = cfg();
+        c.want_assertions_signed = true;
+        let resp = make_response(now, constants::LOA3, true);
+        let p = params(now, &cache);
+
+        let err = process_response(&c, &resp, &p)
+            .expect_err("response signature must not satisfy WantAssertionsSigned");
+        assert!(err.to_string().contains(
+            "Assertion signature required but no verified assertion signature was found"
+        ));
+    }
+
+    #[test]
+    fn test_want_assertions_signed_accepts_direct_assertion_signature() {
+        let now = Utc::now();
+        let cache = InMemoryReplayCache::new();
+        let mut c = cfg();
+        c.want_assertions_signed = true;
+        let mut resp = make_response(now, constants::LOA3, true);
+        resp.assertions[0].has_signature = true;
+        let assertion_id = resp.assertions[0].id.clone();
+        let verified_ids = [RESP_ID, assertion_id.as_str()];
+        let mut p = params(now, &cache);
+        p.verified_signed_ids = &verified_ids;
+
+        let result = process_response(&c, &resp, &p).unwrap();
+        assert_eq!(result.authn.assertion_id, assertion_id);
     }
 
     #[test]
