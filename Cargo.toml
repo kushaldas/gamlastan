@@ -58,6 +58,10 @@ thiserror = "2"
 base64 = "0.22"
 flate2 = "1"
 
+# Legacy digest compatibility. Keep MD5 out of defaults; it is only used by
+# explicit migration modes such as PySAML2 EPTID compatibility.
+md-5 = "0.10"
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 

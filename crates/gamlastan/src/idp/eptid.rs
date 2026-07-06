@@ -4,11 +4,11 @@
 // form `idp-entity-id!sp-entity-id!hash` and caches it in a pluggable
 // store so the same subject always receives the same value.
 //
-// Divergence from pysaml2: the hash is SHA-256 instead of MD5, so the
+// Divergence from pysaml2: the default hash is SHA-256 instead of MD5, so the
 // generated values differ from a pysaml2 deployment with the same secret
-// (they are stable within gamlastan). MD5 is avoided on principle; if you
-// migrate from pysaml2, import the previously issued values into the
-// store instead of recomputing them.
+// (they are stable within gamlastan). A guarded PySAML2 MD5 compatibility mode
+// exists for migrations that must keep already-issued identifiers byte-stable;
+// prefer importing previously issued values into the store when possible.
 
 use crate::attribute_map::eptid_attribute;
 use crate::core::assertion::attribute::Attribute;
@@ -17,16 +17,84 @@ use crate::core::constants;
 use crate::crypto::digest::sha256;
 use crate::idp::ident::{to_hex, IdentityStore, InMemoryIdentityStore};
 
+use md5::{Digest, Md5};
+
+/// Digest profile used for generated EPTID values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EptidDigest {
+    /// gamlastan default: SHA-256 over `user_id || sp_entity_id || secret`.
+    #[default]
+    Sha256,
+    /// Legacy PySAML2 formula: MD5 over `user_id || sp_entity_id || secret`.
+    ///
+    /// This exists only for migration compatibility with already-issued
+    /// EPTIDs. Constructors reject it unless `allow_legacy_md5` is set.
+    Pysaml2Md5Legacy,
+}
+
+/// EPTID generation options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EptidOptions {
+    /// Digest profile to use.
+    pub digest: EptidDigest,
+    /// Required guard for [`EptidDigest::Pysaml2Md5Legacy`].
+    pub allow_legacy_md5: bool,
+}
+
+impl Default for EptidOptions {
+    fn default() -> Self {
+        Self {
+            digest: EptidDigest::Sha256,
+            allow_legacy_md5: false,
+        }
+    }
+}
+
+impl EptidOptions {
+    /// Default SHA-256 EPTID generation.
+    pub fn sha256() -> Self {
+        Self::default()
+    }
+
+    /// PySAML2 MD5 EPTID compatibility.
+    ///
+    /// Pass `allow_legacy_md5 = true` only for a deliberate compatibility
+    /// profile. The constructor still validates the guard.
+    pub fn pysaml2_md5_legacy(allow_legacy_md5: bool) -> Self {
+        Self {
+            digest: EptidDigest::Pysaml2Md5Legacy,
+            allow_legacy_md5,
+        }
+    }
+}
+
+/// EPTID configuration errors.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum EptidConfigError {
+    /// Legacy MD5 was requested without the explicit guard.
+    #[error("legacy PySAML2 MD5 EPTID requires allow_legacy_md5 = true")]
+    LegacyMd5RequiresExplicitAllow,
+}
+
 /// eduPersonTargetedID generator (pysaml2 `Eptid`).
 pub struct Eptid<S: IdentityStore = InMemoryIdentityStore> {
     secret: String,
     store: S,
+    options: EptidOptions,
 }
 
 impl Eptid<InMemoryIdentityStore> {
     /// Create a generator with an in-memory cache.
     pub fn new(secret: impl Into<String>) -> Self {
         Eptid::with_store(InMemoryIdentityStore::new(), secret)
+    }
+
+    /// Create a generator with explicit options and an in-memory cache.
+    pub fn try_new_with_options(
+        secret: impl Into<String>,
+        options: EptidOptions,
+    ) -> Result<Self, EptidConfigError> {
+        Eptid::try_with_store_options(InMemoryIdentityStore::new(), secret, options)
     }
 }
 
@@ -37,7 +105,22 @@ impl<S: IdentityStore> Eptid<S> {
         Eptid {
             secret: secret.into(),
             store,
+            options: EptidOptions::default(),
         }
+    }
+
+    /// Create a generator over a custom store with explicit options.
+    pub fn try_with_store_options(
+        store: S,
+        secret: impl Into<String>,
+        options: EptidOptions,
+    ) -> Result<Self, EptidConfigError> {
+        validate_options(options)?;
+        Ok(Eptid {
+            secret: secret.into(),
+            store,
+            options,
+        })
     }
 
     fn make(&self, idp_entity_id: &str, sp_entity_id: &str, user_id: &str) -> String {
@@ -45,8 +128,18 @@ impl<S: IdentityStore> Eptid<S> {
         input.extend_from_slice(user_id.as_bytes());
         input.extend_from_slice(sp_entity_id.as_bytes());
         input.extend_from_slice(self.secret.as_bytes());
-        let digest = sha256(&input).expect("SHA-256 is always available");
-        format!("{idp_entity_id}!{sp_entity_id}!{}", to_hex(&digest))
+        let hash = match self.options.digest {
+            EptidDigest::Sha256 => {
+                let digest = sha256(&input).expect("SHA-256 is always available");
+                to_hex(&digest)
+            }
+            EptidDigest::Pysaml2Md5Legacy => {
+                let mut digest = Md5::new();
+                digest.update(&input);
+                to_hex(digest.finalize().as_ref())
+            }
+        };
+        format!("{idp_entity_id}!{sp_entity_id}!{hash}")
     }
 
     fn cache_key(idp_entity_id: &str, sp_entity_id: &str, user_id: &str) -> String {
@@ -81,6 +174,13 @@ impl<S: IdentityStore> Eptid<S> {
     pub fn attribute(&self, idp_entity_id: &str, sp_entity_id: &str, user_id: &str) -> Attribute {
         eptid_attribute(vec![self.name_id(idp_entity_id, sp_entity_id, user_id)])
     }
+}
+
+fn validate_options(options: EptidOptions) -> Result<(), EptidConfigError> {
+    if options.digest == EptidDigest::Pysaml2Md5Legacy && !options.allow_legacy_md5 {
+        return Err(EptidConfigError::LegacyMd5RequiresExplicitAllow);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -135,6 +235,26 @@ mod tests {
         let one = Eptid::new("one").get(IDP, SP, "alice");
         let two = Eptid::new("two").get(IDP, SP, "alice");
         assert_ne!(one, two);
+    }
+
+    #[test]
+    fn test_legacy_md5_requires_explicit_guard() {
+        let err =
+            match Eptid::try_new_with_options("s3cr3t", EptidOptions::pysaml2_md5_legacy(false)) {
+                Ok(_) => panic!("legacy MD5 without guard should fail"),
+                Err(err) => err,
+            };
+        assert_eq!(err, EptidConfigError::LegacyMd5RequiresExplicitAllow);
+    }
+
+    #[test]
+    fn test_legacy_md5_matches_pysaml2_eptid() {
+        let eptid =
+            Eptid::try_new_with_options("s3cr3t", EptidOptions::pysaml2_md5_legacy(true)).unwrap();
+        assert_eq!(
+            eptid.get(IDP, SP, "alice"),
+            "https://idp.example.com!https://sp.example.com!f6ecff9c9e19881f47d0078989d14d59"
+        );
     }
 
     #[test]
