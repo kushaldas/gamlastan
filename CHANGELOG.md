@@ -5,7 +5,7 @@ All notable changes to this repository will be documented in this file.
 The project is still pre-1.0, so minor releases may include behavior changes
 where needed to correct protocol handling.
 
-## [0.7.0] - unreleased
+## [0.7.0] - 2026-07-06
 
 ### Added
 
@@ -18,6 +18,16 @@ where needed to correct protocol handling.
   The signature is anchored after each element's `<saml:Issuer>`, per the SAML
   schema ordering, so callers no longer hand-roll the template and splice. See
   ADR 0033.
+- Guarded PySAML2 MD5 EPTID compatibility for stock PySAML2 cutovers:
+  `idp::eptid::EptidDigest::Pysaml2Md5Legacy`, `EptidOptions`, and fallible
+  constructors. SHA-256 remains the default; legacy MD5 requires
+  `allow_legacy_md5 = true`. See ADR 0036.
+- Expanded docs.rs-facing module documentation and examples across the public
+  library surface, including attribute maps, bindings, crypto, IdP helpers,
+  metadata, profiles, PySAML2 compatibility, security defaults, and XML parsing.
+- Security hardening documentation covering signature reference binding,
+  request/response correlation, trusted SP boundaries, metadata key extraction,
+  attribute-release matching, and `KeyInfo` certificate extraction.
 
 ### Changed
 
@@ -36,9 +46,33 @@ where needed to correct protocol handling.
   `SamlVerifier::set_require_reference_digests`,
   `SamlVerifier::set_allow_raw_inline_keyinfo_with_trust_anchors`, and
   `SamlEncryptor` / `SamlDecryptor` PBKDF2 iteration caps.
+- Ready Actix IdP handlers can resolve trusted SP metadata dynamically while
+  keeping the same fail-closed trust requirements as statically configured SPs.
+  See ADR 0034.
 
 ### Security
 
+- XML-DSig verification now binds verified reference IDs to the exact SAML
+  object being consumed across ACS, MDQ, Sweden Connect, SPID, and example
+  flows. A valid signature elsewhere in the document no longer authenticates a
+  different Response or Assertion. See ADR 0028.
+- Solicited SAML response processors now require present, matching
+  `InResponseTo` values and reject dangling `InResponseTo` on otherwise
+  unsolicited flows. This covers artifact resolution, assertion query,
+  ManageNameID, NameIDMapping, Sweden Connect, and logout response handling. See
+  ADR 0029.
+- Ready IdP and federation helper boundaries now require the peer to resolve to
+  trusted metadata before issuing assertions, destroying sessions, resolving
+  artifacts, or accepting dynamically fetched entities. See ADR 0030 and
+  ADR 0034.
+- Metadata key extraction and input validation now fail closed for malformed
+  trust-anchor fragments, self-closing `X509Data`, namespace-confused X.509
+  lookalikes, duplicate Assertion IDs in SPID responses, and unsafe RelayState
+  handling. See ADR 0031.
+- Attribute release decisions now match on trusted SAML attribute `Name` values,
+  never on SP-supplied `FriendlyName`, unless PySAML2 compatibility is
+  explicitly enabled with `ReleasePolicy::allow_friendly_name_release_matching`.
+  See ADR 0032.
 - `SecurityConfig::require_signed_assertions`, SAML `WantAssertionsSigned`, and
   Sweden Connect `want_assertions_signed` now require the consumed Assertion's
   own verified signature. A verified Response signature no longer satisfies that
