@@ -317,43 +317,47 @@ fn verify_acs_response_signatures(
     // use trusted metadata keys only, so attacker-controlled inline KeyInfo does
     // not become a trust anchor.
     //
-    // `verify_enveloped` validates the signature value and all digest
-    // references. A syntactically present but forged `<ds:Signature>` becomes
-    // `Invalid` or an error and is rejected before claims are consumed.
-    let verify_result = verifier.verify_enveloped(xml).map_err(|e| {
+    // `verify_all_enveloped` validates every signature value and every digest
+    // reference. This matters for SAML responses that are signed both at the
+    // Response and Assertion level: the Response signature normally appears
+    // first, but direct assertion-signature policy must see the Assertion ID.
+    let verify_results = verifier.verify_all_enveloped(xml).map_err(|e| {
         SamlActixError::Profile(gamlastan::profiles::ProfileError::AssertionValidation(
             format!("signature verification failed: {e}"),
         ))
     })?;
-
-    let VerifyResult::Valid { references, .. } = verify_result else {
-        let reason = match verify_result {
-            VerifyResult::Invalid { reason } => reason,
-            VerifyResult::Valid { .. } => unreachable!(),
-        };
-        return Err(SamlActixError::Profile(
-            gamlastan::profiles::ProfileError::AssertionValidation(format!(
-                "signature verification failed: {reason}"
-            )),
-        ));
-    };
 
     // Step 5: Convert verified XML-DSig references into SAML object IDs. The
     // core validator compares these IDs against the parsed Response and
     // Assertion IDs, binding cryptographic verification to the objects that
     // provide the user's identity and attributes.
     let mut ids = Vec::new();
-    for reference in references {
-        // Same-document references are normally "#ID". An empty URI signs the
-        // document root, which in the ACS path is the SAML Response we parsed.
-        let id = if reference.uri.is_empty() {
-            Some(response.base.id.as_str())
-        } else {
-            reference.uri.strip_prefix('#')
+    for verify_result in verify_results {
+        let VerifyResult::Valid { references, .. } = verify_result else {
+            let reason = match verify_result {
+                VerifyResult::Invalid { reason } => reason,
+                VerifyResult::Valid { .. } => unreachable!(),
+            };
+            return Err(SamlActixError::Profile(
+                gamlastan::profiles::ProfileError::AssertionValidation(format!(
+                    "signature verification failed: {reason}"
+                )),
+            ));
         };
-        if let Some(id) = id {
-            if !ids.iter().any(|existing| existing == id) {
-                ids.push(id.to_string());
+
+        for reference in references {
+            // Same-document references are normally "#ID". An empty URI signs
+            // the document root, which in the ACS path is the SAML Response we
+            // parsed.
+            let id = if reference.uri.is_empty() {
+                Some(response.base.id.as_str())
+            } else {
+                reference.uri.strip_prefix('#')
+            };
+            if let Some(id) = id {
+                if !ids.iter().any(|existing| existing == id) {
+                    ids.push(id.to_string());
+                }
             }
         }
     }
@@ -1149,6 +1153,43 @@ mod tests {
     }
 
     #[test]
+    fn test_acs_response_signature_does_not_satisfy_assertion_signature_requirement() {
+        let now = Utc::now();
+        let response = make_test_response(
+            "_response",
+            vec![make_test_assertion("_assertion", "user@example.com", now)],
+            now,
+        );
+        let unsigned_xml = response.to_xml_string().unwrap();
+        let templated_xml = insert_response_signature_template(&unsigned_xml, "_response");
+        let signed_xml = test_signer().sign_enveloped(&templated_xml).unwrap();
+        let parsed_response = parse_response_xml(&signed_xml);
+        let config = test_sp_config_with_signing_cert(&cert_b64(SIGN_CERT_PEM));
+
+        let verified_ids =
+            verify_acs_response_signatures(&signed_xml, &parsed_response, &config).unwrap();
+        assert_eq!(verified_ids, vec!["_response".to_string()]);
+        let verified_id_refs: Vec<&str> = verified_ids.iter().map(String::as_str).collect();
+
+        let result = core_sp_profile::process_response_with_verified_signatures(
+            &parsed_response,
+            &SecurityConfig::default(),
+            None,
+            "https://sp.example.com",
+            "https://sp.example.com/acs",
+            None,
+            "https://idp.example.com",
+            &verified_id_refs,
+            now,
+        );
+
+        let err = result.expect_err("response-only signature must not satisfy assertion policy");
+        assert!(err.to_string().contains(
+            "Assertion signature required but no verified assertion signature was found"
+        ));
+    }
+
+    #[test]
     fn test_acs_wrapping_rejects_unsigned_consumed_assertion() {
         let now = Utc::now();
         let response = make_test_response(
@@ -1187,9 +1228,9 @@ mod tests {
         );
 
         let err = result.expect_err("unsigned attacker assertion must not be consumable");
-        assert!(err
-            .to_string()
-            .contains("Assertion signature required but neither assertion nor response signature was verified"));
+        assert!(err.to_string().contains(
+            "Assertion signature required but no verified assertion signature was found"
+        ));
     }
 
     #[test]
@@ -1248,6 +1289,33 @@ mod tests {
         }
         ids.sort();
         assert_eq!(ids, vec!["_assertion".to_string(), "_response".to_string()]);
+
+        // The ACS helper must use the all-signature path too; otherwise the
+        // core direct-assertion policy only sees the Response ID.
+        let parsed_response = parse_response_xml(&double_signed);
+        let verified_ids =
+            verify_acs_response_signatures(&double_signed, &parsed_response, &config).unwrap();
+        assert_eq!(
+            verified_ids,
+            vec!["_response".to_string(), "_assertion".to_string()]
+        );
+
+        let verified_id_refs: Vec<&str> = verified_ids.iter().map(String::as_str).collect();
+        let result = core_sp_profile::process_response_with_verified_signatures(
+            &parsed_response,
+            &SecurityConfig::default(),
+            None,
+            "https://sp.example.com",
+            "https://sp.example.com/acs",
+            None,
+            "https://idp.example.com",
+            &verified_id_refs,
+            now,
+        );
+        assert!(
+            result.is_ok(),
+            "double-signed response should satisfy direct assertion policy: {result:?}"
+        );
     }
 
     #[test]

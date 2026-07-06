@@ -31,6 +31,11 @@ pub enum SwedenConnectError {
     /// (section 6.3.1).
     InvalidResponseSignature(String),
 
+    /// A decrypted assertion carried an assertion-level signature, but that
+    /// signature failed cryptographic verification or could not be bound to a
+    /// verified XML-DSig reference.
+    InvalidAssertionSignature(String),
+
     /// A valid signature was present, but none of its verified XML-DSig
     /// references covered the `<saml2p:Response>` that supplies the identity and
     /// attributes consumed below. This is the XML Signature Wrapping defence: a
@@ -158,6 +163,9 @@ impl std::fmt::Display for SwedenConnectError {
             }
             SwedenConnectError::InvalidResponseSignature(reason) => {
                 write!(f, "Response signature verification failed: {reason}")
+            }
+            SwedenConnectError::InvalidAssertionSignature(reason) => {
+                write!(f, "Assertion signature verification failed: {reason}")
             }
             SwedenConnectError::SignatureNotBoundToResponse => {
                 write!(

@@ -18,6 +18,13 @@
 //! [`validation::ValidationParams`] so this layer can bind those cryptographic
 //! facts to the assertion/response you are about to consume.
 //!
+//! [`SecurityConfig::require_signed_assertions`] means every consumed
+//! `<saml:Assertion>` must carry its own verified signature. A verified
+//! `<samlp:Response>` signature proves response-envelope integrity, but it does
+//! not satisfy that direct assertion-signature policy. Deployments that accept
+//! signed responses with unsigned assertions should set
+//! `require_signed_assertions = false` and `require_signed_responses = true`.
+//!
 //! # Key Errata and Defaults
 //!
 //! - E14: `AllowCreate` means create or associate.

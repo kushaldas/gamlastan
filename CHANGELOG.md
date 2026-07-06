@@ -39,6 +39,13 @@ where needed to correct protocol handling.
 
 ### Security
 
+- `SecurityConfig::require_signed_assertions`, SAML `WantAssertionsSigned`, and
+  Sweden Connect `want_assertions_signed` now require the consumed Assertion's
+  own verified signature. A verified Response signature no longer satisfies that
+  direct assertion-signature policy. The Actix ACS helper now verifies all
+  enveloped signatures so double-signed Responses still collect both Response
+  and Assertion reference IDs, and Sweden Connect `verify_and_process_response`
+  verifies decrypted assertion signatures after decryption. See ADR 0037.
 - `parse_secure` now rejects `<!DOCTYPE>` at Uppsala parse time instead of
   parsing a bounded DTD and rejecting the resulting document afterward.
 - Uppsala 0.9 includes the 0.8 reserved namespace-binding hardening, so illegal
