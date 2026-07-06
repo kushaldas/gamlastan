@@ -38,89 +38,131 @@ pub fn parse_saml<'a, T: SamlDeserialize<'a>>(doc: &'a Document<'a>) -> Result<T
     T::from_xml(doc, root)
 }
 
+/// Parser policy for [`parse_secure_with_config`].
+///
+/// The default is the SAML-safe policy used by [`parse_secure`]: keep uppsala's
+/// default resource caps, reject `<!DOCTYPE>` at parse time, and reject entity
+/// declarations if a caller deliberately allows a DTD for a non-SAML use case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SecureParseConfig {
+    /// Maximum element nesting depth accepted by the parser.
+    pub max_depth: u32,
+    /// Maximum total bytes of entity expansion accepted during one parse.
+    pub max_entity_expansion: usize,
+    /// Reject any `<!DOCTYPE>` declaration before parsing its internal subset.
+    pub forbid_dtd: bool,
+    /// Reject `<!ENTITY>` declarations inside a DTD.
+    pub forbid_entities: bool,
+}
+
+impl Default for SecureParseConfig {
+    fn default() -> Self {
+        Self {
+            max_depth: uppsala::parser::DEFAULT_MAX_DEPTH,
+            max_entity_expansion: uppsala::parser::DEFAULT_MAX_ENTITY_EXPANSION,
+            forbid_dtd: true,
+            forbid_entities: true,
+        }
+    }
+}
+
+impl SecureParseConfig {
+    /// Create the default SAML-safe parse policy.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Override the maximum element nesting depth.
+    pub fn with_max_depth(mut self, max_depth: u32) -> Self {
+        self.max_depth = max_depth;
+        self
+    }
+
+    /// Override the maximum total bytes of entity expansion per parse.
+    pub fn with_max_entity_expansion(mut self, max_bytes: usize) -> Self {
+        self.max_entity_expansion = max_bytes;
+        self
+    }
+
+    /// Configure whether `<!DOCTYPE>` is rejected at parse time.
+    ///
+    /// Leave this enabled for SAML. Disabling it is intended only for callers
+    /// reusing gamlastan's XML helpers on trusted, non-SAML XML.
+    pub fn with_forbid_dtd(mut self, forbid: bool) -> Self {
+        self.forbid_dtd = forbid;
+        self
+    }
+
+    /// Configure whether `<!ENTITY>` declarations are rejected inside a DTD.
+    ///
+    /// This matters only when [`with_forbid_dtd`](Self::with_forbid_dtd) is set
+    /// to `false`; rejecting the whole DTD is stricter and remains the default.
+    pub fn with_forbid_entities(mut self, forbid: bool) -> Self {
+        self.forbid_entities = forbid;
+        self
+    }
+
+    fn parser(self) -> uppsala::Parser {
+        uppsala::Parser::new()
+            .with_max_depth(self.max_depth)
+            .with_max_entity_expansion(self.max_entity_expansion)
+            .with_forbid_dtd(self.forbid_dtd)
+            .with_forbid_entities(self.forbid_entities)
+    }
+}
+
 /// Parse untrusted SAML XML with SAML-specific input hardening.
 ///
 /// This is the parse entry point for any attacker-controlled XML (inbound
 /// protocol messages, SOAP/PAOS envelopes, remote metadata, KeyInfo fragments,
 /// decrypted assertions). It is a drop-in replacement for [`uppsala::parse`]
-/// (same return type) and layers two defenses:
+/// (same return type) and applies [`SecureParseConfig::default`]:
 ///
-/// 1. **uppsala 0.5 resource limits** — inherited automatically from
-///    [`uppsala::parse`]: element-nesting depth cap
+/// 1. **uppsala resource limits** — element-nesting depth cap
 ///    ([`uppsala::parser::DEFAULT_MAX_DEPTH`], 128), entity-expansion byte
 ///    budget ([`uppsala::parser::DEFAULT_MAX_ENTITY_EXPANSION`], 1 MiB), and
 ///    entity-nesting depth cap ([`uppsala::parser::DEFAULT_MAX_ENTITY_DEPTH`],
 ///    256). These bound classic billion-laughs / quadratic-blowup
 ///    amplification and deep-nesting stack exhaustion.
 ///
-/// 2. **DTD rejection** — any document carrying a `<!DOCTYPE …>` is refused.
+/// 2. **parse-time DTD/entity rejection** — any document carrying a
+///    `<!DOCTYPE …>` is refused before the DTD internal subset is parsed.
 ///    Legitimate SAML messages never contain a DTD, so no DTD-bearing document
 ///    is ever accepted past this parse boundary, removing the XXE / entity-
 ///    smuggling entry point from all downstream SAML handling.
 ///
-/// Note on ordering: uppsala parses the document (including any internal DTD
-/// subset, expanding internal entities within the byte/depth budgets above)
-/// *before* this function inspects [`Document::doctype`] and rejects it. The
-/// guarantee is therefore "nothing with a DTD is handed to SAML code", not
-/// "no DTD parsing work occurs" — the bounded parse work that happens before
-/// rejection is capped by uppsala's resource limits, never unbounded.
-///
 /// Trusted XML the library produces itself (serialize-then-reparse round trips,
 /// unit-test fixtures) may continue to call [`uppsala::parse`] directly.
 pub fn parse_secure(xml: &str) -> Result<Document<'_>, uppsala::XmlError> {
-    let doc = uppsala::parse(xml)?;
-    if doc.doctype.is_some() {
-        let (line, column) = locate_doctype(xml).unwrap_or((1, 1));
-        return Err(uppsala::XmlError::well_formedness(
-            "DOCTYPE/DTD declarations are forbidden in SAML messages",
-            line,
-            column,
-        ));
-    }
-    Ok(doc)
+    parse_secure_with_config(xml, &SecureParseConfig::default())
 }
 
-/// Locate the `<!DOCTYPE` token and return its 1-based `(line, column)`.
+/// Parse XML with an explicit secure parse policy.
 ///
-/// Reports the actual position of the offending declaration so error logs point
-/// at it rather than at a misleading `1:1`. Returns `None` when the literal
-/// cannot be found (e.g. an exotic-but-valid spelling uppsala accepted that this
-/// byte search misses), so callers fall back to `1:1`.
-fn locate_doctype(xml: &str) -> Option<(usize, usize)> {
-    let offset = xml.find("<!DOCTYPE")?;
-    let mut line = 1usize;
-    let mut line_start = 0usize;
-    for (i, b) in xml.as_bytes()[..offset].iter().enumerate() {
-        if *b == b'\n' {
-            line += 1;
-            line_start = i + 1;
-        }
-    }
-    // Column counts UTF-8 characters from the line start, not raw bytes.
-    let column = xml[line_start..offset].chars().count() + 1;
-    Some((line, column))
+/// `parse_secure` is the recommended SAML entry point. This variant exists for
+/// callers that need to tune uppsala's parser caps while keeping the same
+/// fail-closed parser surface.
+pub fn parse_secure_with_config<'a>(
+    xml: &'a str,
+    config: &SecureParseConfig,
+) -> Result<Document<'a>, uppsala::XmlError> {
+    config.parser().parse(xml)
 }
 
 #[cfg(test)]
 mod parse_secure_tests {
-    use super::{locate_doctype, parse_secure};
+    use super::{parse_secure, parse_secure_with_config, SecureParseConfig};
 
     #[test]
-    fn reports_doctype_position() {
-        // DOCTYPE on its own line: line 2, column 1.
+    fn secure_config_defaults_to_saml_safe_policy() {
+        let config = SecureParseConfig::default();
+        assert_eq!(config.max_depth, uppsala::parser::DEFAULT_MAX_DEPTH);
         assert_eq!(
-            locate_doctype("<?xml version=\"1.0\"?>\n<!DOCTYPE x [ ]>\n<x/>"),
-            Some((2, 1))
+            config.max_entity_expansion,
+            uppsala::parser::DEFAULT_MAX_ENTITY_EXPANSION
         );
-        // Indented DOCTYPE on the first line: column is 1-based from line start.
-        assert_eq!(locate_doctype("   <!DOCTYPE x><x/>"), Some((1, 4)));
-        // Column counts characters, not bytes (the leading text is multi-byte).
-        assert_eq!(
-            locate_doctype("<!-- café -->\n<!DOCTYPE x><x/>"),
-            Some((2, 1))
-        );
-        // No DOCTYPE present.
-        assert_eq!(locate_doctype("<x/>"), None);
+        assert!(config.forbid_dtd);
+        assert!(config.forbid_entities);
     }
 
     #[test]
@@ -151,9 +193,39 @@ mod parse_secure_tests {
     }
 
     #[test]
+    fn reports_doctype_position_from_parser() {
+        // DOCTYPE on its own line: uppsala rejects at its opening token and
+        // reports that position (line 2), not a generic 1:1.
+        let err = parse_secure("<?xml version=\"1.0\"?>\n<!DOCTYPE x [ ]>\n<x/>")
+            .expect_err("DTD-bearing document must be rejected");
+        assert!(
+            err.to_string().contains("at 2:1"),
+            "error should point at the DOCTYPE declaration, got: {err}"
+        );
+    }
+
+    #[test]
     fn accepts_well_formed_saml_without_dtd() {
         let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_1"/>"#;
         let doc = parse_secure(xml).expect("DTD-free SAML must parse");
         assert!(doc.document_element().is_some());
+    }
+
+    #[test]
+    fn explicit_policy_can_tighten_depth_limit() {
+        let xml = "<a><b/></a>";
+        assert!(parse_secure(xml).is_ok());
+
+        let config = SecureParseConfig::new().with_max_depth(1);
+        assert!(parse_secure_with_config(xml, &config).is_err());
+    }
+
+    #[test]
+    fn explicit_policy_can_allow_dtd_but_reject_entities() {
+        let xml = r#"<!DOCTYPE Response [ <!ENTITY x "expanded"> ]><Response/>"#;
+        let config = SecureParseConfig::new()
+            .with_forbid_dtd(false)
+            .with_forbid_entities(true);
+        assert!(parse_secure_with_config(xml, &config).is_err());
     }
 }

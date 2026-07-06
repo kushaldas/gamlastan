@@ -28,6 +28,28 @@ where needed to correct protocol handling.
   `<saml:Issuer>`). The `SwedenConnectAuthnRequest::extensions_xml` field is
   removed: callers no longer splice a separate extensions string into the
   serialized XML - they just serialize and sign the request.
+- `xml::SecureParseConfig` and `parse_secure_with_config`, exposing uppsala's
+  parser hardening knobs (`max_depth`, `max_entity_expansion`, parse-time DTD
+  rejection, and entity-declaration rejection) while keeping `parse_secure`
+  fail-closed for SAML by default.
+- Crypto hardening knobs for the bergshamra 0.7 stack:
+  `SamlVerifier::set_require_reference_digests`,
+  `SamlVerifier::set_allow_raw_inline_keyinfo_with_trust_anchors`, and
+  `SamlEncryptor` / `SamlDecryptor` PBKDF2 iteration caps.
+
+### Security
+
+- `parse_secure` now rejects `<!DOCTYPE>` at Uppsala parse time instead of
+  parsing a bounded DTD and rejecting the resulting document afterward.
+- Uppsala 0.9 includes the 0.8 reserved namespace-binding hardening, so illegal
+  `xml` / `xmlns` namespace bindings are rejected by the parser instead of
+  being accepted into a non-idempotent DOM.
+- XML-DSig verification now keeps bergshamra 0.7's local reference-digest
+  requirement enabled by default and continues to reject raw inline signing keys
+  when trust anchors are configured. The default HMAC truncation floor follows
+  bergshamra's hardened 160-bit policy.
+- Lockfile-only `anyhow` update to 1.0.103 clears RUSTSEC-2026-0190 from
+  `cargo audit --deny warnings`.
 
 ## [0.6.0] - 2026-06-28
 

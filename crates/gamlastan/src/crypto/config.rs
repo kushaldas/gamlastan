@@ -31,8 +31,20 @@ pub struct CryptoConfig {
     pub reject_ds_object: bool,
 
     /// Minimum HMAC output length (in bits) to prevent truncation attacks
-    /// (CVE-2009-0217). Default: 128 bits.
+    /// (CVE-2009-0217). Default: 160 bits.
     pub hmac_min_output_length: usize,
+
+    /// Require every XML-DSig reference digest to be verified locally.
+    /// Default: true.
+    pub require_reference_digests: bool,
+
+    /// Allow raw inline KeyValue / DEREncodedKeyValue signatures even when
+    /// trust anchors are configured. Default: false.
+    pub allow_raw_inline_keyinfo_with_trust_anchors: bool,
+
+    /// Maximum XML Encryption PBKDF2 iterations accepted from XML-controlled
+    /// parameters. Default matches bergshamra.
+    pub max_pbkdf2_iterations: u32,
 }
 
 impl Default for CryptoConfig {
@@ -45,7 +57,10 @@ impl Default for CryptoConfig {
                 .to_string(),
             preferred_key_wrap_algorithm: "http://www.w3.org/2001/04/xmlenc#kw-aes256".to_string(),
             reject_ds_object: true,
-            hmac_min_output_length: 128,
+            hmac_min_output_length: 160,
+            require_reference_digests: true,
+            allow_raw_inline_keyinfo_with_trust_anchors: false,
+            max_pbkdf2_iterations: bergshamra_enc::context::DEFAULT_MAX_PBKDF2_ITERATIONS,
         }
     }
 }

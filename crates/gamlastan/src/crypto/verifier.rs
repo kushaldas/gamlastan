@@ -8,6 +8,8 @@ use bergshamra_keys::{KeyUsage, KeysManager};
 
 use crate::crypto::error::CryptoError;
 
+const DEFAULT_HMAC_MIN_OUT_LEN_BITS: usize = 160;
+
 /// SAML-specific signature verifier that wraps bergshamra's XML-DSig verification.
 ///
 /// Provides two verification modes:
@@ -39,8 +41,14 @@ pub struct SamlVerifier {
     /// Useful when the IdP certificate has expired but is still functionally valid.
     skip_time_checks: bool,
     /// Minimum HMAC output length in bits to prevent HMAC truncation attacks
-    /// (CVE-2009-0217). Default: 128 bits.
+    /// (CVE-2009-0217). Default: 160 bits.
     hmac_min_out_len: usize,
+    /// Require every signed reference digest to be verified locally.
+    /// Default: true.
+    require_reference_digests: bool,
+    /// Allow raw inline KeyValue / DEREncodedKeyValue signatures even when
+    /// trust anchors are configured. Default: false.
+    allow_raw_inline_keyinfo_with_trust_anchors: bool,
 }
 
 impl SamlVerifier {
@@ -54,7 +62,9 @@ impl SamlVerifier {
             trusted_keys_only: true,
             strict_verification: true,
             skip_time_checks: false,
-            hmac_min_out_len: 128,
+            hmac_min_out_len: DEFAULT_HMAC_MIN_OUT_LEN_BITS,
+            require_reference_digests: true,
+            allow_raw_inline_keyinfo_with_trust_anchors: false,
         }
     }
 
@@ -66,7 +76,9 @@ impl SamlVerifier {
             trusted_keys_only: true,
             strict_verification: true,
             skip_time_checks: false,
-            hmac_min_out_len: 128,
+            hmac_min_out_len: DEFAULT_HMAC_MIN_OUT_LEN_BITS,
+            require_reference_digests: true,
+            allow_raw_inline_keyinfo_with_trust_anchors: false,
         }
     }
 
@@ -107,9 +119,28 @@ impl SamlVerifier {
     /// attacks where an attacker reduces the HMAC output to a trivially brute-
     /// forceable size.
     ///
-    /// Default: 128 bits. Set to 0 to disable (not recommended).
+    /// Default: 160 bits. Set to 0 to disable (not recommended).
     pub fn set_hmac_min_out_len(&mut self, bits: usize) {
         self.hmac_min_out_len = bits;
+    }
+
+    /// Set whether XML-DSig verification requires local digest coverage for
+    /// all references.
+    ///
+    /// Keep this enabled for SAML. Disable only for profiles that verify
+    /// detached content bytes out of band.
+    pub fn set_require_reference_digests(&mut self, require: bool) {
+        self.require_reference_digests = require;
+    }
+
+    /// Set whether raw inline `<KeyValue>` / `<DEREncodedKeyValue>` keys may
+    /// satisfy verification when trust anchors are configured.
+    ///
+    /// Keep this disabled for SAML. It exists as a compatibility escape hatch
+    /// for non-SAML interop suites that intentionally combine trust anchors
+    /// with raw inline test keys.
+    pub fn set_allow_raw_inline_keyinfo_with_trust_anchors(&mut self, allow: bool) {
+        self.allow_raw_inline_keyinfo_with_trust_anchors = allow;
     }
 
     /// Verify a signed SAML message (assertion, response, metadata).
@@ -175,12 +206,15 @@ impl SamlVerifier {
     /// Build a [`DsigContext`] from this verifier's configured policy. Shared by
     /// the single-signature and all-signatures enveloped verification paths.
     fn dsig_context(&self) -> DsigContext {
-        let mut ctx = DsigContext::new(self.keys_manager.clone());
-        ctx.trusted_keys_only = self.trusted_keys_only;
-        ctx.strict_verification = self.strict_verification;
-        ctx.skip_time_checks = self.skip_time_checks;
-        ctx.hmac_min_out_len = self.hmac_min_out_len;
-        ctx
+        DsigContext::new(self.keys_manager.clone())
+            .with_trusted_keys_only(self.trusted_keys_only)
+            .with_strict_verification(self.strict_verification)
+            .with_skip_time_checks(self.skip_time_checks)
+            .with_hmac_min_out_len(self.hmac_min_out_len)
+            .with_require_reference_digests(self.require_reference_digests)
+            .with_allow_raw_inline_keyinfo_with_trust_anchors(
+                self.allow_raw_inline_keyinfo_with_trust_anchors,
+            )
     }
 
     /// Verify HTTP Redirect binding detached signature.
