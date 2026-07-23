@@ -53,6 +53,68 @@ pub fn contains_ds_object(signature_xml: &str) -> Result<bool, uppsala::XmlError
     Ok(false)
 }
 
+/// HMAC-family XML-DSig `SignatureMethod` URIs.
+///
+/// HMAC is a *symmetric* MAC: verifying it requires the same secret used to
+/// produce it. In SAML the IdP authenticates with an asymmetric key, so a
+/// legitimate response is never HMAC-signed. Accepting HMAC opens a key-
+/// confusion class where an attacker who learns (or supplies) the shared secret
+/// forges signatures. gamlastan already refuses attacker-supplied inline keys
+/// (`trusted_keys_only`), but this list lets the verifier reject the HMAC
+/// `SignatureMethod` outright as defence in depth.
+pub const HMAC_SIGNATURE_ALGORITHMS: &[&str] = &[
+    "http://www.w3.org/2000/09/xmldsig#hmac-sha1",
+    "http://www.w3.org/2001/04/xmldsig-more#hmac-sha224",
+    "http://www.w3.org/2001/04/xmldsig-more#hmac-sha256",
+    "http://www.w3.org/2001/04/xmldsig-more#hmac-sha384",
+    "http://www.w3.org/2001/04/xmldsig-more#hmac-sha512",
+    // Legacy MD5 HMAC, listed so it is caught as well.
+    "http://www.w3.org/2001/04/xmldsig-more#hmac-md5",
+];
+
+/// Check whether a signature algorithm URI is an HMAC (symmetric) method.
+pub fn is_hmac_algorithm(algorithm_uri: &str) -> bool {
+    HMAC_SIGNATURE_ALGORITHMS.contains(&algorithm_uri)
+}
+
+/// Scan signed XML for an HMAC `<ds:SignatureMethod>`.
+///
+/// Walks the parsed document and inspects every `{XMLDSig}SignatureMethod`
+/// element's `Algorithm` attribute, independent of the XML Signature prefix
+/// used. Returns `Ok(true)` if any HMAC method is present (meaning the document
+/// should be rejected), `Ok(false)` if none is, and `Err(_)` if the input could
+/// not be parsed — callers fail closed on `Err`, mirroring
+/// [`contains_ds_object`].
+pub fn contains_hmac_signature_method(signed_xml: &str) -> Result<bool, uppsala::XmlError> {
+    const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
+
+    let doc = crate::xml::parse_secure(signed_xml)?;
+
+    let Some(root) = doc.document_element() else {
+        return Ok(false);
+    };
+
+    for node in doc.descendants(root) {
+        let Some(elem) = doc.element(node) else {
+            continue;
+        };
+
+        // Match {XMLDSig}SignatureMethod by expanded name, then test its
+        // Algorithm attribute against the HMAC list.
+        if elem.name.local_name == "SignatureMethod"
+            && elem.name.namespace_uri.as_deref() == Some(XMLDSIG_NS)
+        {
+            if let Some(alg) = elem.get_attribute("Algorithm") {
+                if is_hmac_algorithm(alg) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+
+    Ok(false)
+}
+
 /// Known signature algorithm URIs.
 ///
 /// Per E81: any algorithm supported by the implementation may be used.

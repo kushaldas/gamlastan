@@ -49,6 +49,11 @@ pub struct SamlVerifier {
     /// Allow raw inline KeyValue / DEREncodedKeyValue signatures even when
     /// trust anchors are configured. Default: false.
     allow_raw_inline_keyinfo_with_trust_anchors: bool,
+    /// Reject HMAC-based `SignatureMethod` algorithms outright. Default: true.
+    /// SAML IdPs sign with asymmetric keys, so a legitimate response is never
+    /// HMAC-signed; rejecting HMAC closes a symmetric key-confusion class as
+    /// defence in depth on top of `trusted_keys_only`.
+    reject_hmac_signatures: bool,
 }
 
 impl SamlVerifier {
@@ -65,6 +70,7 @@ impl SamlVerifier {
             hmac_min_out_len: DEFAULT_HMAC_MIN_OUT_LEN_BITS,
             require_reference_digests: true,
             allow_raw_inline_keyinfo_with_trust_anchors: false,
+            reject_hmac_signatures: true,
         }
     }
 
@@ -79,6 +85,7 @@ impl SamlVerifier {
             hmac_min_out_len: DEFAULT_HMAC_MIN_OUT_LEN_BITS,
             require_reference_digests: true,
             allow_raw_inline_keyinfo_with_trust_anchors: false,
+            reject_hmac_signatures: true,
         }
     }
 
@@ -143,6 +150,34 @@ impl SamlVerifier {
         self.allow_raw_inline_keyinfo_with_trust_anchors = allow;
     }
 
+    /// Set whether HMAC-based `SignatureMethod` algorithms are rejected.
+    ///
+    /// Keep this enabled for SAML: IdPs sign with asymmetric keys, so a
+    /// legitimate response never uses HMAC. Disable only for non-SAML interop
+    /// suites that deliberately exercise symmetric-key signatures.
+    pub fn set_reject_hmac_signatures(&mut self, reject: bool) {
+        self.reject_hmac_signatures = reject;
+    }
+
+    /// Fail closed if HMAC rejection is enabled and the document carries an
+    /// HMAC `<ds:SignatureMethod>`. Shared by both enveloped verify paths and
+    /// run before any cryptographic verification. A parse failure is treated as
+    /// a rejection (CWE-693), consistent with the E91 ds:Object guard.
+    fn reject_hmac_if_configured(&self, signed_xml: &str) -> Result<(), CryptoError> {
+        if !self.reject_hmac_signatures {
+            return Ok(());
+        }
+        match crate::security::signature::contains_hmac_signature_method(signed_xml) {
+            Ok(true) => Err(CryptoError::VerificationFailed(
+                "HMAC-based SignatureMethod is not allowed for SAML signatures".to_string(),
+            )),
+            Ok(false) => Ok(()),
+            Err(e) => Err(CryptoError::VerificationFailed(format!(
+                "could not parse XML for HMAC SignatureMethod check: {e}"
+            ))),
+        }
+    }
+
     /// Verify a signed SAML message (assertion, response, metadata).
     ///
     /// Per E91: checks for and rejects `<ds:Object>` elements in the signature
@@ -164,6 +199,9 @@ impl SamlVerifier {
                 }
             }
         }
+
+        // Reject HMAC SignatureMethod before cryptographic verification.
+        self.reject_hmac_if_configured(signed_xml)?;
 
         let ctx = self.dsig_context();
         let result = verify(&ctx, signed_xml)?;
@@ -197,6 +235,9 @@ impl SamlVerifier {
                 }
             }
         }
+
+        // Reject HMAC SignatureMethod before cryptographic verification.
+        self.reject_hmac_if_configured(signed_xml)?;
 
         let ctx = self.dsig_context();
         let results = verify_all(&ctx, signed_xml)?;

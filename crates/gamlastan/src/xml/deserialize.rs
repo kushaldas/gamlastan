@@ -3,7 +3,7 @@
 // The SamlDeserialize trait provides zero-copy deserialization from an
 // uppsala Document into borrowed SAML types (FooRef<'a>).
 
-use uppsala::{Document, NodeId};
+use uppsala::{Document, NodeId, NodeKind};
 
 use crate::xml::error::XmlError;
 
@@ -53,6 +53,12 @@ pub struct SecureParseConfig {
     pub forbid_dtd: bool,
     /// Reject `<!ENTITY>` declarations inside a DTD.
     pub forbid_entities: bool,
+    /// Reject any XML comment (`<!-- … -->`) anywhere in the document.
+    pub forbid_comments: bool,
+    /// Reject any processing instruction (`<?target … ?>`) anywhere in the
+    /// document. The XML declaration (`<?xml … ?>`) is not a processing
+    /// instruction and is unaffected.
+    pub forbid_pis: bool,
 }
 
 impl Default for SecureParseConfig {
@@ -62,6 +68,8 @@ impl Default for SecureParseConfig {
             max_entity_expansion: uppsala::parser::DEFAULT_MAX_ENTITY_EXPANSION,
             forbid_dtd: true,
             forbid_entities: true,
+            forbid_comments: true,
+            forbid_pis: true,
         }
     }
 }
@@ -99,6 +107,27 @@ impl SecureParseConfig {
     /// to `false`; rejecting the whole DTD is stricter and remains the default.
     pub fn with_forbid_entities(mut self, forbid: bool) -> Self {
         self.forbid_entities = forbid;
+        self
+    }
+
+    /// Configure whether XML comments are rejected after parsing.
+    ///
+    /// Leave this enabled for SAML. Rejecting comments closes the
+    /// comment-truncation signature-bypass class (CVE-2017-11427): a comment
+    /// splits an element's text into multiple nodes, so a reader that returns
+    /// only the first text node sees a different value than the one the
+    /// signature was computed over.
+    pub fn with_forbid_comments(mut self, forbid: bool) -> Self {
+        self.forbid_comments = forbid;
+        self
+    }
+
+    /// Configure whether processing instructions are rejected after parsing.
+    ///
+    /// Leave this enabled for SAML. The XML declaration (`<?xml … ?>`) is not a
+    /// processing instruction and is never affected by this policy.
+    pub fn with_forbid_pis(mut self, forbid: bool) -> Self {
+        self.forbid_pis = forbid;
         self
     }
 
@@ -146,7 +175,44 @@ pub fn parse_secure_with_config<'a>(
     xml: &'a str,
     config: &SecureParseConfig,
 ) -> Result<Document<'a>, uppsala::XmlError> {
-    config.parser().parse(xml)
+    let doc = config.parser().parse(xml)?;
+    if config.forbid_comments || config.forbid_pis {
+        reject_forbidden_nodes(&doc, config)?;
+    }
+    Ok(doc)
+}
+
+/// Post-parse rejection of comment and processing-instruction nodes.
+///
+/// uppsala has no parser-level flag for these, so we walk the built DOM once and
+/// fail closed if a disallowed node is present anywhere (prolog, element
+/// content, or epilog). This is the choke point that closes the
+/// comment-truncation bypass: a document carrying a comment is refused before
+/// any field text is extracted.
+fn reject_forbidden_nodes(
+    doc: &Document<'_>,
+    config: &SecureParseConfig,
+) -> Result<(), uppsala::XmlError> {
+    for id in doc.descendants(doc.root()) {
+        match doc.node_kind(id) {
+            Some(NodeKind::Comment(_)) if config.forbid_comments => {
+                return Err(uppsala::XmlError::well_formedness(
+                    "response contained illegal XML comments",
+                    0,
+                    0,
+                ));
+            }
+            Some(NodeKind::ProcessingInstruction(_)) if config.forbid_pis => {
+                return Err(uppsala::XmlError::well_formedness(
+                    "response contained illegal processing instructions",
+                    0,
+                    0,
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -163,6 +229,60 @@ mod parse_secure_tests {
         );
         assert!(config.forbid_dtd);
         assert!(config.forbid_entities);
+        assert!(config.forbid_comments);
+        assert!(config.forbid_pis);
+    }
+
+    #[test]
+    fn rejects_xml_comment() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"><!-- x --></samlp:Response>"#;
+        let err = parse_secure(xml).expect_err("comment-bearing document must be rejected");
+        assert!(
+            err.to_string().contains("illegal XML comments"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_processing_instruction() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"><?php evil ?></samlp:Response>"#;
+        let err = parse_secure(xml).expect_err("PI-bearing document must be rejected");
+        assert!(
+            err.to_string().contains("illegal processing instructions"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_embedded_comment_in_nameid() {
+        // The comment-truncation bypass: a comment splits the NameID text so a
+        // first-text-node reader would see "victim@example.com" while the
+        // signature covers the comment-stripped "victim@example.com.evil.com".
+        // parse_secure must refuse the document before any text extraction.
+        let xml = r#"<saml:NameID xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">victim@example.com<!---->.evil.com</saml:NameID>"#;
+        let err = parse_secure(xml).expect_err("comment in NameID must be rejected");
+        assert!(
+            err.to_string().contains("illegal XML comments"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn accepts_xml_declaration_which_is_not_a_pi() {
+        // The XML declaration must not be mistaken for a processing instruction.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?><samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_1"/>"#;
+        assert!(parse_secure(xml).is_ok());
+    }
+
+    #[test]
+    fn explicit_policy_can_allow_comments_and_pis() {
+        let xml = r#"<Response><!-- ok --><?pi ok ?></Response>"#;
+        assert!(parse_secure(xml).is_err());
+
+        let config = SecureParseConfig::new()
+            .with_forbid_comments(false)
+            .with_forbid_pis(false);
+        assert!(parse_secure_with_config(xml, &config).is_ok());
     }
 
     #[test]
