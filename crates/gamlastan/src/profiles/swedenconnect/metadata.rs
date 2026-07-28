@@ -191,7 +191,7 @@ pub fn entity_attribute_values(ext: &Extensions, attribute_name: &str) -> Vec<St
         ext.raw_xml
     );
 
-    let doc = match crate::xml::parse_secure(&full_xml) {
+    let doc = match crate::xml::parse_secure_metadata(&full_xml) {
         Ok(d) => d,
         Err(_) => return Vec::new(),
     };
@@ -219,10 +219,10 @@ fn collect_attribute_values<'a>(
                 for value_node in doc.children_iter(child) {
                     if let Some(value_elem) = doc.element(value_node) {
                         if value_elem.name.local_name.as_ref() == "AttributeValue" {
-                            let text = doc
-                                .text_content(value_node)
-                                .map(|t| t.to_string())
-                                .unwrap_or_else(|| doc.text_content_deep(value_node));
+                            // Deep gather (not first-text-node) so a comment or
+                            // CDATA cannot truncate the value below what the
+                            // metadata signature covers.
+                            let text = doc.text_content_deep(value_node);
                             let trimmed = text.trim();
                             if !trimmed.is_empty() {
                                 out.push(trimmed.to_string());
@@ -281,6 +281,35 @@ mod tests {
 
         let loas = assurance_certifications(&ext);
         assert_eq!(loas, vec![constants::LOA3.to_string()]);
+    }
+
+    #[test]
+    fn comment_bearing_metadata_parses_and_reads_full_value() {
+        // Federation metadata routinely carries XML comments; they must not
+        // cause the extension to be rejected (interop), and a comment splitting
+        // an AttributeValue must not truncate the read value below what a
+        // signature covers (the CVE-2017-11427 class). The reader gathers the
+        // full text content, so the mid-value comment is transparent.
+        let raw = format!(
+            r#"<mdattr:EntityAttributes xmlns:mdattr="{}" xmlns:saml2="{}">
+                 <!-- published by test federation -->
+                 <saml2:Attribute Name="{}">
+                   <saml2:AttributeValue>{}<!-- x -->{}</saml2:AttributeValue>
+                 </saml2:Attribute>
+               </mdattr:EntityAttributes>"#,
+            constants::NS_MDATTR,
+            constants::NS_SAML_ASSERTION,
+            constants::ENTITY_CATEGORY_ATTR,
+            "http://id.elegnamnden.se/ec/",
+            "loa3-pnr",
+        );
+        let ext = Extensions::new(raw);
+        let cats = entity_categories(&ext);
+        assert_eq!(
+            cats,
+            vec!["http://id.elegnamnden.se/ec/loa3-pnr".to_string()],
+            "comment must be transparent and the full value read"
+        );
     }
 
     #[test]

@@ -9,8 +9,10 @@
 //! Attacks are grouped by the layer that stops them:
 //!
 //! * **Parse layer** — `parse_secure` fails closed before any field is read
-//!   (DTD/XXE/entity-expansion, XML comments, processing instructions). Comment
-//!   rejection is what closes the comment-truncation signature-bypass class.
+//!   (DTD/XXE/entity-expansion, XML comments, processing instructions, CDATA
+//!   sections). Comment and CDATA rejection is what closes the text-truncation
+//!   signature-bypass class (both split element text while canonicalizing to the
+//!   same signed bytes).
 //! * **Structure layer** — `ResponseRef::from_xml` rejects a smuggled
 //!   `AuthnRequest`, and a non-`Response` root is rejected by element checking.
 //! * **Signature layer** — an untrusted / forged / HMAC signature never yields a
@@ -130,6 +132,24 @@ fn digest_value_comment_is_rejected() {
     // XML-signature bypass via a comment inside DigestValue: refused at the
     // parse layer along with every other comment.
     assert_rejected_for_comment("digest_value_comment.xml");
+}
+
+// ── Parse layer: CDATA sections (comment-truncation's CDATA sibling) ──────────
+
+#[test]
+fn cdata_in_nameid_is_rejected() {
+    // The CDATA variant of the comment-truncation bypass: `mgerber<![CDATA[
+    // @berkeley.edu]]>` splits the NameID so a first-text-node reader sees
+    // "mgerber" while Canonical XML — which folds CDATA into the same character
+    // data — covers "mgerber@berkeley.edu", leaving the enveloping signature
+    // valid. parse_secure must refuse the document before any text extraction,
+    // exactly as it does for the comment form.
+    let err =
+        parse_secure(&fixture("cdata_in_nameid.xml")).expect_err("CDATA document must be rejected");
+    assert!(
+        err.to_string().contains("illegal CDATA sections"),
+        "expected CDATA rejection, got: {err}"
+    );
 }
 
 // ── Parse layer: processing instructions ─────────────────────────────────────

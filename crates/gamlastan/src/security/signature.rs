@@ -70,11 +70,21 @@ pub const HMAC_SIGNATURE_ALGORITHMS: &[&str] = &[
     "http://www.w3.org/2001/04/xmldsig-more#hmac-sha512",
     // Legacy MD5 HMAC, listed so it is caught as well.
     "http://www.w3.org/2001/04/xmldsig-more#hmac-md5",
+    // RIPEMD-160 HMAC — supported by the underlying DSig backend
+    // (`bergshamra_crypto`), so it must be caught here too or it would slip
+    // past this pre-filter.
+    "http://www.w3.org/2001/04/xmldsig-more#hmac-ripemd160",
 ];
 
 /// Check whether a signature algorithm URI is an HMAC (symmetric) method.
+///
+/// This must stay a superset of the HMAC URIs the DSig backend
+/// ([`bergshamra_crypto::sign::is_hmac_algorithm`]) can actually verify; the
+/// backstop below catches any HMAC method the static list above has not been
+/// updated for, so the two cannot silently drift.
 pub fn is_hmac_algorithm(algorithm_uri: &str) -> bool {
     HMAC_SIGNATURE_ALGORITHMS.contains(&algorithm_uri)
+        || bergshamra_crypto::sign::is_hmac_algorithm(algorithm_uri)
 }
 
 /// Scan signed XML for an HMAC `<ds:SignatureMethod>`.
@@ -302,5 +312,42 @@ mod tests {
         assert!(!is_gcm_algorithm(
             "http://www.w3.org/2001/04/xmlenc#aes128-cbc"
         ));
+    }
+
+    #[test]
+    fn test_hmac_algorithms_cover_every_backend_hmac() {
+        // The static list plus the backend backstop must flag every HMAC URI the
+        // DSig backend can actually verify — including RIPEMD-160, which the
+        // static list historically omitted.
+        for uri in [
+            "http://www.w3.org/2000/09/xmldsig#hmac-sha1",
+            "http://www.w3.org/2001/04/xmldsig-more#hmac-sha224",
+            "http://www.w3.org/2001/04/xmldsig-more#hmac-sha256",
+            "http://www.w3.org/2001/04/xmldsig-more#hmac-sha384",
+            "http://www.w3.org/2001/04/xmldsig-more#hmac-sha512",
+            "http://www.w3.org/2001/04/xmldsig-more#hmac-md5",
+            "http://www.w3.org/2001/04/xmldsig-more#hmac-ripemd160",
+        ] {
+            assert!(is_hmac_algorithm(uri), "{uri} must be flagged as HMAC");
+            assert!(
+                bergshamra_crypto::sign::is_hmac_algorithm(uri),
+                "{uri} should also be an HMAC per the backend"
+            );
+        }
+        assert!(!is_hmac_algorithm(
+            "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"
+        ));
+    }
+
+    #[test]
+    fn test_contains_hmac_ripemd160_signature_method() {
+        // A document declaring the RIPEMD-160 HMAC method must be caught by the
+        // pre-filter (regression for the URI the static list had omitted).
+        let xml = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+            <ds:SignedInfo>
+                <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#hmac-ripemd160"/>
+            </ds:SignedInfo>
+        </ds:Signature>"#;
+        assert_eq!(contains_hmac_signature_method(xml), Ok(true));
     }
 }

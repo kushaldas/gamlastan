@@ -72,7 +72,8 @@ pub mod serialize;
 
 // Re-export the core traits.
 pub use deserialize::{
-    parse_saml, parse_secure, parse_secure_with_config, SamlDeserialize, SecureParseConfig,
+    parse_saml, parse_secure, parse_secure_metadata, parse_secure_with_config, SamlDeserialize,
+    SecureParseConfig,
 };
 pub use error::XmlError;
 pub use serialize::SamlSerialize;

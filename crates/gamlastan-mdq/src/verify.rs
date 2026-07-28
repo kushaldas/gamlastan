@@ -42,8 +42,8 @@ pub(crate) fn parse_verify_select(
     allow_unverified: bool,
     now: DateTime<Utc>,
 ) -> Result<Resolved, MdqError> {
-    let doc =
-        gamlastan::xml::parse_secure(xml).map_err(|e| MdqError::Parse(XmlError::ParseError(e)))?;
+    let doc = gamlastan::xml::parse_secure_metadata(xml)
+        .map_err(|e| MdqError::Parse(XmlError::ParseError(e)))?;
     let root = doc.document_element().ok_or(XmlError::EmptyDocument)?;
     let elem = doc.element(root).ok_or(XmlError::NotAnElement)?;
 
