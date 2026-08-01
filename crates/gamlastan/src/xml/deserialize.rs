@@ -3,7 +3,7 @@
 // The SamlDeserialize trait provides zero-copy deserialization from an
 // uppsala Document into borrowed SAML types (FooRef<'a>).
 
-use uppsala::{Document, NodeId};
+use uppsala::{Document, NodeId, NodeKind};
 
 use crate::xml::error::XmlError;
 
@@ -53,6 +53,16 @@ pub struct SecureParseConfig {
     pub forbid_dtd: bool,
     /// Reject `<!ENTITY>` declarations inside a DTD.
     pub forbid_entities: bool,
+    /// Reject any XML comment (`<!-- … -->`) anywhere in the document.
+    pub forbid_comments: bool,
+    /// Reject any processing instruction (`<?target … ?>`) anywhere in the
+    /// document. The XML declaration (`<?xml … ?>`) is not a processing
+    /// instruction and is unaffected.
+    pub forbid_pis: bool,
+    /// Reject any CDATA section (`<![CDATA[ … ]]>`) anywhere in the document.
+    /// Like a comment, a CDATA section splits an element's text into multiple
+    /// nodes, so it enables the same first-text-node truncation bypass.
+    pub forbid_cdata: bool,
 }
 
 impl Default for SecureParseConfig {
@@ -62,6 +72,9 @@ impl Default for SecureParseConfig {
             max_entity_expansion: uppsala::parser::DEFAULT_MAX_ENTITY_EXPANSION,
             forbid_dtd: true,
             forbid_entities: true,
+            forbid_comments: true,
+            forbid_pis: true,
+            forbid_cdata: true,
         }
     }
 }
@@ -102,6 +115,39 @@ impl SecureParseConfig {
         self
     }
 
+    /// Configure whether XML comments are rejected after parsing.
+    ///
+    /// Leave this enabled for SAML. Rejecting comments closes the
+    /// comment-truncation signature-bypass class (CVE-2017-11427): a comment
+    /// splits an element's text into multiple nodes, so a reader that returns
+    /// only the first text node sees a different value than the one the
+    /// signature was computed over.
+    pub fn with_forbid_comments(mut self, forbid: bool) -> Self {
+        self.forbid_comments = forbid;
+        self
+    }
+
+    /// Configure whether processing instructions are rejected after parsing.
+    ///
+    /// Leave this enabled for SAML. The XML declaration (`<?xml … ?>`) is not a
+    /// processing instruction and is never affected by this policy.
+    pub fn with_forbid_pis(mut self, forbid: bool) -> Self {
+        self.forbid_pis = forbid;
+        self
+    }
+
+    /// Configure whether CDATA sections are rejected after parsing.
+    ///
+    /// Leave this enabled for SAML. A CDATA section splits an element's text
+    /// into multiple nodes exactly like a comment, and Canonical XML normalizes
+    /// it to the same character data — so a reader that returns only the first
+    /// text node can be truncated while the enveloping signature still verifies
+    /// (the CDATA sibling of the CVE-2017-11427 comment-truncation bypass).
+    pub fn with_forbid_cdata(mut self, forbid: bool) -> Self {
+        self.forbid_cdata = forbid;
+        self
+    }
+
     fn parser(self) -> uppsala::Parser {
         uppsala::Parser::new()
             .with_max_depth(self.max_depth)
@@ -137,6 +183,29 @@ pub fn parse_secure(xml: &str) -> Result<Document<'_>, uppsala::XmlError> {
     parse_secure_with_config(xml, &SecureParseConfig::default())
 }
 
+/// Parse SAML **metadata** with the same hardening as [`parse_secure`] but
+/// tolerant of XML comments and processing instructions.
+///
+/// SAML metadata aggregates published by real federations (eduGAIN, InCommon,
+/// national federations) routinely carry XML comments — provenance banners,
+/// per-entity notes — and sometimes processing instructions. Enveloped
+/// signatures use exclusive-c14n *without* comments, so a comment never
+/// invalidates the metadata signature; rejecting comment-bearing metadata would
+/// refuse validly-signed documents and break federation ingestion.
+///
+/// Comments and PIs are therefore allowed here, but every other guard is
+/// retained: DTD/entity rejection (XXE), the resource caps, and **CDATA
+/// rejection** (the truncation vector) all still apply. Independently, the
+/// metadata readers concatenate the full text content
+/// ([`uppsala::Document::text_content_deep`]) rather than reading only the first
+/// text node, so an allowed comment cannot split a value the signature covers.
+pub fn parse_secure_metadata(xml: &str) -> Result<Document<'_>, uppsala::XmlError> {
+    let config = SecureParseConfig::default()
+        .with_forbid_comments(false)
+        .with_forbid_pis(false);
+    parse_secure_with_config(xml, &config)
+}
+
 /// Parse XML with an explicit secure parse policy.
 ///
 /// `parse_secure` is the recommended SAML entry point. This variant exists for
@@ -146,7 +215,52 @@ pub fn parse_secure_with_config<'a>(
     xml: &'a str,
     config: &SecureParseConfig,
 ) -> Result<Document<'a>, uppsala::XmlError> {
-    config.parser().parse(xml)
+    let doc = config.parser().parse(xml)?;
+    if config.forbid_comments || config.forbid_pis || config.forbid_cdata {
+        reject_forbidden_nodes(&doc, config)?;
+    }
+    Ok(doc)
+}
+
+/// Post-parse rejection of comment, processing-instruction, and CDATA nodes.
+///
+/// uppsala has no parser-level flag for these, so we walk the built DOM once and
+/// fail closed if a disallowed node is present anywhere (prolog, element
+/// content, or epilog). This is the choke point that closes the
+/// text-truncation bypass: a document carrying a comment or CDATA section — both
+/// of which split an element's text into multiple nodes while canonicalizing to
+/// the same signed bytes — is refused before any field text is extracted.
+fn reject_forbidden_nodes(
+    doc: &Document<'_>,
+    config: &SecureParseConfig,
+) -> Result<(), uppsala::XmlError> {
+    for id in doc.descendants(doc.root()) {
+        match doc.node_kind(id) {
+            Some(NodeKind::Comment(_)) if config.forbid_comments => {
+                return Err(uppsala::XmlError::well_formedness(
+                    "document contained illegal XML comments",
+                    0,
+                    0,
+                ));
+            }
+            Some(NodeKind::ProcessingInstruction(_)) if config.forbid_pis => {
+                return Err(uppsala::XmlError::well_formedness(
+                    "document contained illegal processing instructions",
+                    0,
+                    0,
+                ));
+            }
+            Some(NodeKind::CData(_)) if config.forbid_cdata => {
+                return Err(uppsala::XmlError::well_formedness(
+                    "document contained illegal CDATA sections",
+                    0,
+                    0,
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -163,6 +277,88 @@ mod parse_secure_tests {
         );
         assert!(config.forbid_dtd);
         assert!(config.forbid_entities);
+        assert!(config.forbid_comments);
+        assert!(config.forbid_pis);
+        assert!(config.forbid_cdata);
+    }
+
+    #[test]
+    fn rejects_xml_comment() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"><!-- x --></samlp:Response>"#;
+        let err = parse_secure(xml).expect_err("comment-bearing document must be rejected");
+        assert!(
+            err.to_string().contains("illegal XML comments"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_processing_instruction() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"><?php evil ?></samlp:Response>"#;
+        let err = parse_secure(xml).expect_err("PI-bearing document must be rejected");
+        assert!(
+            err.to_string().contains("illegal processing instructions"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_embedded_comment_in_nameid() {
+        // The comment-truncation bypass: a comment splits the NameID text so a
+        // first-text-node reader would see "victim@example.com" while the
+        // signature covers the comment-stripped "victim@example.com.evil.com".
+        // parse_secure must refuse the document before any text extraction.
+        let xml = r#"<saml:NameID xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">victim@example.com<!---->.evil.com</saml:NameID>"#;
+        let err = parse_secure(xml).expect_err("comment in NameID must be rejected");
+        assert!(
+            err.to_string().contains("illegal XML comments"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_cdata_section() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"><![CDATA[x]]></samlp:Response>"#;
+        let err = parse_secure(xml).expect_err("CDATA-bearing document must be rejected");
+        assert!(
+            err.to_string().contains("illegal CDATA sections"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_embedded_cdata_in_nameid() {
+        // The CDATA sibling of the comment-truncation bypass: a CDATA section
+        // splits the NameID text so a first-text-node reader would see
+        // "victim@example.com" while Canonical XML (which folds CDATA into the
+        // same character data) covers "victim@example.com.evil.com" — so the
+        // enveloping signature still verifies. parse_secure must refuse the
+        // document before any text extraction.
+        let xml = r#"<saml:NameID xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">victim@example.com<![CDATA[.evil.com]]></saml:NameID>"#;
+        let err = parse_secure(xml).expect_err("CDATA in NameID must be rejected");
+        assert!(
+            err.to_string().contains("illegal CDATA sections"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn accepts_xml_declaration_which_is_not_a_pi() {
+        // The XML declaration must not be mistaken for a processing instruction.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?><samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_1"/>"#;
+        assert!(parse_secure(xml).is_ok());
+    }
+
+    #[test]
+    fn explicit_policy_can_allow_comments_and_pis() {
+        let xml = r#"<Response><!-- ok --><?pi ok ?><![CDATA[ok]]></Response>"#;
+        assert!(parse_secure(xml).is_err());
+
+        let config = SecureParseConfig::new()
+            .with_forbid_comments(false)
+            .with_forbid_pis(false)
+            .with_forbid_cdata(false);
+        assert!(parse_secure_with_config(xml, &config).is_ok());
     }
 
     #[test]

@@ -213,7 +213,7 @@ fn is_xmldsig_or_unqualified(ns: Option<&str>) -> bool {
 fn x509_certificates_der_from_key_info(key_info_xml: &str) -> Vec<Vec<u8>> {
     use base64::Engine;
 
-    let doc = match crate::xml::parse_secure(key_info_xml) {
+    let doc = match crate::xml::parse_secure_metadata(key_info_xml) {
         Ok(doc) => doc,
         // KeyInfo captured from a larger metadata document often borrows
         // ancestor namespace declarations and is not valid standalone XML.

@@ -5,6 +5,62 @@ All notable changes to this repository will be documented in this file.
 The project is still pre-1.0, so minor releases may include behavior changes
 where needed to correct protocol handling.
 
+## [0.8.0] - 2026-08-02
+
+### Added
+
+- Attack-corpus regression suite (`crates/gamlastan/tests/attack_corpus.rs` plus
+  `tests/fixtures/attacks/`) replaying known-malicious SAML payloads against the
+  real parse and signature-verification pipeline: DTD/XXE/entity-expansion,
+  comment- and CDATA-truncation, processing-instruction injection, smuggled
+  `AuthnRequest`-in-`Response`, HMAC `SignatureMethod`, and DigestValue/URI
+  signature-wrapping vectors, with a legitimate-response positive control to
+  prove the hardening does not over-block.
+- `xml::parse_secure_metadata`: a metadata-tolerant secure parse entry point.
+  It keeps every `parse_secure` guard (DTD/entity rejection, resource caps, and
+  CDATA rejection) but allows XML comments and processing instructions, which
+  real federation metadata aggregates (eduGAIN, InCommon) legitimately carry and
+  which never invalidate an enveloped metadata signature.
+- `xml::SecureParseConfig` gains `forbid_comments`, `forbid_pis`, and
+  `forbid_cdata` policy flags (all default `true`) with matching
+  `with_forbid_*` builders.
+
+### Changed
+
+- Upgraded the XML-security/crypto stack: `bergshamra` 0.7.0 → 0.8.0 and the
+  direct `kryptering` dependency 0.4 → 0.5, features still mirroring bergshamra
+  (`legacy`, `post-quantum`, `pkcs11`) so the shared `Signer` / `Pkcs11Signer`
+  types resolve to a single instance with no version or feature drift. `uppsala`
+  stays at 0.9. `Key::to_signing_key` and `sign::from_uri` now return `Result`,
+  handled at the two crypto call sites.
+- Metadata parsing (MDQ verify, SPID and mdui/algsupport extensions, `KeyInfo`
+  extraction, Sweden Connect entity attributes) now uses `parse_secure_metadata`
+  and gathers full element text (deep concatenation) instead of the first text
+  node, so an allowed comment can never truncate a signed value.
+
+### Security
+
+- `parse_secure` now rejects XML comments, processing instructions, and CDATA
+  sections anywhere in a document. Comments and CDATA both split an element's
+  text into multiple nodes while canonicalizing to the same signed bytes, so a
+  first-text-node reader could see a different value than the signature covered
+  (the comment- and CDATA-truncation authentication-bypass class,
+  CVE-2017-11427). Refusing them before any field text is extracted closes the
+  bypass at the parse choke point.
+- `ResponseRef::from_xml` rejects smuggled protocol *request* elements
+  (`AuthnRequest`, `LogoutRequest`, `ArtifactResolve`, `AttributeQuery`,
+  `AuthnQuery`, `AuthzDecisionQuery`, `AssertionIDRequest`,
+  `ManageNameIDRequest`, `NameIDMappingRequest`) as direct children of a
+  `<samlp:Response>` — a classic signature-wrapping / request-smuggling vector.
+- XML-DSig verification rejects HMAC-based `SignatureMethod` algorithms outright
+  (`SamlVerifier::set_reject_hmac_signatures`, default on): SAML IdPs sign with
+  asymmetric keys, so a legitimate response is never HMAC-signed, and refusing
+  HMAC closes a symmetric key-confusion class as defence in depth on top of
+  `trusted_keys_only`. The detection list is kept a superset of the DSig
+  backend's HMAC URIs (including `hmac-ripemd160`) so the two cannot drift. The
+  `ds:Object` (E91) and HMAC structural pre-scans parse comment-tolerantly so
+  comment-bearing federation metadata is not rejected during verification.
+
 ## [0.7.0] - 2026-07-06
 
 ### Added
@@ -389,6 +445,8 @@ Historical release recorded before changelog adoption.
 
 Historical release recorded before changelog adoption.
 
+[0.8.0]: https://github.com/kushaldas/gamlastan/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/kushaldas/gamlastan/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/kushaldas/gamlastan/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/kushaldas/gamlastan/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/kushaldas/gamlastan/compare/v0.4.0...v0.4.1

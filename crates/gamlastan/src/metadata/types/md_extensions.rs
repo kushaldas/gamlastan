@@ -157,7 +157,7 @@ impl MdExtensions {
             r#"<gamlastan-md-root xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" xmlns:mdrpi="{MDRPI_NS}" xmlns:mdattr="{MDATTR_NS}" xmlns:saml="{SAML_ASSERTION_NS}" xmlns:mdui="{MDUI_NS}" xmlns:alg="{ALGSUPPORT_NS}">{inner}</gamlastan-md-root>"#
         );
 
-        let Ok(doc) = crate::xml::parse_secure(&full) else {
+        let Ok(doc) = crate::xml::parse_secure_metadata(&full) else {
             return out;
         };
         let Some(root) = doc.document_element() else {
@@ -261,10 +261,9 @@ fn attribute_values(doc: &crate::xml::Document<'_>, attr_node: crate::xml::NodeI
         if elem.name.namespace_uri.as_deref() == Some(SAML_ASSERTION_NS)
             && elem.name.local_name == "AttributeValue"
         {
-            let text = match doc.text_content(child) {
-                Some(t) => t.trim().to_string(),
-                None => doc.text_content_deep(child).trim().to_string(),
-            };
+            // Deep gather (not first-text-node) so a comment/CDATA cannot
+            // truncate the value below what the signature covers.
+            let text = doc.text_content_deep(child).trim().to_string();
             if !text.is_empty() {
                 values.push(text);
             }
@@ -273,13 +272,12 @@ fn attribute_values(doc: &crate::xml::Document<'_>, attr_node: crate::xml::NodeI
     values
 }
 
-/// The trimmed text content of an element (direct text, falling back to a deep
-/// gather), or the empty string.
+/// The trimmed full text content of an element, or the empty string.
+///
+/// Uses a deep gather rather than the first text node so a comment/CDATA
+/// splitting the text cannot truncate the value below what a signature covers.
 fn element_text(doc: &crate::xml::Document<'_>, node: crate::xml::NodeId) -> String {
-    match doc.text_content(node) {
-        Some(t) => t.trim().to_string(),
-        None => doc.text_content_deep(node).trim().to_string(),
-    }
+    doc.text_content_deep(node).trim().to_string()
 }
 
 /// The `xml:lang` of an element, if present.

@@ -311,9 +311,38 @@ impl<'a> SamlDeserialize<'a> for AuthnRequestRef<'a> {
 
 // ── Response ────────────────────────────────────────────────────────────────
 
+/// SAML protocol *request* elements that must never appear as a direct child
+/// of a `<samlp:Response>`. Their presence indicates a signature-wrapping /
+/// request-smuggling attempt rather than a legitimate response.
+const FORBIDDEN_RESPONSE_CHILDREN: &[&str] = &[
+    "AuthnRequest",
+    "LogoutRequest",
+    "ArtifactResolve",
+    "AttributeQuery",
+    "AuthnQuery",
+    "AuthzDecisionQuery",
+    "AssertionIDRequest",
+    "ManageNameIDRequest",
+    "NameIDMappingRequest",
+];
+
 impl<'a> SamlDeserialize<'a> for ResponseRef<'a> {
     fn from_xml(doc: &'a Document<'a>, node: NodeId) -> Result<Self, XmlError> {
         verify_element(doc, node, SAML_PROTOCOL_NS, "Response")?;
+
+        // Reject smuggled protocol *request* elements. A well-formed Response's
+        // only protocol-namespace children are Status (and, per binding, an
+        // enveloped Signature/Extensions); a nested request such as
+        // AuthnRequest is never legitimate and is a classic wrapping vector, so
+        // fail closed if one appears as a direct child.
+        for forbidden in FORBIDDEN_RESPONSE_CHILDREN {
+            if !find_child_elements(doc, node, SAML_PROTOCOL_NS, forbidden).is_empty() {
+                return Err(XmlError::UnexpectedElement(format!(
+                    "{forbidden} element is not allowed inside a SAML Response"
+                )));
+            }
+        }
+
         let base = parse_response_base(doc, node)?;
 
         // Assertion elements (per E26: multiple allowed)

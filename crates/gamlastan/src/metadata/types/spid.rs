@@ -263,7 +263,7 @@ impl SpidContactExtensions {
             r#"<root xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" xmlns:spid="{SPID_EXTENSIONS_NS}">{xml_to_parse}</root>"#
         );
 
-        let doc = crate::xml::parse_secure(&full_xml)
+        let doc = crate::xml::parse_secure_metadata(&full_xml)
             .map_err(|e| SpidExtensionError::ParseError(e.to_string()))?;
 
         let mut sp_type: Option<SpidSpType> = None;
@@ -329,18 +329,12 @@ fn visit_elements<'a>(
         if let Some(elem) = doc.element(child) {
             let local: &str = &elem.name.local_name;
             let ns: Option<&str> = elem.name.namespace_uri.as_deref();
-            // Try zero-copy text_content first, fall back to deep concatenation
-            let text = match doc.text_content(child) {
-                Some(t) => Some(t.to_string()),
-                None => {
-                    let deep = doc.text_content_deep(child);
-                    if deep.is_empty() {
-                        None
-                    } else {
-                        Some(deep)
-                    }
-                }
-            };
+            // Concatenate the full text content. A shallow first-text-node read
+            // would be truncatable by a comment/CDATA splitting the text (the
+            // CVE-2017-11427 class); the deep gather always matches the value the
+            // signature canonicalizes over.
+            let deep = doc.text_content_deep(child);
+            let text = if deep.is_empty() { None } else { Some(deep) };
             f(local, ns, text);
             visit_elements(doc, child, f);
         }
