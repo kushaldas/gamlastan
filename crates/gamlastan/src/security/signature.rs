@@ -30,7 +30,14 @@
 pub fn contains_ds_object(signature_xml: &str) -> Result<bool, uppsala::XmlError> {
     const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 
-    let doc = crate::xml::parse_secure(signature_xml)?;
+    // Use the comment/PI-tolerant metadata parse. This helper runs inside
+    // `verify_enveloped`, which also verifies federation metadata (MDQ), and
+    // metadata legitimately carries comments. A strict parse here would fail
+    // closed on comment-bearing-but-valid metadata. Nothing is weakened: this is
+    // a structural scan for a `{XMLDSig}Object` element (comments cannot hide or
+    // forge an element), CDATA/DTD are still rejected, and the comment-truncation
+    // defense for protocol messages is enforced at the deserialize parse layer.
+    let doc = crate::xml::parse_secure_metadata(signature_xml)?;
 
     let Some(root) = doc.document_element() else {
         return Ok(false);
@@ -98,7 +105,13 @@ pub fn is_hmac_algorithm(algorithm_uri: &str) -> bool {
 pub fn contains_hmac_signature_method(signed_xml: &str) -> Result<bool, uppsala::XmlError> {
     const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 
-    let doc = crate::xml::parse_secure(signed_xml)?;
+    // Comment/PI-tolerant metadata parse, for the same reason as
+    // [`contains_ds_object`]: this runs inside `verify_enveloped`, which also
+    // verifies comment-bearing federation metadata (MDQ). A strict parse would
+    // fail closed on otherwise-valid metadata. The scan is purely structural
+    // (a `{XMLDSig}SignatureMethod` element's `Algorithm` attribute), so
+    // tolerating comments loses no security; CDATA/DTD remain rejected.
+    let doc = crate::xml::parse_secure_metadata(signed_xml)?;
 
     let Some(root) = doc.document_element() else {
         return Ok(false);
@@ -269,6 +282,46 @@ mod tests {
         // to fail closed), not Ok(false) which would silently bypass E91.
         let xml = "<ds:Signature><ds:Object>unterminated";
         assert!(contains_ds_object(xml).is_err());
+    }
+
+    #[test]
+    fn test_scans_tolerate_comments_in_metadata() {
+        // PR #33 review: these helpers run inside `verify_enveloped`, which also
+        // verifies federation metadata (MDQ). Metadata legitimately carries XML
+        // comments, so a comment-bearing document must not fail closed in the
+        // structural pre-scans — while the scans still detect the real content.
+        let with_comment = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+            <!-- published by test federation -->
+            <ds:SignedInfo>
+                <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+            </ds:SignedInfo>
+        </ds:Signature>"#;
+        // Comment present but no ds:Object and no HMAC method: both scans must
+        // parse cleanly and report "not present" rather than erroring.
+        assert_eq!(contains_ds_object(with_comment), Ok(false));
+        assert_eq!(contains_hmac_signature_method(with_comment), Ok(false));
+
+        // Detection still works with a comment in the document.
+        let obj = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+            <!-- c --><ds:Object>x</ds:Object>
+        </ds:Signature>"#;
+        assert_eq!(contains_ds_object(obj), Ok(true));
+
+        let hmac = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+            <!-- c --><ds:SignedInfo>
+                <ds:SignatureMethod Algorithm="http://www.w3.org/2000/09/xmldsig#hmac-sha1"/>
+            </ds:SignedInfo>
+        </ds:Signature>"#;
+        assert_eq!(contains_hmac_signature_method(hmac), Ok(true));
+    }
+
+    #[test]
+    fn test_scans_still_reject_cdata() {
+        // Tolerating comments must not reopen the CDATA truncation vector: the
+        // metadata parse still rejects CDATA, so these scans fail closed on it.
+        let xml = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><![CDATA[x]]></ds:Signature>"#;
+        assert!(contains_ds_object(xml).is_err());
+        assert!(contains_hmac_signature_method(xml).is_err());
     }
 
     #[test]

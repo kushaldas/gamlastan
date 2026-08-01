@@ -238,21 +238,21 @@ fn reject_forbidden_nodes(
         match doc.node_kind(id) {
             Some(NodeKind::Comment(_)) if config.forbid_comments => {
                 return Err(uppsala::XmlError::well_formedness(
-                    "response contained illegal XML comments",
+                    "document contained illegal XML comments",
                     0,
                     0,
                 ));
             }
             Some(NodeKind::ProcessingInstruction(_)) if config.forbid_pis => {
                 return Err(uppsala::XmlError::well_formedness(
-                    "response contained illegal processing instructions",
+                    "document contained illegal processing instructions",
                     0,
                     0,
                 ));
             }
             Some(NodeKind::CData(_)) if config.forbid_cdata => {
                 return Err(uppsala::XmlError::well_formedness(
-                    "response contained illegal CDATA sections",
+                    "document contained illegal CDATA sections",
                     0,
                     0,
                 ));
