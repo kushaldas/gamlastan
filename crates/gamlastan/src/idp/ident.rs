@@ -12,8 +12,6 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use rand::RngCore;
-
 use crate::core::assertion::name_id::{NameId, NameIdPolicy};
 use crate::core::constants;
 use crate::core::protocol::name_id_mgmt::NewIdOrTerminate;
@@ -286,7 +284,7 @@ impl<S: IdentityStore> IdentDb<S> {
     ) -> String {
         loop {
             let mut seed = [0u8; 32];
-            rand::thread_rng().fill_bytes(&mut seed);
+            rand::fill(&mut seed);
             let mut input = seed.to_vec();
             input.extend_from_slice(format.as_bytes());
             input.extend_from_slice(name_qualifier.unwrap_or("").as_bytes());

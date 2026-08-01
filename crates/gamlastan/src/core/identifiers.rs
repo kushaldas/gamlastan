@@ -89,10 +89,8 @@ impl SamlId {
     /// Generate a new random SAML ID.
     /// Format: `_` followed by 32 random hex characters.
     pub fn generate() -> Self {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
         let mut bytes = [0u8; 16];
-        rng.fill(&mut bytes);
+        rand::fill(&mut bytes);
         let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
         SamlId(format!("_{}", hex))
     }
