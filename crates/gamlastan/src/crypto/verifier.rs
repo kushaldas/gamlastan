@@ -277,9 +277,12 @@ impl SamlVerifier {
             .keys_manager
             .find_by_usage(KeyUsage::Verify)
             .ok_or_else(|| CryptoError::KeyNotFound("No verification key found".to_string()))?;
-        let signing_key = key.to_signing_key().ok_or_else(|| {
-            CryptoError::KeyNotFound("Key cannot be used for verification".to_string())
-        })?;
+        let signing_key = key
+            .to_signing_key()
+            .map_err(CryptoError::BergshamraError)?
+            .ok_or_else(|| {
+                CryptoError::KeyNotFound("Key cannot be used for verification".to_string())
+            })?;
         let valid = sig_alg
             .verify(&signing_key, query_string, signature)
             .map_err(CryptoError::BergshamraError)?;

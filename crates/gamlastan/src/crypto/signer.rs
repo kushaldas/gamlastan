@@ -185,9 +185,12 @@ impl SamlSigner {
             .keys_manager
             .find_by_usage(KeyUsage::Sign)
             .ok_or_else(|| CryptoError::KeyNotFound("No signing key found".to_string()))?;
-        let signing_key = key.to_signing_key().ok_or_else(|| {
-            CryptoError::KeyNotFound("Key cannot be used for signing".to_string())
-        })?;
+        let signing_key = key
+            .to_signing_key()
+            .map_err(CryptoError::BergshamraError)?
+            .ok_or_else(|| {
+                CryptoError::KeyNotFound("Key cannot be used for signing".to_string())
+            })?;
         let signature = sig_alg
             .sign(&signing_key, query_string)
             .map_err(CryptoError::BergshamraError)?;
