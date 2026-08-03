@@ -283,13 +283,12 @@ mod tests {
         assert_eq!(loas, vec![constants::LOA3.to_string()]);
     }
 
+    /// Verifies comments may be structural but cannot split a signed text value.
     #[test]
-    fn comment_bearing_metadata_parses_and_reads_full_value() {
-        // Federation metadata routinely carries XML comments; they must not
-        // cause the extension to be rejected (interop), and a comment splitting
-        // an AttributeValue must not truncate the read value below what a
-        // signature covers (the CVE-2017-11427 class). The reader gathers the
-        // full text content, so the mid-value comment is transparent.
+    fn comment_bearing_metadata_rejects_split_value() {
+        // Structural federation comments remain accepted, but a comment that
+        // splits a signed value is rejected before a zero-copy reader can see a
+        // truncated first text node.
         let raw = format!(
             r#"<mdattr:EntityAttributes xmlns:mdattr="{}" xmlns:saml2="{}">
                  <!-- published by test federation -->
@@ -305,11 +304,7 @@ mod tests {
         );
         let ext = Extensions::new(raw);
         let cats = entity_categories(&ext);
-        assert_eq!(
-            cats,
-            vec!["http://id.elegnamnden.se/ec/loa3-pnr".to_string()],
-            "comment must be transparent and the full value read"
-        );
+        assert!(cats.is_empty(), "split metadata value must be rejected");
     }
 
     #[test]

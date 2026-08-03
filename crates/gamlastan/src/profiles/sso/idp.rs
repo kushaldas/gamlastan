@@ -89,12 +89,22 @@ pub struct ProcessedAuthnRequest {
 /// authentication and response generation.
 ///
 /// Per Profiles 4.1.4.1:
-/// - Verify ACS URL belongs to the SP (MITM prevention)
+/// - Verify the ACS URL and binding pair belongs to the SP (MITM prevention)
+/// - Require cryptographic signature proof when requested by metadata or markup
 /// - Respect ForceAuthn and IsPassive
 /// - Respect RequestedAuthnContext
+///
+/// `request_signature_verified` must be supplied by the binding layer after
+/// cryptographic verification; signature markup alone is not trusted.
+///
+/// # Errors
+///
+/// Returns an error for missing identity fields, an unregistered ACS
+/// URL/binding pair, or a required signature without verification proof.
 pub fn process_authn_request(
     request: &AuthnRequest,
-    sp_metadata: Option<&SpSsoDescriptor>,
+    sp_metadata: &SpSsoDescriptor,
+    request_signature_verified: bool,
 ) -> Result<ProcessedAuthnRequest, ProfileError> {
     // Extract SP entity ID from Issuer
     let sp_entity_id = request
@@ -106,6 +116,12 @@ pub fn process_authn_request(
         .clone();
 
     // Determine ACS URL and binding
+    if (request.base.has_signature || sp_metadata.authn_requests_signed == Some(true))
+        && !request_signature_verified
+    {
+        return Err(ProfileError::AuthnRequestSignatureRequired);
+    }
+
     let (acs_url, acs_binding) = resolve_acs_endpoint(request, sp_metadata)?;
 
     // Extract ForceAuthn and IsPassive
@@ -149,7 +165,7 @@ pub fn process_authn_request(
 /// 3. Default ACS from SP metadata
 fn resolve_acs_endpoint(
     request: &AuthnRequest,
-    sp_metadata: Option<&SpSsoDescriptor>,
+    sp_metadata: &SpSsoDescriptor,
 ) -> Result<(String, String), ProfileError> {
     // Option 1: URL directly specified in request
     if let Some(url) = &request.assertion_consumer_service_url {
@@ -158,15 +174,15 @@ fn resolve_acs_endpoint(
             .as_deref()
             .unwrap_or("urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST");
 
-        // If we have SP metadata, verify the URL is legitimate
-        if let Some(sp) = sp_metadata {
-            let found = sp
-                .assertion_consumer_services
-                .iter()
-                .any(|ep| ep.endpoint.location == *url);
-            if !found {
-                return Err(ProfileError::AcsUrlMismatch);
-            }
+        // Location and binding are one registered endpoint. Verifying only the
+        // URL and then returning the request-controlled binding creates a
+        // protocol-confusion gap.
+        let found = sp_metadata
+            .assertion_consumer_services
+            .iter()
+            .any(|ep| ep.endpoint.location == *url && ep.endpoint.binding == binding);
+        if !found {
+            return Err(ProfileError::AcsUrlMismatch);
         }
 
         return Ok((url.clone(), binding.to_string()));
@@ -174,14 +190,12 @@ fn resolve_acs_endpoint(
 
     // Option 2: Index specified in request
     if let Some(index) = request.assertion_consumer_service_index {
-        if let Some(sp) = sp_metadata {
-            if let Some(ep) = sp
-                .assertion_consumer_services
-                .iter()
-                .find(|e| e.index == index)
-            {
-                return Ok((ep.endpoint.location.clone(), ep.endpoint.binding.clone()));
-            }
+        if let Some(ep) = sp_metadata
+            .assertion_consumer_services
+            .iter()
+            .find(|e| e.index == index)
+        {
+            return Ok((ep.endpoint.location.clone(), ep.endpoint.binding.clone()));
         }
         return Err(ProfileError::NoAcsEndpoint(format!(
             "index {} not found in SP metadata",
@@ -190,12 +204,11 @@ fn resolve_acs_endpoint(
     }
 
     // Option 3: Default from SP metadata
-    if let Some(sp) = sp_metadata {
-        let default =
-            crate::profiles::sso::sp::find_default_acs_endpoint(&sp.assertion_consumer_services);
-        if let Some(ep) = default {
-            return Ok((ep.endpoint.location.clone(), ep.endpoint.binding.clone()));
-        }
+    let default = crate::profiles::sso::sp::find_default_acs_endpoint(
+        &sp_metadata.assertion_consumer_services,
+    );
+    if let Some(ep) = default {
+        return Ok((ep.endpoint.location.clone(), ep.endpoint.binding.clone()));
     }
 
     Err(ProfileError::NoAcsEndpoint(
@@ -741,7 +754,7 @@ mod tests {
     fn test_process_authn_request() {
         let request = make_authn_request();
         let sp_meta = make_sp_metadata();
-        let result = process_authn_request(&request, Some(&sp_meta)).unwrap();
+        let result = process_authn_request(&request, &sp_meta, false).unwrap();
 
         assert_eq!(result.request_id, "_req123");
         assert_eq!(result.sp_entity_id, "https://sp.example.com");
@@ -761,7 +774,7 @@ mod tests {
         let mut request = make_authn_request();
         request.assertion_consumer_service_url = Some("https://evil.example.com/acs".to_string());
         let sp_meta = make_sp_metadata();
-        let result = process_authn_request(&request, Some(&sp_meta));
+        let result = process_authn_request(&request, &sp_meta, false);
         assert!(matches!(result, Err(ProfileError::AcsUrlMismatch)));
     }
 
@@ -772,7 +785,7 @@ mod tests {
         request.protocol_binding = None;
         request.assertion_consumer_service_index = Some(1);
         let sp_meta = make_sp_metadata();
-        let result = process_authn_request(&request, Some(&sp_meta)).unwrap();
+        let result = process_authn_request(&request, &sp_meta, false).unwrap();
         assert_eq!(result.acs_url, "https://sp.example.com/acs/redirect");
     }
 
@@ -783,7 +796,7 @@ mod tests {
         request.protocol_binding = None;
         request.assertion_consumer_service_index = None;
         let sp_meta = make_sp_metadata();
-        let result = process_authn_request(&request, Some(&sp_meta)).unwrap();
+        let result = process_authn_request(&request, &sp_meta, false).unwrap();
         assert_eq!(result.acs_url, "https://sp.example.com/acs/post");
     }
 
@@ -791,8 +804,36 @@ mod tests {
     fn test_process_authn_request_missing_issuer() {
         let mut request = make_authn_request();
         request.base.issuer = None;
-        let result = process_authn_request(&request, None);
+        let sp_meta = make_sp_metadata();
+        let result = process_authn_request(&request, &sp_meta, false);
         assert!(matches!(result, Err(ProfileError::MissingIssuer)));
+    }
+
+    /// Verifies that an ACS URL is accepted only with its registered binding.
+    #[test]
+    fn test_process_authn_request_rejects_binding_not_registered_for_url() {
+        let mut request = make_authn_request();
+        request.protocol_binding =
+            Some("urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect".to_string());
+        let sp_meta = make_sp_metadata();
+        assert!(matches!(
+            process_authn_request(&request, &sp_meta, false),
+            Err(ProfileError::AcsUrlMismatch)
+        ));
+    }
+
+    /// Verifies enforcement of the SP metadata `AuthnRequestsSigned` policy.
+    #[test]
+    fn test_process_authn_request_enforces_metadata_signature_policy() {
+        let request = make_authn_request();
+        let mut sp_meta = make_sp_metadata();
+        sp_meta.authn_requests_signed = Some(true);
+
+        assert!(matches!(
+            process_authn_request(&request, &sp_meta, false),
+            Err(ProfileError::AuthnRequestSignatureRequired)
+        ));
+        assert!(process_authn_request(&request, &sp_meta, true).is_ok());
     }
 
     #[test]

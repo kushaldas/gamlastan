@@ -49,7 +49,10 @@ use gamlastan::core::assertion::attribute::{Attribute, AttributeValue};
 use gamlastan::core::assertion::name_id::NameId;
 use gamlastan::core::constants;
 use gamlastan::core::identifiers::SamlId;
+use gamlastan::core::protocol::request::{AuthnContextComparison, RequestedAuthnContext};
+use gamlastan::core::protocol::status::Status;
 use gamlastan::crypto::{KeysManager, SamlSigner, SamlVerifier, VerifyResult};
+use gamlastan::idp::authn_broker::AuthnBroker;
 use gamlastan::metadata::types::entity_descriptor::EntityDescriptorRef;
 use gamlastan::profiles::sso::idp as idp_profile;
 use gamlastan::profiles::sso::web_browser::{ResponseOptions, ResponseTimes};
@@ -62,6 +65,10 @@ const OID_UID: &str = "urn:oid:0.9.2342.19200300.100.1.1";
 const OID_EMAIL: &str = "urn:oid:0.9.2342.19200300.100.1.3";
 const OID_GIVEN_NAME: &str = "urn:oid:2.5.4.42";
 const OID_SURNAME: &str = "urn:oid:2.5.4.4";
+/// Maximum age of a login form's pending AuthnRequest.
+const PENDING_AUTHN_REQUEST_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+/// Hard bound on outstanding login forms retained by the example IdP.
+const MAX_PENDING_AUTHN_REQUESTS: usize = 1024;
 
 // ── Test user ─────────────────────────────────────────────────────────────
 
@@ -75,6 +82,7 @@ struct User {
 }
 
 impl User {
+    /// Return the example user's attributes for an issued assertion.
     fn attributes(&self) -> Vec<Attribute> {
         vec![
             Attribute {
@@ -104,10 +112,15 @@ impl User {
         ]
     }
 
-    fn name_id(&self) -> NameId {
+    /// Build a NameID in the requested format supported by this example IdP.
+    fn name_id(&self, requested_format: Option<&str>) -> NameId {
         NameId {
             value: self.email.clone(),
-            format: Some(constants::NAMEID_EMAIL.to_string()),
+            format: Some(
+                requested_format
+                    .unwrap_or(constants::NAMEID_EMAIL)
+                    .to_string(),
+            ),
             name_qualifier: None,
             sp_name_qualifier: None,
             sp_provided_id: None,
@@ -146,6 +159,8 @@ fn test_users() -> HashMap<String, User> {
 struct PendingAuthnRequest {
     processed: idp_profile::ProcessedAuthnRequest,
     relay_state: Option<String>,
+    /// Monotonic insertion time used to expire abandoned login forms.
+    created_at: std::time::Instant,
 }
 
 // ── Session (authenticated user) ──────────────────────────────────────────
@@ -153,8 +168,10 @@ struct PendingAuthnRequest {
 #[derive(Debug, Clone)]
 struct Session {
     username: String,
-    #[allow(dead_code)]
     session_index: String,
+    authn_instant: chrono::DateTime<Utc>,
+    /// AuthnContextClassRef established by the original login.
+    authn_context_class_ref: String,
 }
 
 struct TrustedSp {
@@ -457,7 +474,7 @@ async fn handle_authn_request(
     redirect_binding: Option<&RedirectDecoded>,
 ) -> HttpResponse {
     // Parse the AuthnRequest
-    let doc = match gamlastan::xml::uppsala::parse(xml_str) {
+    let doc = match gamlastan::xml::parse_secure(xml_str) {
         Ok(d) => d,
         Err(e) => return HttpResponse::BadRequest().body(format!("Invalid XML: {e}")),
     };
@@ -487,28 +504,75 @@ async fn handle_authn_request(
         processed.sp_entity_id, processed.request_id, processed.acs_url
     );
 
-    // Check if user already has a session
-    if let Some(session) = get_session_from_cookie(&req, &state) {
-        info!(
-            "User {} already has session, responding directly",
-            session.username
+    if !requested_name_id_is_supported(&processed) {
+        return build_saml_error_response(
+            &state,
+            &processed,
+            relay_state,
+            constants::STATUS_REQUESTER,
+            constants::STATUS_INVALID_NAMEID_POLICY,
+            "The example IdP supports only email-address and unspecified NameID formats",
         );
-        if let Some(user) = state.users.get(&session.username) {
-            return build_saml_response(&state, &processed, user, relay_state);
+    }
+
+    if select_authn_context(&processed).is_none() {
+        return build_saml_error_response(
+            &state,
+            &processed,
+            relay_state,
+            constants::STATUS_RESPONDER,
+            constants::STATUS_NO_AUTHN_CONTEXT,
+            "The requested authentication context is unavailable",
+        );
+    }
+
+    // Check if user already has a session. ForceAuthn deliberately bypasses
+    // reuse; combined with IsPassive it therefore produces NoPassive below.
+    if !processed.force_authn {
+        if let Some(session) = get_session_from_cookie(&req, &state) {
+            info!(
+                "User {} already has session, responding directly",
+                session.username
+            );
+            if let Some(user) = state.users.get(&session.username) {
+                if authn_context_satisfies(&processed, &session.authn_context_class_ref) {
+                    return build_saml_response(
+                        &state,
+                        &processed,
+                        user,
+                        relay_state,
+                        session.authn_instant,
+                        session.session_index,
+                        session.authn_context_class_ref,
+                    );
+                }
+            }
         }
+    }
+
+    if processed.is_passive {
+        return build_saml_error_response(
+            &state,
+            &processed,
+            relay_state,
+            constants::STATUS_RESPONDER,
+            constants::STATUS_NO_PASSIVE,
+            "Passive authentication is not possible without a reusable session",
+        );
     }
 
     // No session — store pending request and show login form
     let pending_id = SamlId::generate().to_string();
-    {
-        let mut pending = state.pending_requests.lock().unwrap();
-        pending.insert(
-            pending_id.clone(),
-            PendingAuthnRequest {
-                processed,
-                relay_state,
-            },
-        );
+    if !store_pending_authn_request(
+        &state.pending_requests,
+        pending_id.clone(),
+        PendingAuthnRequest {
+            processed,
+            relay_state,
+            created_at: std::time::Instant::now(),
+        },
+    ) {
+        return HttpResponse::TooManyRequests().body("Too many pending authentication requests");
     }
 
     show_login_form(&pending_id, None)
@@ -524,18 +588,12 @@ async fn handle_login(
     let password = form.get("password").map(|s| s.as_str()).unwrap_or("");
     let pending_id = form.get("pending_id").map(|s| s.as_str()).unwrap_or("");
 
-    // Look up pending request
-    let pending = {
-        let pending_map = state.pending_requests.lock().unwrap();
-        pending_map.get(pending_id).cloned()
-    };
-
-    let pending = match pending {
-        Some(p) => p,
-        None => {
-            return HttpResponse::BadRequest().body("No pending authentication request found. Please start the login flow from your SP.");
-        }
-    };
+    // Check the request without consuming it so a mistyped password can retry.
+    if pending_authn_request(&state.pending_requests, pending_id).is_none() {
+        return HttpResponse::BadRequest().body(
+            "No pending authentication request found. Please start the login flow from your SP.",
+        );
+    }
 
     // Authenticate
     let user = match state.users.get(username) {
@@ -547,15 +605,22 @@ async fn handle_login(
 
     info!("User {} authenticated successfully", username);
 
-    // Remove pending request
-    {
-        let mut pending_map = state.pending_requests.lock().unwrap();
-        pending_map.remove(pending_id);
-    }
+    // Atomically consume the request after authentication. Concurrent form
+    // submissions may both authenticate, but exactly one may issue a response.
+    let pending = match take_pending_authn_request(&state.pending_requests, pending_id) {
+        Some(pending) => pending,
+        None => {
+            return HttpResponse::BadRequest()
+                .body("Authentication request was already used or expired")
+        }
+    };
 
     // Create session
     let session_id = SamlId::generate().to_string();
     let session_index = SamlId::generate().to_string();
+    let authn_instant = Utc::now();
+    let selected_authn_context = select_authn_context(&pending.processed)
+        .expect("pending request policy was checked before login");
     {
         let mut sessions = state.sessions.lock().unwrap();
         sessions.insert(
@@ -563,12 +628,22 @@ async fn handle_login(
             Session {
                 username: username.to_string(),
                 session_index: session_index.clone(),
+                authn_instant,
+                authn_context_class_ref: selected_authn_context.clone(),
             },
         );
     }
 
     // Build SAML Response
-    let mut response = build_saml_response(&state, &pending.processed, user, pending.relay_state);
+    let mut response = build_saml_response(
+        &state,
+        &pending.processed,
+        user,
+        pending.relay_state,
+        authn_instant,
+        session_index,
+        selected_authn_context,
+    );
 
     // Set session cookie
     response.headers_mut().insert(
@@ -588,13 +663,14 @@ fn build_saml_response(
     processed: &idp_profile::ProcessedAuthnRequest,
     user: &User,
     relay_state: Option<String>,
+    authn_instant: chrono::DateTime<Utc>,
+    session_index: String,
+    authn_context_class_ref: String,
 ) -> HttpResponse {
     let now = Utc::now();
     let session_not_on_or_after = now
         + chrono::TimeDelta::try_seconds(state.config.session_lifetime_seconds as i64)
             .unwrap_or(chrono::TimeDelta::try_hours(8).unwrap());
-
-    let session_index = SamlId::generate().to_string();
 
     let response_options = ResponseOptions {
         idp_entity_id: state.config.entity_id.clone(),
@@ -604,18 +680,60 @@ fn build_saml_response(
         assertion_lifetime_seconds: state.config.assertion_lifetime_seconds,
         session_index: Some(session_index),
         session_not_on_or_after: Some(session_not_on_or_after),
-        authn_context_class_ref: Some(
-            "urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport".to_string(),
-        ),
+        authn_context_class_ref: Some(authn_context_class_ref),
         client_address: None,
         attributes: user.attributes(),
     };
 
-    // This example always authenticates the user fresh per request, so the
-    // authentication instant equals the response issue instant.
-    let response =
-        idp_profile::create_response(&response_options, &user.name_id(), ResponseTimes::at(now));
+    let response = idp_profile::create_response(
+        &response_options,
+        &user.name_id(processed.requested_name_id_format.as_deref()),
+        ResponseTimes {
+            issue_instant: now,
+            authn_instant,
+        },
+    );
 
+    render_saml_response(
+        state,
+        response,
+        &processed.acs_url,
+        relay_state,
+        state.config.sign_assertions,
+    )
+}
+
+/// Build, sign, and POST a protocol error response to the validated ACS.
+#[allow(clippy::too_many_arguments)]
+fn build_saml_error_response(
+    state: &AppState,
+    processed: &idp_profile::ProcessedAuthnRequest,
+    relay_state: Option<String>,
+    top_level_status: &str,
+    sub_status: &str,
+    message: &str,
+) -> HttpResponse {
+    let response = idp_profile::create_error_response(
+        &state.config.entity_id,
+        Some(&processed.request_id),
+        &processed.acs_url,
+        Status::with_sub_status(top_level_status, sub_status, Some(message.to_string())),
+        Utc::now(),
+    );
+    render_saml_response(state, response, &processed.acs_url, relay_state, false)
+}
+
+/// Serialize, sign, and encode a SAML Response for HTTP-POST delivery.
+///
+/// Assertion-less error responses are signed at the Response level whenever
+/// either normal response or assertion signing is enabled.
+fn render_saml_response(
+    state: &AppState,
+    response: gamlastan::core::protocol::response::Response,
+    acs_url: &str,
+    relay_state: Option<String>,
+    sign_assertion: bool,
+) -> HttpResponse {
     let response_xml = match response.to_xml_string() {
         Ok(xml) => xml,
         Err(e) => {
@@ -624,15 +742,17 @@ fn build_saml_response(
         }
     };
 
-    // Sign the Response and Assertion
+    // Sign the Response and, for successful responses, its Assertion.
     let assertion_id = response.assertions.first().map(|a| a.id.as_str());
+    let sign_response = state.config.sign_responses
+        || (response.assertions.is_empty() && state.config.sign_assertions);
     let signed_xml = match gamlastan_actix::idp::sign_response_xml(
         &response_xml,
         &state.signing_ctx,
         &response.base.id,
         assertion_id,
-        state.config.sign_assertions,
-        state.config.sign_responses,
+        sign_assertion,
+        sign_response,
     ) {
         Ok(xml) => xml,
         Err(e) => {
@@ -648,7 +768,7 @@ fn build_saml_response(
     let html = gamlastan::bindings::post::post_encode(
         signed_xml.as_bytes(),
         false, // is_response (not request)
-        &processed.acs_url,
+        acs_url,
         relay.as_ref(),
     );
 
@@ -675,6 +795,118 @@ async fn slo_handler() -> HttpResponse {
 }
 
 // ── Helper functions ──────────────────────────────────────────────────────
+
+/// Return whether the request's NameID format can be issued by this IdP.
+fn requested_name_id_is_supported(processed: &idp_profile::ProcessedAuthnRequest) -> bool {
+    matches!(
+        processed.requested_name_id_format.as_deref(),
+        None | Some(constants::NAMEID_EMAIL) | Some(constants::NAMEID_UNSPECIFIED)
+    )
+}
+
+/// Build the authentication-method broker used by the example login form.
+fn supported_authn_contexts() -> AuthnBroker {
+    let mut broker = AuthnBroker::new();
+    broker.add(
+        constants::AUTHN_CONTEXT_UNSPECIFIED,
+        "password-form",
+        0,
+        None,
+    );
+    broker.add(constants::AUTHN_CONTEXT_PASSWORD, "password-form", 1, None);
+    broker.add(
+        constants::AUTHN_CONTEXT_PASSWORD_PROTECTED_TRANSPORT,
+        "password-form",
+        2,
+        None,
+    );
+    broker
+}
+
+/// Convert the processed request fields back into broker input.
+fn requested_authn_context(
+    processed: &idp_profile::ProcessedAuthnRequest,
+) -> Option<RequestedAuthnContext> {
+    if processed.requested_authn_context_class_refs.is_empty() {
+        return None;
+    }
+    Some(RequestedAuthnContext {
+        authn_context_class_refs: processed.requested_authn_context_class_refs.clone(),
+        authn_context_decl_refs: Vec::new(),
+        comparison: processed
+            .authn_context_comparison
+            .unwrap_or(AuthnContextComparison::Exact),
+    })
+}
+
+/// Select the strongest supported authentication context satisfying a request.
+fn select_authn_context(processed: &idp_profile::ProcessedAuthnRequest) -> Option<String> {
+    let Some(requested) = requested_authn_context(processed) else {
+        return Some(constants::AUTHN_CONTEXT_PASSWORD_PROTECTED_TRANSPORT.to_string());
+    };
+    supported_authn_contexts()
+        .pick(Some(&requested))
+        .into_iter()
+        .max_by_key(|method| method.level)
+        .map(|method| method.class_ref.clone())
+}
+
+/// Return whether an existing session satisfies the requested context policy.
+fn authn_context_satisfies(
+    processed: &idp_profile::ProcessedAuthnRequest,
+    established_class_ref: &str,
+) -> bool {
+    let Some(requested) = requested_authn_context(processed) else {
+        return true;
+    };
+    supported_authn_contexts()
+        .pick(Some(&requested))
+        .iter()
+        .any(|method| method.class_ref == established_class_ref)
+}
+
+/// Remove expired pending requests while the caller holds the state lock.
+fn purge_expired_pending_authn_requests(pending: &mut HashMap<String, PendingAuthnRequest>) {
+    let now = std::time::Instant::now();
+    pending.retain(|_, request| {
+        now.saturating_duration_since(request.created_at) <= PENDING_AUTHN_REQUEST_TTL
+    });
+}
+
+/// Store a pending request if the bounded request table has capacity.
+fn store_pending_authn_request(
+    pending: &Mutex<HashMap<String, PendingAuthnRequest>>,
+    pending_id: String,
+    request: PendingAuthnRequest,
+) -> bool {
+    let mut pending = pending.lock().unwrap();
+    purge_expired_pending_authn_requests(&mut pending);
+    if pending.len() >= MAX_PENDING_AUTHN_REQUESTS {
+        return false;
+    }
+    pending.insert(pending_id, request);
+    true
+}
+
+/// Look up a live pending request without consuming it.
+fn pending_authn_request(
+    pending: &Mutex<HashMap<String, PendingAuthnRequest>>,
+    pending_id: &str,
+) -> Option<PendingAuthnRequest> {
+    let mut pending = pending.lock().unwrap();
+    purge_expired_pending_authn_requests(&mut pending);
+    pending.get(pending_id).cloned()
+}
+
+/// Atomically consume a live pending request after successful authentication.
+fn take_pending_authn_request(
+    pending: &Mutex<HashMap<String, PendingAuthnRequest>>,
+    pending_id: &str,
+) -> Option<PendingAuthnRequest> {
+    let mut pending = pending.lock().unwrap();
+    purge_expired_pending_authn_requests(&mut pending);
+    pending.remove(pending_id)
+}
 
 /// Show the login form HTML
 fn show_login_form(pending_id: &str, error: Option<&str>) -> HttpResponse {
@@ -833,7 +1065,7 @@ fn validate_authn_request(
         return Err("unsigned AuthnRequest rejected by IdP policy".to_string());
     }
 
-    idp_profile::process_authn_request(authn_request, Some(&sp.sp_sso)).map_err(|e| e.to_string())
+    idp_profile::process_authn_request(authn_request, &sp.sp_sso, signed).map_err(|e| e.to_string())
 }
 
 /// Load every trusted SP, keyed by entity ID.
@@ -905,7 +1137,7 @@ fn load_trusted_sp(
         )
     })?;
 
-    let metadata_doc = gamlastan::xml::uppsala::parse(&metadata_xml).map_err(|e| {
+    let metadata_doc = gamlastan::xml::parse_secure_metadata(&metadata_xml).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("invalid SP metadata XML: {e}"),
@@ -971,7 +1203,7 @@ fn extract_x509_certificates(key_info_xml: &str) -> io::Result<Vec<Vec<u8>>> {
         return Ok(Vec::new());
     }
 
-    let doc = gamlastan::xml::uppsala::parse(key_info_xml).map_err(|e| {
+    let doc = gamlastan::xml::parse_secure_metadata(key_info_xml).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("invalid ds:KeyInfo XML in metadata: {e}"),
@@ -1415,6 +1647,140 @@ mod tests {
         }
     }
 
+    /// Build a validated request for helper-level policy and state tests.
+    fn processed_request() -> idp_profile::ProcessedAuthnRequest {
+        let state = test_state(false, &["https://sp.example.se/metadata"]);
+        validate_authn_request(
+            &state,
+            &unsigned_request("https://sp.example.se/metadata"),
+            "",
+            None,
+        )
+        .expect("test request should be valid")
+    }
+
+    /// Requested NameID formats are either honored or rejected explicitly.
+    #[test]
+    fn requested_name_id_policy_is_enforced() {
+        let mut processed = processed_request();
+        assert!(requested_name_id_is_supported(&processed));
+
+        processed.requested_name_id_format = Some(constants::NAMEID_UNSPECIFIED.to_string());
+        assert!(requested_name_id_is_supported(&processed));
+        assert_eq!(
+            test_users()["alice"]
+                .name_id(processed.requested_name_id_format.as_deref())
+                .format,
+            Some(constants::NAMEID_UNSPECIFIED.to_string())
+        );
+
+        processed.requested_name_id_format = Some(constants::NAMEID_PERSISTENT.to_string());
+        assert!(!requested_name_id_is_supported(&processed));
+    }
+
+    /// AuthnContext selection honors all comparison modes and rejects gaps.
+    #[test]
+    fn requested_authn_context_is_negotiated() {
+        let mut processed = processed_request();
+        processed.requested_authn_context_class_refs =
+            vec![constants::AUTHN_CONTEXT_PASSWORD.to_string()];
+
+        processed.authn_context_comparison = Some(AuthnContextComparison::Exact);
+        assert_eq!(
+            select_authn_context(&processed).as_deref(),
+            Some(constants::AUTHN_CONTEXT_PASSWORD)
+        );
+
+        processed.authn_context_comparison = Some(AuthnContextComparison::Better);
+        assert_eq!(
+            select_authn_context(&processed).as_deref(),
+            Some(constants::AUTHN_CONTEXT_PASSWORD_PROTECTED_TRANSPORT)
+        );
+
+        processed.requested_authn_context_class_refs =
+            vec![constants::AUTHN_CONTEXT_PASSWORD_PROTECTED_TRANSPORT.to_string()];
+        assert!(select_authn_context(&processed).is_none());
+
+        processed.authn_context_comparison = Some(AuthnContextComparison::Maximum);
+        assert!(authn_context_satisfies(
+            &processed,
+            constants::AUTHN_CONTEXT_PASSWORD
+        ));
+    }
+
+    /// Pending login state is bounded, expires, and can be consumed once.
+    #[test]
+    fn pending_authn_requests_are_bounded_and_one_time() {
+        let pending = Mutex::new(HashMap::new());
+        let processed = processed_request();
+        for index in 0..MAX_PENDING_AUTHN_REQUESTS {
+            assert!(store_pending_authn_request(
+                &pending,
+                format!("pending-{index}"),
+                PendingAuthnRequest {
+                    processed: processed.clone(),
+                    relay_state: None,
+                    created_at: std::time::Instant::now(),
+                },
+            ));
+        }
+        assert!(!store_pending_authn_request(
+            &pending,
+            "overflow".to_string(),
+            PendingAuthnRequest {
+                processed: processed.clone(),
+                relay_state: None,
+                created_at: std::time::Instant::now(),
+            },
+        ));
+
+        assert!(pending_authn_request(&pending, "pending-0").is_some());
+        assert!(take_pending_authn_request(&pending, "pending-0").is_some());
+        assert!(take_pending_authn_request(&pending, "pending-0").is_none());
+
+        pending.lock().unwrap().insert(
+            "expired".to_string(),
+            PendingAuthnRequest {
+                processed,
+                relay_state: None,
+                created_at: std::time::Instant::now()
+                    - PENDING_AUTHN_REQUEST_TTL
+                    - std::time::Duration::from_secs(1),
+            },
+        );
+        assert!(pending_authn_request(&pending, "expired").is_none());
+    }
+
+    /// IsPassive without a suitable session returns without creating login state.
+    #[actix_web::test]
+    async fn passive_request_does_not_prompt_for_credentials() {
+        let mut state = test_state(false, &["https://sp.example.se/metadata"]);
+        state.config.sign_assertions = false;
+        state.config.sign_responses = false;
+        let state = web::Data::new(state);
+        let mut request = unsigned_request("https://sp.example.se/metadata");
+        request.is_passive = Some(true);
+        let xml = request.to_xml_string().unwrap();
+
+        let response = handle_authn_request(
+            actix_web::test::TestRequest::default().to_http_request(),
+            state.clone(),
+            &xml,
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+        assert!(state.pending_requests.lock().unwrap().is_empty());
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.contains("SAMLResponse"));
+        assert!(!body.contains("Sign In"));
+    }
+
     #[test]
     fn test_load_trusted_sp_requires_signed_requests_by_default() {
         let path = write_temp_metadata(&test_metadata(Some(false)));
@@ -1432,6 +1798,21 @@ mod tests {
         std::fs::remove_file(path).unwrap();
 
         assert!(!trusted_sp.require_signed_authn_requests);
+    }
+
+    /// Trusted metadata accepts comments under the metadata-specific policy.
+    #[test]
+    fn test_load_trusted_sp_accepts_metadata_comments() {
+        let metadata = test_metadata(Some(false)).replacen(
+            "<md:SPSSODescriptor",
+            "<!-- federation provenance --><md:SPSSODescriptor",
+            1,
+        );
+        let path = write_temp_metadata(&metadata);
+        let trusted_sp = load_trusted_sp(path.to_str().unwrap(), false).unwrap();
+        std::fs::remove_file(path).unwrap();
+
+        assert_eq!(trusted_sp.entity_id, "https://sp.example.se/metadata");
     }
 
     #[test]

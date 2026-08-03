@@ -59,6 +59,22 @@ const SPID_L1: &str = "https://www.spid.gov.it/SpidL1";
 const SPID_L2: &str = "https://www.spid.gov.it/SpidL2";
 #[allow(dead_code)]
 const SPID_L3: &str = "https://www.spid.gov.it/SpidL3";
+/// Maximum age of an outstanding AuthnRequest correlation record.
+const PENDING_REQUEST_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+/// Hard bound on outstanding AuthnRequest correlation records.
+const MAX_PENDING_REQUESTS: usize = 1024;
+
+/// One outstanding AuthnRequest and the context needed to validate its response.
+#[derive(Debug, Clone)]
+struct PendingRequest {
+    /// Authentication context requested from the IdP.
+    authn_context: String,
+    /// Monotonic insertion time used to expire the record.
+    created_at: std::time::Instant,
+}
+
+/// Outstanding AuthnRequests keyed by their one-time request ID.
+type PendingRequests = std::collections::HashMap<String, PendingRequest>;
 
 // ── App State ──────────────────────────────────────────────────────────────
 
@@ -85,8 +101,8 @@ struct AppState {
     signer: Arc<SamlSigner>,
     /// SAML verifier (for IdP responses) - configured with IdP's certificate
     idp_verifier: Arc<SamlVerifier>,
-    /// Pending request IDs (maps request_id -> authn_context_class_ref)
-    pending_requests: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    /// Bounded pending request IDs and their requested authentication context.
+    pending_requests: Arc<std::sync::Mutex<PendingRequests>>,
     /// Replay cache for assertion ID deduplication
     #[allow(dead_code)]
     replay_cache: Arc<InMemoryReplayCache>,
@@ -391,11 +407,10 @@ async fn sp_login(state: web::Data<AppState>, query: web::Query<LoginParams>) ->
     info!("AuthnRequest XML:\n{xml}");
 
     // Store pending request ID with the requested authn context
-    state
-        .pending_requests
-        .lock()
-        .unwrap()
-        .insert(request_id.clone(), authn_context.to_string());
+    if !store_pending_request(&state.pending_requests, &request_id, authn_context) {
+        log::warn!("pending AuthnRequest capacity reached");
+        return HttpResponse::TooManyRequests().body("Too many pending authentication requests");
+    }
 
     // Encode using HTTP-Redirect binding with signature
     let sig_alg = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
@@ -495,7 +510,7 @@ fn first_duplicate_assertion_id(
 /// 2. Verify XML signatures (Response and/or Assertion level)
 /// 3. Parse the SAML Response
 /// 4. Run SPID-specific structural checks
-/// 5. Run the 32-check assertion validation
+/// 5. Run the shared security checks plus SPID-specific validation
 /// 6. Return HTTP 200 for valid responses, HTTP 400/403/500 for invalid
 ///
 /// Signature verification keeps the verified XML-DSig reference IDs and binds
@@ -527,7 +542,7 @@ async fn sp_acs(state: web::Data<AppState>, form: web::Form<AcsForm>) -> HttpRes
 
     info!(
         "SAML Response XML (first 500 chars):\n{}",
-        &xml_str[..xml_str.len().min(500)]
+        truncate_chars(&xml_str, 500)
     );
 
     // ── Step 2: Quick structural XML checks before full parse ──────────
@@ -595,34 +610,13 @@ async fn sp_acs(state: web::Data<AppState>, form: web::Form<AcsForm>) -> HttpRes
     };
 
     // ── Step 4: Parse the SAML Response ────────────────────────────────
-    let doc = match gamlastan::xml::uppsala::parse(&xml_str) {
-        Ok(d) => d,
+    let response = match parse_spid_response(&xml_str) {
+        Ok(response) => response,
         Err(e) => {
-            log::error!("Failed to parse SAML Response XML: {e}");
-            return HttpResponse::BadRequest().body(format!("XML parse error: {e}"));
+            log::warn!("Failed to securely parse SAML Response: {e}");
+            return HttpResponse::BadRequest().body(e);
         }
     };
-
-    use gamlastan::xml::deserialize::SamlDeserialize;
-    let doc_elem = match doc.document_element() {
-        Some(e) => e,
-        None => {
-            return HttpResponse::BadRequest().body("Empty XML document");
-        }
-    };
-
-    let response_ref =
-        match gamlastan::core::protocol::response::ResponseRef::from_xml(&doc, doc_elem) {
-            Ok(r) => r,
-            Err(e) => {
-                // Many SPID tests send malformed XML that fails at parse time.
-                // This is expected - return 400 for parse errors.
-                log::warn!("Failed to parse SAML Response: {e}");
-                return HttpResponse::BadRequest().body(format!("SAML parse error: {e}"));
-            }
-        };
-
-    let response: Response = response_ref.to_owned();
 
     // ── Step 5: Check status code ──────────────────────────────────────
     // Error status codes (tests 104-108, 111) should be handled gracefully.
@@ -706,19 +700,16 @@ async fn sp_acs(state: web::Data<AppState>, form: web::Form<AcsForm>) -> HttpRes
 
     // 6e. Response MUST have InResponseTo matching a pending request
     let (expected_request_id, requested_acr) = match response.base.in_response_to.as_deref() {
-        Some(irt) if !irt.is_empty() => {
-            let pending = state.pending_requests.lock().unwrap();
-            match pending.get(irt) {
-                Some(acr) => (Some(irt.to_string()), Some(acr.clone())),
-                None => {
-                    log::warn!(
-                        "ACS: InResponseTo '{}' does not match any pending request",
-                        irt
-                    );
-                    return HttpResponse::BadRequest().body("InResponseTo does not match");
-                }
+        Some(irt) if !irt.is_empty() => match pending_request(&state.pending_requests, irt) {
+            Some(pending) => (Some(irt.to_string()), Some(pending.authn_context)),
+            None => {
+                log::warn!(
+                    "ACS: InResponseTo '{}' does not match any pending request",
+                    irt
+                );
+                return HttpResponse::BadRequest().body("InResponseTo does not match");
             }
-        }
+        },
         Some("") => {
             log::warn!("ACS: InResponseTo is empty");
             return HttpResponse::BadRequest().body("InResponseTo is empty");
@@ -1148,13 +1139,15 @@ async fn sp_acs(state: web::Data<AppState>, form: web::Form<AcsForm>) -> HttpRes
         return HttpResponse::Forbidden().body("Replay detected");
     }
 
-    // ── Step 9: Remove processed request ID ────────────────────────────
-    if let Some(ref req_id) = expected_request_id {
-        state
-            .pending_requests
-            .lock()
-            .unwrap()
-            .remove(req_id.as_str());
+    // Consume correlation only after every signature, issuer, assertion, and
+    // replay check succeeds. The final atomic removal also makes concurrent
+    // responses for one AuthnRequest race safely: exactly one can succeed.
+    let request_id = expected_request_id
+        .as_deref()
+        .expect("solicited SPID responses always establish InResponseTo above");
+    if take_pending_request(&state.pending_requests, request_id).is_none() {
+        log::warn!("ACS: pending AuthnRequest was already consumed or expired");
+        return HttpResponse::Forbidden().body("InResponseTo already consumed or expired");
     }
 
     // ── Step 10: Success response ──────────────────────────────────────
@@ -1344,6 +1337,76 @@ fn uuid_v4() -> String {
         ((ts >> 52) as u16 & 0x3fff) | 0x8000,
         ts as u64 & 0xffffffffffff
     )
+}
+
+/// Securely parse an untrusted SPID response into its owned protocol type.
+///
+/// This is the ACS XML choke point: DTDs, entities, comments, processing
+/// instructions, CDATA, and parser resource-limit violations are rejected
+/// before typed fields can be consumed.
+fn parse_spid_response(xml: &str) -> Result<Response, String> {
+    let doc = gamlastan::xml::parse_secure(xml).map_err(|e| format!("XML parse error: {e}"))?;
+    let response =
+        gamlastan::xml::parse_saml::<gamlastan::core::protocol::response::ResponseRef<'_>>(&doc)
+            .map_err(|e| format!("SAML parse error: {e}"))?;
+    Ok(response.to_owned())
+}
+
+/// Store an outstanding request after purging expired entries.
+///
+/// Returns `false` when accepting a new ID would exceed the hard capacity.
+fn store_pending_request(
+    pending: &std::sync::Mutex<PendingRequests>,
+    request_id: &str,
+    authn_context: &str,
+) -> bool {
+    let now = std::time::Instant::now();
+    let mut pending = pending.lock().unwrap();
+    pending.retain(|_, entry| now.duration_since(entry.created_at) < PENDING_REQUEST_TTL);
+    if !pending.contains_key(request_id) && pending.len() >= MAX_PENDING_REQUESTS {
+        return false;
+    }
+    pending.insert(
+        request_id.to_string(),
+        PendingRequest {
+            authn_context: authn_context.to_string(),
+            created_at: now,
+        },
+    );
+    true
+}
+
+/// Return a live pending request without consuming it.
+///
+/// Validation needs the requested authentication context before it is safe to
+/// consume correlation state. Expired records are purged under the same lock.
+fn pending_request(
+    pending: &std::sync::Mutex<PendingRequests>,
+    request_id: &str,
+) -> Option<PendingRequest> {
+    let now = std::time::Instant::now();
+    let mut pending = pending.lock().unwrap();
+    pending.retain(|_, entry| now.duration_since(entry.created_at) < PENDING_REQUEST_TTL);
+    pending.get(request_id).cloned()
+}
+
+/// Purge expired entries and atomically consume `request_id` if it remains.
+fn take_pending_request(
+    pending: &std::sync::Mutex<PendingRequests>,
+    request_id: &str,
+) -> Option<PendingRequest> {
+    let now = std::time::Instant::now();
+    let mut pending = pending.lock().unwrap();
+    pending.retain(|_, entry| now.duration_since(entry.created_at) < PENDING_REQUEST_TTL);
+    pending.remove(request_id)
+}
+
+/// Return at most `max_chars` Unicode scalar values without splitting UTF-8.
+fn truncate_chars(value: &str, max_chars: usize) -> &str {
+    value
+        .char_indices()
+        .nth(max_chars)
+        .map_or(value, |(index, _)| &value[..index])
 }
 
 fn pkcs11_signing_config() -> Option<Pkcs11SigningConfig> {
@@ -1614,6 +1677,35 @@ mod tests {
                 ..SecurityConfig::default()
             },
         }
+    }
+
+    /// Verifies diagnostic previews truncate only at UTF-8 character boundaries.
+    #[test]
+    fn utf8_preview_truncates_on_character_boundary() {
+        let value = "å".repeat(600);
+        let preview = truncate_chars(&value, 500);
+        assert_eq!(preview.chars().count(), 500);
+    }
+
+    /// Verifies lookup preserves correlation while final consumption is one-time.
+    #[test]
+    fn pending_requests_are_one_time() {
+        let pending = std::sync::Mutex::new(PendingRequests::new());
+        assert!(store_pending_request(&pending, "_request", SPID_L2));
+        assert!(pending_request(&pending, "_request").is_some());
+        assert!(pending_request(&pending, "_request").is_some());
+        assert!(take_pending_request(&pending, "_request").is_some());
+        assert!(take_pending_request(&pending, "_request").is_none());
+    }
+
+    /// Verifies the SPID ACS parser rejects DTDs and accepts ordinary responses.
+    #[test]
+    fn spid_response_parser_uses_secure_xml_policy() {
+        let xml = replay_test_response().to_xml_string().unwrap();
+        assert!(parse_spid_response(&xml).is_ok());
+
+        let with_doctype = format!("<!DOCTYPE samlp:Response [ ]>{xml}");
+        assert!(parse_spid_response(&with_doctype).is_err());
     }
 
     fn replay_test_response() -> Response {

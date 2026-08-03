@@ -42,8 +42,14 @@ pub struct SecurityConfig {
     /// Reject signatures containing ds:Object elements (E91: default true).
     pub reject_signatures_with_ds_object: bool,
 
-    /// Enforce persistent identifier uniqueness (E78: default true).
-    /// When true, persistent IDs must never be reassigned to different principals.
+    /// Enforce persistent identifier uniqueness (E78).
+    ///
+    /// This requires an application-supplied
+    /// [`PersistentIdStore`](crate::security::name_id::PersistentIdStore)
+    /// and an independent local principal through
+    /// [`AssertionValidator::with_persistent_id_store`](crate::security::AssertionValidator::with_persistent_id_store).
+    /// It defaults to false because an SP-side validator cannot infer the IdP's
+    /// local account identifier from the asserted NameID.
     pub enforce_persistent_id_uniqueness: bool,
 
     /// Sanitize RelayState for XSS/CSRF (E90: default true).
@@ -66,15 +72,15 @@ pub struct SecurityConfig {
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
-            clock_skew_seconds: 180,                // E92: 3 minutes
-            require_signed_assertions: true,        // secure default for POST
-            require_signed_responses: false,        // not always required
-            require_encrypted_assertions: false,    // not always required
-            max_assertion_age_seconds: 300,         // 5 minutes
-            reject_signatures_with_ds_object: true, // E91
-            enforce_persistent_id_uniqueness: true, // E78
-            sanitize_relay_state: true,             // E90
-            require_integrity_with_cbc: true,       // E93
+            clock_skew_seconds: 180,                 // E92: 3 minutes
+            require_signed_assertions: true,         // secure default for POST
+            require_signed_responses: false,         // not always required
+            require_encrypted_assertions: false,     // not always required
+            max_assertion_age_seconds: 300,          // 5 minutes
+            reject_signatures_with_ds_object: true,  // E91
+            enforce_persistent_id_uniqueness: false, // requires application principal context
+            sanitize_relay_state: true,              // E90
+            require_integrity_with_cbc: true,        // E93
             verify_destination: true,
             verify_recipient: true,
             check_client_address: false, // optional, off by default
@@ -110,7 +116,9 @@ impl SecurityConfig {
 
     /// Create a strict configuration for production use.
     ///
-    /// Enables all security checks including optional ones.
+    /// Enables all checks that can be enforced from SAML input alone. Persistent
+    /// identifier uniqueness still requires application principal context and
+    /// must be opted into with a store on the assertion validator.
     pub fn strict() -> Self {
         Self {
             clock_skew_seconds: 180, // E92: 3 minutes (tight)
@@ -119,7 +127,7 @@ impl SecurityConfig {
             require_encrypted_assertions: true,
             max_assertion_age_seconds: 180, // 3 minutes
             reject_signatures_with_ds_object: true,
-            enforce_persistent_id_uniqueness: true,
+            enforce_persistent_id_uniqueness: false,
             sanitize_relay_state: true,
             require_integrity_with_cbc: true,
             verify_destination: true,
@@ -142,7 +150,7 @@ mod tests {
         assert!(!config.require_encrypted_assertions);
         assert_eq!(config.max_assertion_age_seconds, 300);
         assert!(config.reject_signatures_with_ds_object);
-        assert!(config.enforce_persistent_id_uniqueness);
+        assert!(!config.enforce_persistent_id_uniqueness);
         assert!(config.sanitize_relay_state);
         assert!(config.require_integrity_with_cbc);
         assert!(config.verify_destination);

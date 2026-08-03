@@ -45,7 +45,7 @@
 //! # }
 //! ```
 //!
-//! [`MetadataCache`]: gamlastan::metadata::cache::MetadataCache
+//! [`MetadataCache`]: gamlastan::metadata::MetadataCache
 
 #![forbid(unsafe_code)]
 

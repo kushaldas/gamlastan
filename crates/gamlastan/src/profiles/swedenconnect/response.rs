@@ -1,7 +1,7 @@
 // SP-side Response processing (section 6).
 //
 // Validates a `<saml2p:Response>` per the profile's processing requirements,
-// layered on the 32-check `AssertionValidator`. The Sweden Connect specific
+// layered on the shared `AssertionValidator`. The Sweden Connect specific
 // additions over the base Web Browser SSO profile are:
 //
 // - unsolicited responses are rejected unless explicitly enabled (section 6.1),
@@ -217,6 +217,10 @@ fn decrypt_response_with_plaintexts(
         let enc_xml = std::str::from_utf8(&ea.raw)
             .map_err(|e| SwedenConnectError::Other(format!("non-UTF8 EncryptedAssertion: {e}")))?;
         let plaintext = decryptor.decrypt(enc_xml)?;
+        // Encryption hides inner SignatureMethod/DigestMethod declarations from
+        // the outer scan. Reject disallowed algorithms before parsing or
+        // returning decrypted claims, including through `decrypt_response`.
+        validate_response_algorithms(&plaintext)?;
         {
             let assertion_doc = crate::xml::parse_secure(&plaintext)
                 .map_err(|e| SwedenConnectError::Xml(crate::xml::XmlError::ParseError(e)))?;
@@ -342,7 +346,7 @@ pub fn process_response(
         return Err(SwedenConnectError::SignatureNotBoundToResponse);
     }
 
-    // Run the 32-check validator with the profile's security configuration,
+    // Run the shared validator with the profile's security configuration,
     // threading the externally-performed response signature verification.
     let security = cfg.security_config();
     let validator = AssertionValidator::new(&security).with_replay_cache(params.replay_cache);

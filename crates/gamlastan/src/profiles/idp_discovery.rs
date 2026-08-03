@@ -99,17 +99,48 @@ pub fn add_idp_to_cookie(
 /// Build the discovery service return URL.
 ///
 /// The discovery service redirects back to the SP with the selected IdP
-/// entity ID as a query parameter.
-pub fn build_return_url(sp_return_url: &str, idp_entity_id: &str, return_param: &str) -> String {
+/// entity ID as a query parameter. `return_param` must be an identifier-like
+/// ASCII name; it is never interpreted as arbitrary query syntax.
+///
+/// # Errors
+///
+/// Returns [`ProfileError::DiscoveryInvalidReturnParameter`] when
+/// `return_param` is empty, starts with an invalid character, or contains query
+/// delimiters or other characters outside the accepted grammar.
+pub fn build_return_url(
+    sp_return_url: &str,
+    idp_entity_id: &str,
+    return_param: &str,
+) -> Result<String, ProfileError> {
+    validate_return_parameter_name(return_param)?;
     let separator = if sp_return_url.contains('?') {
         "&"
     } else {
         "?"
     };
-    format!(
+    Ok(format!(
         "{sp_return_url}{separator}{return_param}={}",
         url_encode(idp_entity_id)
-    )
+    ))
+}
+
+/// Validate a discovery return parameter against the restricted ASCII grammar.
+///
+/// Names start with an ASCII letter or underscore and continue with ASCII
+/// alphanumerics, `_`, `-`, `.`, or `~`.
+fn validate_return_parameter_name(name: &str) -> Result<(), ProfileError> {
+    let mut chars = name.chars();
+    let first_ok = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+    let rest_ok = chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '~'));
+    if first_ok && rest_ok {
+        Ok(())
+    } else {
+        Err(ProfileError::DiscoveryInvalidReturnParameter(
+            name.to_string(),
+        ))
+    }
 }
 
 // ── Discovery Service protocol (sstc-saml-idp-discovery) ──────────────────
@@ -164,10 +195,13 @@ pub fn parse_discovery_service_request(
         }
     }
 
+    let return_id_param = return_id_param.unwrap_or_else(|| DEFAULT_RETURN_ID_PARAM.to_string());
+    validate_return_parameter_name(&return_id_param)?;
+
     Ok(DiscoveryServiceRequest {
         entity_id: entity_id.ok_or(ProfileError::DiscoveryMissingEntityId)?,
         return_url,
-        return_id_param: return_id_param.unwrap_or_else(|| DEFAULT_RETURN_ID_PARAM.to_string()),
+        return_id_param,
         policy,
         is_passive,
     })
@@ -327,7 +361,7 @@ pub fn create_discovery_service_response(
     };
 
     Ok(match selected_idp {
-        Some(idp) => build_return_url(&return_url, idp, &request.return_id_param),
+        Some(idp) => build_return_url(&return_url, idp, &request.return_id_param)?,
         None => return_url,
     })
 }
@@ -406,7 +440,8 @@ mod tests {
             "https://sp.example.com/ds",
             "https://idp.example.com",
             "entityID",
-        );
+        )
+        .unwrap();
         assert!(url.starts_with("https://sp.example.com/ds?entityID="));
         assert!(url.contains("https%3A%2F%2Fidp.example.com"));
     }
@@ -417,8 +452,23 @@ mod tests {
             "https://sp.example.com/ds?foo=bar",
             "https://idp.example.com",
             "entityID",
-        );
+        )
+        .unwrap();
         assert!(url.contains("&entityID="));
+    }
+
+    /// Verifies that a parameter name cannot inject an additional query pair.
+    #[test]
+    fn test_build_return_url_rejects_query_injection_parameter() {
+        let result = build_return_url(
+            "https://sp.example.com/ds",
+            "https://idp.example.com",
+            "entityID&admin=true",
+        );
+        assert!(matches!(
+            result,
+            Err(ProfileError::DiscoveryInvalidReturnParameter(_))
+        ));
     }
 
     // ── Discovery Service protocol tests ────────────────────────────────────

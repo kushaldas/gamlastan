@@ -120,20 +120,41 @@ impl AssertionStore for InMemoryAssertionStore {
     }
 }
 
-/// The AuthnStatements stored for a subject, optionally narrowed by
-/// session index and acceptable context class refs (pysaml2
-/// `get_authn_statements()`).
+/// Return the currently valid AuthnStatements stored for a subject.
+///
+/// Assertions without a bounded `Conditions::NotOnOrAfter` value, assertions
+/// outside their Conditions window, and expired sessions are omitted. Results
+/// can additionally be narrowed by session index and acceptable authentication
+/// context class references (pysaml2 `get_authn_statements()`).
 pub fn get_authn_statements(
     store: &dyn AssertionStore,
     name_id_value: &str,
     session_index: Option<&str>,
     requested_context_class_refs: &[String],
+    now: DateTime<Utc>,
 ) -> Vec<AuthnStatement> {
     store
         .assertions_for_subject(name_id_value)
         .into_iter()
+        .filter(|assertion| {
+            assertion.conditions.as_ref().is_some_and(|conditions| {
+                let started = conditions
+                    .not_before
+                    .is_none_or(|not_before| now >= not_before);
+                let unexpired = conditions
+                    .not_on_or_after
+                    .is_some_and(|not_on_or_after| now < not_on_or_after);
+                started && unexpired
+            })
+        })
         .flat_map(|a| a.authn_statements)
         .filter(|stmt| {
+            if stmt
+                .session_not_on_or_after
+                .is_some_and(|not_on_or_after| now >= not_on_or_after)
+            {
+                return false;
+            }
             if let Some(wanted) = session_index {
                 if stmt.session_index.as_deref() != Some(wanted) {
                     return false;
@@ -278,6 +299,7 @@ pub fn create_authn_query_response(
         &name_id.value,
         query.session_index.as_deref(),
         &class_refs,
+        now,
     );
 
     if statements.is_empty() {
@@ -334,7 +356,13 @@ mod tests {
                 name_id: Some(NameIdOrEncryptedId::NameId(name_id(subject))),
                 subject_confirmations: vec![],
             }),
-            conditions: None,
+            conditions: Some(crate::core::assertion::conditions::Conditions {
+                not_before: Some(Utc::now() - chrono::TimeDelta::minutes(1)),
+                not_on_or_after: Some(Utc::now() + chrono::TimeDelta::minutes(5)),
+                audience_restrictions: vec![],
+                one_time_use: false,
+                proxy_restriction: None,
+            }),
             advice: None,
             authn_statements: vec![AuthnStatement {
                 authn_instant: Utc::now(),
@@ -477,5 +505,30 @@ mod tests {
             .as_ref()
             .unwrap();
         assert_eq!(sub.value, constants::STATUS_NO_AUTHN_CONTEXT);
+    }
+
+    /// Verifies that an expired assertion cannot be reissued by AuthnQuery.
+    #[test]
+    fn test_authn_query_does_not_reissue_expired_statement() {
+        let store = InMemoryAssertionStore::new();
+        let mut expired = assertion(
+            "_expired",
+            "alice",
+            "_session",
+            constants::AUTHN_CONTEXT_PASSWORD,
+        );
+        expired.conditions.as_mut().unwrap().not_on_or_after =
+            Some(Utc::now() - chrono::TimeDelta::seconds(1));
+        store.store_assertion(expired);
+        let query = create_authn_query(
+            "https://sp.example.com",
+            &name_id("alice"),
+            None,
+            None,
+            None,
+        );
+        let response = create_authn_query_response(&store, &query, IDP, Utc::now());
+        assert!(!response.base.status.is_success());
+        assert!(response.assertions.is_empty());
     }
 }

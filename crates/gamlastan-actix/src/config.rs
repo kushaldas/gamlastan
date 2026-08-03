@@ -146,12 +146,39 @@ pub trait RequestIdTracker: Send + Sync {
     /// Check if a request ID was sent and consume it (one-time use).
     /// Returns true if the ID was found and removed.
     fn consume(&self, request_id: &str) -> bool;
+
+    /// Record `request_id` together with opaque state identifying its initiating
+    /// browser.
+    ///
+    /// Custom trackers must override [`consume_bound`](Self::consume_bound) to
+    /// enable the ready ACS flow; its default intentionally fails closed.
+    fn store_bound(&self, request_id: &str, _browser_state: &str) {
+        self.store(request_id);
+    }
+
+    /// Atomically consume `request_id` only when `browser_state` matches the
+    /// state supplied to [`store_bound`](Self::store_bound).
+    ///
+    /// Returns `false` for missing, expired, or mismatched entries. A mismatch
+    /// must not consume the entry, so the initiating browser can still use it.
+    fn consume_bound(&self, _request_id: &str, _browser_state: &str) -> bool {
+        false
+    }
+}
+
+#[derive(Debug)]
+/// One outstanding AuthnRequest and its optional initiating-browser binding.
+struct TrackedRequestId {
+    /// Monotonic insertion time used to enforce the configured TTL.
+    inserted: std::time::Instant,
+    /// Opaque browser state, or `None` for the legacy unbound API.
+    browser_state: Option<String>,
 }
 
 /// In-memory request ID tracker with automatic expiry.
 pub struct InMemoryRequestIdTracker {
     /// Map of request_id -> insertion time (for TTL)
-    ids: Mutex<HashMap<String, std::time::Instant>>,
+    ids: Mutex<HashMap<String, TrackedRequestId>>,
     /// TTL for stored request IDs (default: 5 minutes)
     ttl: std::time::Duration,
 }
@@ -185,16 +212,65 @@ impl RequestIdTracker for InMemoryRequestIdTracker {
         let mut ids = self.ids.lock().unwrap();
         // Purge expired entries while we're here
         let now = std::time::Instant::now();
-        ids.retain(|_, inserted| now.duration_since(*inserted) < self.ttl);
-        ids.insert(request_id.to_string(), now);
+        ids.retain(|_, entry| now.duration_since(entry.inserted) < self.ttl);
+        ids.insert(
+            request_id.to_string(),
+            TrackedRequestId {
+                inserted: now,
+                browser_state: None,
+            },
+        );
     }
 
     fn consume(&self, request_id: &str) -> bool {
         let mut ids = self.ids.lock().unwrap();
-        let Some(inserted) = ids.remove(request_id) else {
+        let Some(entry) = ids.get(request_id) else {
             return false;
         };
-        std::time::Instant::now().duration_since(inserted) < self.ttl
+        let expired = std::time::Instant::now().duration_since(entry.inserted) >= self.ttl;
+        if expired {
+            ids.remove(request_id);
+            return false;
+        }
+        if entry.browser_state.is_some() {
+            return false;
+        }
+        ids.remove(request_id);
+        true
+    }
+
+    /// Store a browser-bound request, replacing any entry with the same ID.
+    fn store_bound(&self, request_id: &str, browser_state: &str) {
+        let mut ids = self.ids.lock().unwrap();
+        let now = std::time::Instant::now();
+        ids.retain(|_, entry| now.duration_since(entry.inserted) < self.ttl);
+        ids.insert(
+            request_id.to_string(),
+            TrackedRequestId {
+                inserted: now,
+                browser_state: Some(browser_state.to_string()),
+            },
+        );
+    }
+
+    /// Consume a live request only when its stored browser state matches.
+    fn consume_bound(&self, request_id: &str, browser_state: &str) -> bool {
+        let mut ids = self.ids.lock().unwrap();
+        let Some(entry) = ids.get(request_id) else {
+            return false;
+        };
+        let expired = std::time::Instant::now().duration_since(entry.inserted) >= self.ttl;
+        if expired {
+            ids.remove(request_id);
+            return false;
+        }
+        if entry.browser_state.as_deref() != Some(browser_state) {
+            // Preserve the entry on mismatch: an attacker must not be able to
+            // invalidate the legitimate browser's outstanding request.
+            return false;
+        }
+        ids.remove(request_id);
+        true
     }
 }
 
@@ -661,6 +737,16 @@ mod tests {
     fn test_request_id_tracker_consume_unknown() {
         let tracker = InMemoryRequestIdTracker::new();
         assert!(!tracker.consume("_nonexistent"));
+    }
+
+    /// Verifies browser binding, mismatch preservation, and one-time use.
+    #[test]
+    fn test_request_id_tracker_is_browser_bound_and_one_time() {
+        let tracker = InMemoryRequestIdTracker::new();
+        tracker.store_bound("_req", "browser-a");
+        assert!(!tracker.consume_bound("_req", "browser-b"));
+        assert!(tracker.consume_bound("_req", "browser-a"));
+        assert!(!tracker.consume_bound("_req", "browser-a"));
     }
 
     #[test]

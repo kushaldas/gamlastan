@@ -10,6 +10,8 @@ The plan is to become Rust equivalent of
 not be 100% compatible, but will try to close the gap. We thank the amazing
 maintainers of the `pysaml2` project for maintaining the stack for the community.
 
+The workspace requires Rust 1.88 or later.
+
 ## Workspace Structure
 
 | Crate | Description |
@@ -27,7 +29,7 @@ The `gamlastan` crate contains the following modules:
 | `crypto` | Cryptographic operations (signing, verification) via [bergshamra](https://github.com/kushaldas/bergshamra) |
 | `metadata` | SAML metadata types, SPID extensions, caching, and validation |
 | `bindings` | HTTP Redirect, POST, Artifact, SOAP, PAOS bindings and RelayState handling |
-| `security` | 32-check assertion validator, replay cache, clock skew handling |
+| `security` | 35-check assertion validator, replay cache, clock skew handling |
 | `profiles` | Web Browser SSO (SP + IdP), SLO, ECP, artifact resolution, name ID management, Sweden Connect deployment profile |
 
 ## Deployment Profiles

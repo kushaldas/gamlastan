@@ -27,6 +27,14 @@ where needed to correct protocol handling.
 
 ### Changed
 
+- Raised the declared minimum supported Rust version from 1.75 to 1.88 to match
+  the resolved Actix, bergshamra, kryptering, and time dependency graph.
+- The example IdP now honors `IsPassive`, `ForceAuthn`, RequestedAuthnContext
+  comparison, and requested NameID format, returning signed SAML protocol errors
+  when a request cannot be satisfied. Reused sessions preserve their original
+  authentication context, instant, and session index.
+- The example IdP loads trusted SP metadata with `parse_secure_metadata`, so
+  legitimate federation comments remain compatible with the hardened parser.
 - Upgraded the XML-security/crypto stack: `bergshamra` 0.7.0 → 0.8.0 and the
   direct `kryptering` dependency 0.4 → 0.5, features still mirroring bergshamra
   (`legacy`, `post-quantum`, `pkcs11`) so the shared `Signer` / `Pkcs11Signer`
@@ -40,6 +48,12 @@ where needed to correct protocol handling.
 
 ### Security
 
+- SPID and example IdP pending authentication state is TTL-bounded, capacity-
+  bounded, and atomically consumed only after all terminal validation succeeds.
+- Actix SLO verifies every signature representation supplied with a message; a
+  valid Redirect signature can no longer mask an invalid enveloped XML-DSig.
+- The SPID ACS now parses network-supplied responses exclusively through the
+  secure XML boundary before typed deserialization.
 - `parse_secure` now rejects XML comments, processing instructions, and CDATA
   sections anywhere in a document. Comments and CDATA both split an element's
   text into multiple nodes while canonicalizing to the same signed bytes, so a

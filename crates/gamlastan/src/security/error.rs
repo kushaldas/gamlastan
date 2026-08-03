@@ -115,7 +115,10 @@ pub enum SecurityError {
 #[derive(Debug, Clone)]
 pub struct ValidationCheck {
     /// The check number. Checks 1-32 map to the Section 7.2 checklist; checks
-    /// 33-34 are additional response-envelope checks (status is Success, and at
+    /// 33-35 are additional checks (status is Success, at least one
+    /// plaintext/decrypted assertion is present, and assertion age is within
+    /// local policy). Checks 33-34 are response-envelope checks; check 35 is
+    /// applied per assertion. The response layer does not
     /// least one plaintext/decrypted `Assertion` present -- this layer does not
     /// count `EncryptedAssertion` elements, which must be decrypted first). All
     /// checks run and are recorded; a failure (including 33-34) marks the

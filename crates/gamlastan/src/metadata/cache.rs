@@ -119,6 +119,35 @@ impl MetadataCache {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// Store an entry while enforcing a hard `capacity` at time `now`.
+    ///
+    /// Expired entries are removed first; if the cache is still full, the entry
+    /// with the oldest fetch timestamp is evicted. Updating an existing entity
+    /// does not evict another entry. A zero capacity disables caching.
+    pub fn put_bounded(
+        &mut self,
+        entity_id: String,
+        metadata: CachedMetadata,
+        capacity: usize,
+        now: DateTime<Utc>,
+    ) {
+        self.purge_expired(now);
+        if capacity == 0 {
+            return;
+        }
+        if !self.entries.contains_key(&entity_id) && self.entries.len() >= capacity {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, cached)| cached.fetched_at)
+                .map(|(id, _)| id.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(entity_id, metadata);
+    }
 }
 
 impl MetadataStore for MetadataCache {
@@ -185,6 +214,29 @@ mod tests {
         assert!(cached.is_cache_stale(now));
         assert!(cached.is_valid(now));
         assert!(cached.should_refresh(now));
+    }
+
+    /// Verifies deterministic eviction of the oldest fetched cache entry.
+    #[test]
+    fn bounded_cache_evicts_oldest_entry() {
+        let first = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let second = Utc.with_ymd_and_hms(2025, 1, 1, 0, 1, 0).unwrap();
+        let mut cache = MetadataCache::new();
+        cache.put_bounded(
+            "first".into(),
+            CachedMetadata::new(dummy_entity("first"), first, None, None),
+            1,
+            first,
+        );
+        cache.put_bounded(
+            "second".into(),
+            CachedMetadata::new(dummy_entity("second"), second, None, None),
+            1,
+            second,
+        );
+        assert!(cache.get("first").is_none());
+        assert!(cache.get("second").is_some());
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]

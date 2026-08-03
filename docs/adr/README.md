@@ -46,3 +46,8 @@ rewriting history (mark the old one `Superseded by NNNN`).
 | [0035](0035-uppsala-0.9-bergshamra-0.7-hardening-controls.md) | Adopt uppsala 0.9 and bergshamra 0.7 hardening controls | Accepted |
 | [0036](0036-guarded-pysaml2-md5-eptid-compatibility.md) | Guarded PySAML2 MD5 EPTID compatibility | Accepted |
 | [0037](0037-direct-assertion-signature-policy.md) | Direct assertion-signature policy | Accepted |
+| [0038](0038-explicit-protocol-trust-and-freshness.md) | Explicit protocol trust and freshness | Accepted |
+| [0039](0039-signed-xml-has-one-security-interpretation.md) | Signed XML has one security interpretation | Accepted |
+| [0040](0040-ready-handlers-bind-browser-and-signing-state.md) | Ready handlers bind browser and signing state | Accepted |
+| [0041](0041-bound-untrusted-resource-state.md) | Bound untrusted resource state | Accepted |
+| [0042](0042-complete-inbound-protocol-validation.md) | Complete inbound protocol validation | Accepted |
