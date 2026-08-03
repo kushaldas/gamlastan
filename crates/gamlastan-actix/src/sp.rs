@@ -292,7 +292,9 @@ fn set_authn_state_cookie(response: &mut HttpResponse, state: &str) -> Result<()
 fn is_generated_browser_state(state: &str) -> bool {
     state.len() == 33
         && state.starts_with('_')
-        && state[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
+        && state[1..]
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 fn escape_html_text(value: &str) -> String {
