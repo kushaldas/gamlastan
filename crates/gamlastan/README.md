@@ -9,7 +9,7 @@ A comprehensive, pure-Rust SAML 2.0 library implementing the full specification 
 - **XML integration** -- Built on [uppsala](https://crates.io/crates/uppsala) for XML parsing and serialization
 - **Cryptographic operations** -- XML-DSig signing/verification, XML Encryption, via [bergshamra](https://crates.io/crates/bergshamra)
 - **All protocol bindings** -- HTTP Redirect, HTTP POST, HTTP Artifact, SOAP, PAOS, URI
-- **32-check assertion validator** -- Comprehensive security validation suite
+- **35-check assertion validator** -- Comprehensive security validation suite
 - **All SAML 2.0 profiles** -- Web Browser SSO (SP + IdP), Single Logout, ECP, Artifact Resolution, Name ID Management/Mapping, IdP Discovery, Assertion Query
 - **Attribute profiles** -- Basic, X.500/LDAP, UUID, DCE PAC
 - **SPID compliant** -- Passes 263/263 Italian SPID conformance checks
@@ -41,17 +41,23 @@ let response: Response = response_ref.to_owned();
 
 ## Usage
 
-Parse and validate a SAML Response:
+Securely parse a SAML Response (parsing alone does **not** authenticate it):
 
 ```rust
-use gamlastan::xml::uppsala;
-use gamlastan::xml::deserialize::parse_saml;
+use gamlastan::xml::{parse_saml, parse_secure};
 use gamlastan::core::protocol::response::ResponseRef;
 
-let doc = uppsala::parse(xml_str)?;
+let doc = parse_secure(xml_str)?;
 let response: ResponseRef<'_> = parse_saml(&doc)?;
-assert!(response.base.status.is_success());
+// `status`, Issuer, Destination, assertions, and attributes are still
+// untrusted here. Verify the XML signature against partner metadata and run
+// the SP response profile with a replay cache before consuming any claims.
 ```
+
+For a complete fail-closed path, use `gamlastan-actix`'s ready `/saml/acs`
+handler. It verifies signatures using IdP metadata, binds `InResponseTo` to the
+initiating browser, enforces destination/audience/time checks, and rejects
+assertion replay before returning attributes to the application callback.
 
 Build and serialize an AuthnRequest:
 

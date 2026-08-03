@@ -56,7 +56,7 @@ impl IdpSigningContext {
 
     /// Build an HSM / PKCS#11-backed signing context.
     ///
-    /// `signer` is any [`kryptering::Signer`] — typically a
+    /// `signer` is any [`gamlastan::crypto::kryptering::Signer`] — typically a
     /// `kryptering::pkcs11::Pkcs11Signer` bound to a private key on a token. The
     /// private key never leaves the token; signing happens on the HSM.
     ///
@@ -291,8 +291,18 @@ async fn idp_sso(
     // preserve the ProfileError mapping (HTTP 403) rather than turning a normal
     // rejection into an Internal 500 (which is misleading and noisy under
     // hostile traffic).
-    let processed = idp_profile::process_authn_request(&authn_request, Some(&sp_sso))
-        .map_err(SamlActixError::Profile)?;
+    let request_signature_verified = verify_authn_request_signature(
+        &msg,
+        &config,
+        &sp_sso,
+        xml_str,
+        &authn_request.base.id,
+        authn_request.base.has_signature,
+    )?;
+
+    let processed =
+        idp_profile::process_authn_request(&authn_request, &sp_sso, request_signature_verified)
+            .map_err(SamlActixError::Profile)?;
 
     // Call the authentication callback
     let callback = authn_callback.ok_or_else(|| {
@@ -345,6 +355,11 @@ async fn idp_sso(
             config.sign_assertions,
             config.sign_responses,
         )?
+    } else if config.sign_assertions || config.sign_responses {
+        return Err(SamlActixError::Configuration(
+            "IdP response/assertion signing is enabled but no IdpSigningContext is registered"
+                .into(),
+        ));
     } else {
         response_xml
     };
@@ -387,10 +402,6 @@ async fn idp_slo(
             >(&doc)?;
             let logout_req = req_ref.to_owned();
 
-            let now = Utc::now();
-            logout::validate_logout_request(&logout_req, now, config.security.clock_skew_seconds)
-                .map_err(|e| SamlActixError::Internal(format!("invalid LogoutRequest: {e}")))?;
-
             // Authorize the logout before mutating any session. SLO destroys
             // sessions keyed by the request-supplied NameID, so an unauthenticated
             // request lets anyone who guesses a NameID force-logout a victim
@@ -404,7 +415,22 @@ async fn idp_slo(
                 Some(id) => resolve_trusted_sp(&config, id).await,
                 None => None,
             };
-            authorize_slo_request(&config, &logout_req, xml_str, slo_sp.as_ref())?;
+            let slo_authorized =
+                authorize_slo_request(&config, &logout_req, xml_str, slo_sp.as_ref())?;
+            let now = Utc::now();
+            // `expected_issuer` is the request's own issuer: on the IdP side the
+            // real issuer trust decision is the metadata resolution and signature
+            // check that produced `slo_authorized`, so the equality check inside
+            // `validate_logout_request` is already established. The remaining
+            // value of the call is the NameID and NotOnOrAfter validation.
+            logout::validate_logout_request(
+                &logout_req,
+                slo_issuer.unwrap_or_default(),
+                slo_authorized.message_authenticated(),
+                now,
+                config.security.clock_skew_seconds,
+            )
+            .map_err(SamlActixError::Profile)?;
 
             // Propagate logout to session participants via the SessionStore
             if let Some(ref session_store) = config.session_store {
@@ -639,6 +665,63 @@ fn verify_sp_message_signature(
     }
 }
 
+/// Verify every signature representation present on an AuthnRequest and return
+/// whether the request was authenticated. The core profile uses this explicit
+/// proof to enforce `AuthnRequestsSigned` metadata without trusting signature
+/// markup alone.
+///
+/// Returns `true` when at least one signature representation is present and
+/// every representation present verifies against the SP metadata keys.
+///
+/// # Errors
+///
+/// Returns an error when signing keys are unavailable, a Redirect or XML
+/// signature is invalid, or signature verification cannot be completed.
+fn verify_authn_request_signature(
+    msg: &SamlMessage,
+    config: &IdpConfig,
+    sp: &gamlastan::metadata::types::sp::SpSsoDescriptor,
+    xml: &str,
+    request_id: &str,
+    has_xml_signature: bool,
+) -> Result<bool, SamlActixError> {
+    let mut verified = false;
+
+    if let Some(signature) = &msg.redirect_signature {
+        let verifier = config.verifier_for(sp).ok_or_else(|| {
+            SamlActixError::Profile(gamlastan::profiles::ProfileError::AssertionValidation(
+                "AuthnRequest issuer has no usable signing certificate in metadata".into(),
+            ))
+        })?;
+        let valid = verifier
+            .verify_redirect_query(
+                signature.signature_input.as_bytes(),
+                &signature.signature,
+                &signature.sig_alg,
+            )
+            .map_err(|e| {
+                SamlActixError::Profile(gamlastan::profiles::ProfileError::AssertionValidation(
+                    format!("AuthnRequest redirect signature verification failed: {e}"),
+                ))
+            })?;
+        if !valid {
+            return Err(SamlActixError::Profile(
+                gamlastan::profiles::ProfileError::AssertionValidation(
+                    "AuthnRequest redirect signature is invalid".into(),
+                ),
+            ));
+        }
+        verified = true;
+    }
+
+    if has_xml_signature {
+        verify_sp_message_signature(config, sp, xml, request_id, "AuthnRequest")?;
+        verified = true;
+    }
+
+    Ok(verified)
+}
+
 /// Resolve trusted SP metadata for `entity_id`: the static
 /// [`IdpConfig::trusted_sps`] registry first, then the optional
 /// [`TrustedSpResolver`](crate::TrustedSpResolver) (e.g. an MDQ client).
@@ -695,26 +778,29 @@ async fn resolve_trusted_sp(
 /// which case the request is accepted without a message signature.
 ///
 /// `sp` is the metadata resolved for `logout_req`'s issuer, or `None` if the
-/// issuer is unknown/untrusted. Returns `Ok(())` when the logout is authorized,
-/// otherwise a 403-mapped [`SamlActixError::Profile`] explaining the rejection
-/// (these are request authorization failures, not server faults).
+/// issuer is unknown/untrusted. Returns an [`SloAuthorization`] proof when the
+/// logout is authorized, otherwise a 403-mapped [`SamlActixError::Profile`]
+/// explaining the rejection (these are request authorization failures, not
+/// server faults).
 ///
 /// # Examples
 ///
 /// ```ignore
 /// // In the SLO handler, after structural validation and issuer resolution:
-/// authorize_slo_request(&config, &logout_req, xml_str, slo_sp.as_ref())?;
-/// // Safe to look up and destroy the principal's sessions now.
+/// let slo_authorized =
+///     authorize_slo_request(&config, &logout_req, xml_str, slo_sp.as_ref())?;
+/// // Safe to look up and destroy the principal's sessions now; thread
+/// // `slo_authorized.message_authenticated()` into `validate_logout_request`.
 /// ```
 fn authorize_slo_request(
     config: &IdpConfig,
     logout_req: &gamlastan::core::protocol::logout::LogoutRequest,
     xml_str: &str,
     sp: Option<&gamlastan::metadata::types::sp::SpSsoDescriptor>,
-) -> Result<(), SamlActixError> {
+) -> Result<SloAuthorization, SamlActixError> {
     // Transport-authenticated deployments opt out of message-signature checks.
     if config.allow_unauthenticated_backchannel {
-        return Ok(());
+        return Ok(SloAuthorization);
     }
 
     // The issuer must resolve to trusted SP metadata.
@@ -750,7 +836,31 @@ fn authorize_slo_request(
         }
     }
 
-    verify_sp_message_signature(config, sp, xml_str, &logout_req.id, "LogoutRequest")
+    verify_sp_message_signature(config, sp, xml_str, &logout_req.id, "LogoutRequest")?;
+    Ok(SloAuthorization)
+}
+
+/// Proof that [`authorize_slo_request`] authenticated a logout message.
+///
+/// The token is produced only by that function, so the authentication flag
+/// threaded into `logout::validate_logout_request` reflects work that actually
+/// ran — a refactor that removes or reorders the authorization step loses the
+/// token and fails to compile instead of silently passing a stale `true`.
+#[derive(Clone, Copy, Debug)]
+#[must_use = "thread this proof into logout validation"]
+struct SloAuthorization;
+
+impl SloAuthorization {
+    /// The message-authentication flag for `logout::validate_logout_request`.
+    ///
+    /// This token exists only after a bound message signature verified against
+    /// trusted SP metadata, or after the deployment's explicit
+    /// [`IdpConfig::allow_unauthenticated_backchannel`] transport policy
+    /// accepted the message; either satisfies the validation layer's
+    /// authentication requirement.
+    fn message_authenticated(self) -> bool {
+        true
+    }
 }
 
 /// Authorize an incoming `ArtifactResolve` before the referenced artifact is

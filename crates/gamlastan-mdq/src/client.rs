@@ -20,6 +20,8 @@ use crate::verify::{parse_verify_select, Resolved};
 
 /// Default cache lifetime used when a document carries no `cacheDuration`.
 const DEFAULT_TTL: Duration = Duration::from_secs(3600);
+/// Default maximum number of dynamically cached entities.
+const DEFAULT_CACHE_CAPACITY: usize = 1024;
 /// Initial backoff after a static-URL fetch failure.
 const RETRY_BASE: Duration = Duration::from_secs(5);
 /// Maximum backoff between static-URL retries.
@@ -129,6 +131,7 @@ pub struct MdqClient<F = ReqwestFetcher> {
     fallback_ttl: Duration,
     clock: Clock,
     cache: Arc<Mutex<MetadataCache>>,
+    max_cache_entries: usize,
     warned_unverified: Arc<AtomicBool>,
     static_state: Option<Arc<Mutex<StaticState>>>,
 }
@@ -180,6 +183,7 @@ impl<F: MetadataFetcher> MdqClient<F> {
             fallback_ttl: DEFAULT_TTL,
             clock: default_clock(),
             cache: Arc::new(Mutex::new(MetadataCache::new())),
+            max_cache_entries: DEFAULT_CACHE_CAPACITY,
             warned_unverified: Arc::new(AtomicBool::new(false)),
             static_state: None,
         }
@@ -229,6 +233,15 @@ impl<F: MetadataFetcher> MdqClient<F> {
     /// `cacheDuration` (default: 1 hour).
     pub fn with_fallback_ttl(mut self, ttl: Duration) -> Self {
         self.fallback_ttl = ttl;
+        self
+    }
+
+    /// Set the maximum number of dynamic metadata entries retained in memory.
+    ///
+    /// When insertion exceeds `capacity`, the least recently fetched entry is
+    /// evicted. A capacity of zero disables caching.
+    pub fn with_cache_capacity(mut self, capacity: usize) -> Self {
+        self.max_cache_entries = capacity;
         self
     }
 
@@ -380,7 +393,7 @@ impl<F: MetadataFetcher> MdqClient<F> {
         );
         {
             let mut cache = lock(&self.cache);
-            cache.put(entity_id.to_string(), cached);
+            cache.put_bounded(entity_id.to_string(), cached, self.max_cache_entries, now);
         }
         Ok(resolved.entity)
     }

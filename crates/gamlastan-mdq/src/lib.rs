@@ -31,6 +31,23 @@
 //! - Single `<EntityDescriptor>` and `<EntitiesDescriptor>` aggregate responses.
 //! - Pluggable transport via [`MetadataFetcher`] for deterministic testing.
 //!
+//! ## Resource limits
+//!
+//! The MDQ server is untrusted, so buffering is bounded by default:
+//!
+//! - [`ReqwestFetcher`] accepts at most **10 MiB per response body**
+//!   ([`fetch::MAX_BODY_BYTES`]) and buffers at most **8 bodies concurrently**
+//!   ([`fetch::MAX_CONCURRENT_FETCHES`]). These defaults are sized for
+//!   per-entity MDQ lookups; fetching a large federation *aggregate* (e.g.
+//!   eduGAIN, on the order of 100 MiB) requires a deliberate opt-in via
+//!   [`ReqwestFetcher::with_limits`] or
+//!   [`ReqwestFetcher::from_client_with_limits`].
+//! - Dynamically fetched metadata is cached with a **1024-entry bound** by
+//!   default ([`MdqClient::with_cache_capacity`]). Expired entries are purged
+//!   first; at capacity the entry with the oldest fetch time is evicted, so
+//!   attacker-chosen `entityID`s can thrash the cache but cannot grow memory
+//!   without bound. A capacity of zero disables caching.
+//!
 //! ```no_run
 //! use gamlastan_mdq::{MdqClient, MdqTransform, RequiredRole};
 //!
@@ -45,7 +62,7 @@
 //! # }
 //! ```
 //!
-//! [`MetadataCache`]: gamlastan::metadata::cache::MetadataCache
+//! [`MetadataCache`]: gamlastan::metadata::MetadataCache
 
 #![forbid(unsafe_code)]
 

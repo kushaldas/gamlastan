@@ -160,9 +160,11 @@ impl SecureParseConfig {
 /// Parse untrusted SAML XML with SAML-specific input hardening.
 ///
 /// This is the parse entry point for any attacker-controlled XML (inbound
-/// protocol messages, SOAP/PAOS envelopes, remote metadata, KeyInfo fragments,
-/// decrypted assertions). It is a drop-in replacement for [`uppsala::parse`]
-/// (same return type) and applies [`SecureParseConfig::default`]:
+/// protocol messages, SOAP/PAOS envelopes, and decrypted assertions). Metadata
+/// and metadata-derived KeyInfo fragments should use [`parse_secure_metadata`]
+/// so legitimate structural comments and processing instructions are accepted.
+/// This function is a drop-in replacement for [`uppsala::parse`] (same return
+/// type) and applies [`SecureParseConfig::default`]:
 ///
 /// 1. **uppsala resource limits** — element-nesting depth cap
 ///    ([`uppsala::parser::DEFAULT_MAX_DEPTH`], 128), entity-expansion byte
@@ -193,17 +195,50 @@ pub fn parse_secure(xml: &str) -> Result<Document<'_>, uppsala::XmlError> {
 /// invalidates the metadata signature; rejecting comment-bearing metadata would
 /// refuse validly-signed documents and break federation ingestion.
 ///
-/// Comments and PIs are therefore allowed here, but every other guard is
-/// retained: DTD/entity rejection (XXE), the resource caps, and **CDATA
-/// rejection** (the truncation vector) all still apply. Independently, the
-/// metadata readers concatenate the full text content
-/// ([`uppsala::Document::text_content_deep`]) rather than reading only the first
-/// text node, so an allowed comment cannot split a value the signature covers.
+/// Comments and PIs are therefore allowed between metadata elements, but every
+/// other guard is retained. A comment or PI that splits non-whitespace direct
+/// text inside one element is rejected because zero-copy metadata fields read a
+/// single text node and must not disagree with canonicalized signed content.
 pub fn parse_secure_metadata(xml: &str) -> Result<Document<'_>, uppsala::XmlError> {
     let config = SecureParseConfig::default()
         .with_forbid_comments(false)
         .with_forbid_pis(false);
-    parse_secure_with_config(xml, &config)
+    let doc = parse_secure_with_config(xml, &config)?;
+    reject_split_metadata_text(&doc)?;
+    Ok(doc)
+}
+
+/// Reject comments or processing instructions embedded between meaningful text
+/// nodes in the same metadata element.
+///
+/// Structural comments remain valid, while split value text is rejected to
+/// prevent consumers from observing only the first text node of signed data.
+fn reject_split_metadata_text(doc: &Document<'_>) -> Result<(), uppsala::XmlError> {
+    for parent in doc.descendants(doc.root()) {
+        let children = doc.children(parent);
+        for (index, child) in children.iter().enumerate() {
+            if !matches!(
+                doc.node_kind(*child),
+                Some(NodeKind::Comment(_) | NodeKind::ProcessingInstruction(_))
+            ) {
+                continue;
+            }
+            let meaningful_text = |id| match doc.node_kind(id) {
+                Some(NodeKind::Text(value) | NodeKind::CData(value)) => !value.trim().is_empty(),
+                _ => false,
+            };
+            if children[..index].iter().copied().any(meaningful_text)
+                && children[index + 1..].iter().copied().any(meaningful_text)
+            {
+                return Err(uppsala::XmlError::well_formedness(
+                    "metadata comment or processing instruction split element text",
+                    0,
+                    0,
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Parse XML with an explicit secure parse policy.
@@ -265,7 +300,7 @@ fn reject_forbidden_nodes(
 
 #[cfg(test)]
 mod parse_secure_tests {
-    use super::{parse_secure, parse_secure_with_config, SecureParseConfig};
+    use super::{parse_secure, parse_secure_metadata, parse_secure_with_config, SecureParseConfig};
 
     #[test]
     fn secure_config_defaults_to_saml_safe_policy() {
@@ -347,6 +382,15 @@ mod parse_secure_tests {
         // The XML declaration must not be mistaken for a processing instruction.
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?><samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_1"/>"#;
         assert!(parse_secure(xml).is_ok());
+    }
+
+    /// Verifies structural comments remain valid while split values are rejected.
+    #[test]
+    fn metadata_allows_structural_comments_but_rejects_split_text() {
+        assert!(parse_secure_metadata("<Entities><!-- provenance --><Entity/></Entities>").is_ok());
+        let xml = "<AdditionalMetadataLocation>https://safe.example/<!--x-->evil</AdditionalMetadataLocation>";
+        let err = parse_secure_metadata(xml).expect_err("split metadata text must be rejected");
+        assert!(err.to_string().contains("split element text"));
     }
 
     #[test]

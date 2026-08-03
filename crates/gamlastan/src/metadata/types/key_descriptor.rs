@@ -319,6 +319,7 @@ fn x509_certificates_der_from_fragment(key_info_xml: &str) -> Vec<Vec<u8>> {
             {
                 if !declares_foreign_namespace(cert_tag_body)
                     && !declares_foreign_namespace(data_tag_body)
+                    && !rebinds_expected_prefix(&key_info_xml[..tag_start], expected_prefix)
                 {
                     let b64: String = key_info_xml[start_tag_end + 1..content_end]
                         .split_whitespace()
@@ -336,6 +337,39 @@ fn x509_certificates_der_from_fragment(key_info_xml: &str) -> Vec<Vec<u8>> {
     }
 
     out
+}
+
+/// Reject a namespace rebinding on any intermediate start tag, not only on the
+/// X509Data and certificate tags themselves. Namespace declarations apply to
+/// descendants, so an attacker can otherwise rebind `ds` on a wrapper element.
+///
+/// Returns `true` on a conflicting declaration or malformed start tag so callers
+/// fail closed when the namespace context cannot be established safely.
+fn rebinds_expected_prefix(xml: &str, expected_prefix: &str) -> bool {
+    let expected_attribute = if expected_prefix.is_empty() {
+        "xmlns".to_string()
+    } else {
+        format!("xmlns:{}", expected_prefix.trim_end_matches(':'))
+    };
+    let mut cursor = 0;
+    while let Some(relative) = xml[cursor..].find('<') {
+        let start = cursor + relative;
+        let Some(end) = find_tag_end(xml, start + 1) else {
+            return true;
+        };
+        let body = xml[start + 1..end].trim_start();
+        if !body.starts_with('/')
+            && !body.starts_with('!')
+            && !body.starts_with('?')
+            && tag_attributes(body)
+                .into_iter()
+                .any(|(name, value)| name == expected_attribute && value != XMLDSIG_NS)
+        {
+            return true;
+        }
+        cursor = end + 1;
+    }
+    false
 }
 
 /// The prefix (with trailing colon, e.g. `"ds:"`, or `""` for the default
@@ -403,7 +437,7 @@ fn last_tag(haystack: &str, needle: &str) -> Option<usize> {
     while let Some(rel) = haystack[from..].find(needle) {
         let at = from + rel;
         let after = haystack[at + needle.len()..].chars().next();
-        if after.map_or(true, |c| c.is_whitespace() || c == '>' || c == '/') {
+        if after.is_none_or(|c| c.is_whitespace() || c == '>' || c == '/') {
             found = Some(at);
         }
         from = at + needle.len();
@@ -847,6 +881,18 @@ mod tests {
         );
         assert!(uppsala::parse(&kd.key_info_xml).is_err());
         assert_eq!(kd.x509_certificates_der(), vec![b"hello".to_vec()]);
+    }
+
+    /// Verifies that a wrapper cannot rebind the signature prefix for descendants.
+    #[test]
+    fn test_x509_certificates_der_rejects_intermediate_prefix_rebind() {
+        let kd = KeyDescriptor::signing(
+            "<ds:KeyInfo><wrapper xmlns:ds=\"urn:attacker\"><ds:X509Data>\
+             <ds:X509Certificate>aGVsbG8=</ds:X509Certificate></ds:X509Data>\
+             </wrapper></ds:KeyInfo>",
+        );
+        assert!(uppsala::parse(&kd.key_info_xml).is_err());
+        assert!(kd.x509_certificates_der().is_empty());
     }
 
     #[test]

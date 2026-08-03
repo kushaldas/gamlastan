@@ -69,12 +69,13 @@ pub struct ValidationParams<'a> {
     pub now: DateTime<Utc>,
 }
 
-/// The assertion validator implements the 32-check validation checklist
-/// (Section 7.2) plus two response-envelope checks (33-34).
+/// The assertion validator implements the original 32-check validation
+/// checklist, two response-envelope checks (33-34), and assertion age (35).
 pub struct AssertionValidator<'a> {
     config: &'a SecurityConfig,
     replay_cache: Option<&'a dyn ReplayCache>,
     persistent_id_store: Option<&'a dyn PersistentIdStore>,
+    persistent_id_principal: Option<&'a str>,
 }
 
 impl<'a> AssertionValidator<'a> {
@@ -84,6 +85,7 @@ impl<'a> AssertionValidator<'a> {
             config,
             replay_cache: None,
             persistent_id_store: None,
+            persistent_id_principal: None,
         }
     }
 
@@ -93,16 +95,25 @@ impl<'a> AssertionValidator<'a> {
         self
     }
 
-    /// Set the persistent ID store for E78 enforcement.
-    pub fn with_persistent_id_store(mut self, store: &'a dyn PersistentIdStore) -> Self {
+    /// Set the persistent ID store and independent application principal used
+    /// for E78 uniqueness enforcement.
+    ///
+    /// `principal` identifies the local account independently of the asserted
+    /// persistent NameID. This prevents a new NameID from defining its own
+    /// uniqueness lookup key.
+    pub fn with_persistent_id_store(
+        mut self,
+        store: &'a dyn PersistentIdStore,
+        principal: &'a str,
+    ) -> Self {
         self.persistent_id_store = Some(store);
+        self.persistent_id_principal = Some(principal);
         self
     }
 
     /// Validate a SAML Response and its contained assertions.
     ///
-    /// Runs all applicable checks from the 32-check validation checklist,
-    /// plus the response-envelope checks (33-34).
+    /// Runs all applicable checks from the validation checklist (1-35).
     /// Returns a `ValidationResult` containing all check outcomes.
     pub fn validate_response(
         &self,
@@ -375,6 +386,10 @@ impl<'a> AssertionValidator<'a> {
         // Check 8: Algorithm supported (E81)
         // This is informational - bergshamra handles actual algorithm support.
         result.add(ValidationCheck::pass(8, "Signature algorithm supported"));
+
+        // Check 35: the local assertion-age policy is independent of the
+        // issuer-selected Conditions window and must always be enforced.
+        result.add(self.check_assertion_age(assertion.issue_instant, params.now));
 
         // Checks 9-13: Conditions
         if let Some(ref conditions) = assertion.conditions {
@@ -712,10 +727,10 @@ impl<'a> AssertionValidator<'a> {
                 ));
             }
         } else {
-            // No replay cache configured - skip
-            result.add(ValidationCheck::pass(
+            result.add(ValidationCheck::fail(
                 20,
-                "Assertion ID not replayed (no cache)",
+                "Assertion ID not replayed",
+                "Replay protection is required but no replay cache is configured",
             ));
         }
     }
@@ -803,13 +818,13 @@ impl<'a> AssertionValidator<'a> {
                 match name_id {
                     crate::core::assertion::name_id::NameIdOrEncryptedId::NameId(nid) => {
                         if nid.format.as_deref() == Some(NAMEID_PERSISTENT) {
-                            if let Some(store) = self.persistent_id_store {
-                                // We need a principal identifier - use the NameID value itself
-                                // as a proxy (the real principal comes from the application)
+                            if let (Some(store), Some(principal)) =
+                                (self.persistent_id_store, self.persistent_id_principal)
+                            {
                                 match store.check_and_record(
                                     &nid.value,
                                     params.sp_entity_id,
-                                    &nid.value, // placeholder: real apps should map to internal principal
+                                    principal,
                                 ) {
                                     Ok(()) => {
                                         result
@@ -824,9 +839,10 @@ impl<'a> AssertionValidator<'a> {
                                     }
                                 }
                             } else {
-                                result.add(ValidationCheck::pass(
+                                result.add(ValidationCheck::fail(
                                     26,
-                                    "Persistent ID unique (no store)",
+                                    "Persistent ID unique",
+                                    "Persistent ID enforcement requires a store and an independent local principal",
                                 ));
                             }
                         } else {
@@ -904,10 +920,10 @@ impl<'a> AssertionValidator<'a> {
         now: DateTime<Utc>,
     ) -> ValidationCheck {
         if is_within_age_limit(now, issue_instant, self.config.max_assertion_age_seconds) {
-            ValidationCheck::pass(0, "Assertion age within limit")
+            ValidationCheck::pass(35, "Assertion age within limit")
         } else {
             ValidationCheck::fail(
-                0,
+                35,
                 "Assertion age within limit",
                 format!(
                     "Assertion issued at {} exceeds max age of {}s",
@@ -930,6 +946,7 @@ mod tests {
     use crate::core::identifiers::SamlVersion;
     use crate::core::protocol::response::{Response, ResponseBase};
     use crate::core::protocol::status::Status;
+    use crate::security::name_id::InMemoryPersistentIdStore;
     use crate::security::replay::InMemoryReplayCache;
     use chrono::TimeDelta;
 
@@ -1027,7 +1044,8 @@ mod tests {
             require_signed_assertions: false,
             ..SecurityConfig::default()
         };
-        let validator = AssertionValidator::new(&config);
+        let replay_cache = InMemoryReplayCache::new();
+        let validator = AssertionValidator::new(&config).with_replay_cache(&replay_cache);
         let response = make_valid_response(now);
         let params = make_params(now);
 
@@ -1067,7 +1085,8 @@ mod tests {
     fn test_required_assertion_signature_accepts_direct_verified_assertion_id() {
         let now = Utc::now();
         let config = SecurityConfig::default();
-        let validator = AssertionValidator::new(&config);
+        let replay_cache = InMemoryReplayCache::new();
+        let validator = AssertionValidator::new(&config).with_replay_cache(&replay_cache);
         let mut response = make_valid_response(now);
         response.assertions[0].has_signature = true;
         let assertion_id = response.assertions[0].id.as_str();
@@ -1509,7 +1528,8 @@ mod tests {
             require_signed_assertions: false,
             ..SecurityConfig::default()
         };
-        let validator = AssertionValidator::new(&config);
+        let replay_cache = InMemoryReplayCache::new();
+        let validator = AssertionValidator::new(&config).with_replay_cache(&replay_cache);
         let response = make_valid_response(now);
         let params = make_params(now);
 
@@ -1543,7 +1563,8 @@ mod tests {
             require_signed_assertions: false,
             ..SecurityConfig::default()
         };
-        let validator = AssertionValidator::new(&config);
+        let replay_cache = InMemoryReplayCache::new();
+        let validator = AssertionValidator::new(&config).with_replay_cache(&replay_cache);
         let mut response = make_valid_response(now);
         // Remove InResponseTo for unsolicited
         response.base.in_response_to = None;
@@ -1630,5 +1651,63 @@ mod tests {
 
         let old = now - TimeDelta::seconds(600);
         assert!(!validator.check_assertion_age(old, now).passed);
+    }
+
+    /// Verifies that response validation executes and reports assertion-age check 35.
+    #[test]
+    fn test_assertion_age_is_enforced_during_response_validation() {
+        let now = Utc::now();
+        let config = SecurityConfig {
+            require_signed_assertions: false,
+            max_assertion_age_seconds: 60,
+            ..SecurityConfig::default()
+        };
+        let replay_cache = InMemoryReplayCache::new();
+        let validator = AssertionValidator::new(&config).with_replay_cache(&replay_cache);
+        let mut response = make_valid_response(now);
+        response.assertions[0].issue_instant = now - TimeDelta::minutes(2);
+        let result = validator.validate_response(&response, &make_params(now));
+        assert!(result
+            .failures()
+            .iter()
+            .any(|check| check.check_number == 35));
+    }
+
+    /// Verifies persistent-ID uniqueness is keyed by an application principal.
+    #[test]
+    fn persistent_id_uses_independent_application_principal() {
+        let now = Utc::now();
+        let config = SecurityConfig {
+            require_signed_assertions: false,
+            enforce_persistent_id_uniqueness: true,
+            ..SecurityConfig::default()
+        };
+        let store = InMemoryPersistentIdStore::new();
+        store
+            .check_and_record("_persistent", "https://sp.example.com", "alice")
+            .unwrap();
+        let replay_cache = InMemoryReplayCache::new();
+        let validator = AssertionValidator::new(&config)
+            .with_replay_cache(&replay_cache)
+            .with_persistent_id_store(&store, "bob");
+        let mut response = make_valid_response(now);
+        let NameIdOrEncryptedId::NameId(name_id) = response.assertions[0]
+            .subject
+            .as_mut()
+            .unwrap()
+            .name_id
+            .as_mut()
+            .unwrap()
+        else {
+            panic!("expected cleartext NameID")
+        };
+        name_id.value = "_persistent".into();
+        name_id.format = Some(NAMEID_PERSISTENT.into());
+
+        let result = validator.validate_response(&response, &make_params(now));
+        assert!(result
+            .failures()
+            .iter()
+            .any(|check| check.check_number == 26));
     }
 }

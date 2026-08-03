@@ -33,6 +33,8 @@ use crate::error::SamlActixError;
 use crate::extractors::SamlMessage;
 use crate::responders::MetadataXml;
 
+const AUTHN_STATE_COOKIE: &str = "__Host-gamlastan_authn_state";
+
 /// SP signing context for signing AuthnRequests in HTTP-Redirect binding.
 ///
 /// Register as `web::Data<Arc<SpSigningContext>>`. If present, the SP login
@@ -140,8 +142,14 @@ async fn sp_login(
         .to_xml_string()
         .map_err(|e| SamlActixError::Internal(format!("failed to serialize AuthnRequest: {e}")))?;
 
-    // Track the request ID for InResponseTo verification
-    config.request_id_tracker.store(&authn_request.base.id);
+    let browser_state = req
+        .cookie(AUTHN_STATE_COOKIE)
+        .map(|cookie| cookie.value().to_string())
+        .filter(|state| is_generated_browser_state(state))
+        .unwrap_or_else(|| gamlastan::core::identifiers::SamlId::generate().to_string());
+    config
+        .request_id_tracker
+        .store_bound(&authn_request.base.id, &browser_state);
 
     // Encode and send via the appropriate binding
     let relay_state = relay_state_value
@@ -155,7 +163,9 @@ async fn sp_login(
             &sso_endpoint.location,
             relay_state.as_ref(),
         );
-        Ok(crate::response_adapter::post_binding_response(&html))
+        let mut response = crate::response_adapter::post_binding_response(&html);
+        set_authn_state_cookie(&mut response, &browser_state)?;
+        Ok(response)
     } else {
         let signer_pair = signing_ctx
             .as_ref()
@@ -169,9 +179,9 @@ async fn sp_login(
         })
         .map_err(|e| SamlActixError::Internal(format!("redirect encode failed: {e}")))?;
 
-        Ok(crate::response_adapter::redirect_binding_response(
-            &redirect_url,
-        ))
+        let mut response = crate::response_adapter::redirect_binding_response(&redirect_url);
+        set_authn_state_cookie(&mut response, &browser_state)?;
+        Ok(response)
     }
 }
 
@@ -205,12 +215,20 @@ async fn sp_acs(
     // Get the IdP entity ID from metadata
     let expected_idp_entity_id = &config.idp_metadata.entity_id;
 
-    // Look up InResponseTo from the response to verify against tracked request IDs
+    // Correlate InResponseTo to both an issued ID and the browser that initiated
+    // it. A process-global outstanding ID is not sufficient browser state.
+    let browser_state = req
+        .cookie(AUTHN_STATE_COOKIE)
+        .map(|cookie| cookie.value().to_string());
     let expected_request_id = response
         .base
         .in_response_to
         .as_deref()
-        .filter(|id| config.request_id_tracker.consume(id))
+        .filter(|id| {
+            browser_state
+                .as_deref()
+                .is_some_and(|state| config.request_id_tracker.consume_bound(id, state))
+        })
         .map(|id| id.to_string());
 
     // Validate the Response
@@ -218,7 +236,7 @@ async fn sp_acs(
     let authn_result = sp_profile::process_response_with_verified_signatures(
         &response,
         &config.security,
-        Some(config.replay_cache.as_ref()),
+        config.replay_cache.as_ref(),
         &config.entity_id,
         &config.acs_url,
         expected_request_id.as_deref(),
@@ -246,6 +264,37 @@ async fn sp_acs(
     Ok(HttpResponse::Ok()
         .content_type("text/html; charset=utf-8")
         .body(body))
+}
+
+/// Attach the short-lived, host-only browser-binding cookie to an AuthnRequest
+/// response.
+///
+/// # Errors
+///
+/// Returns [`SamlActixError`] if Actix rejects the cookie header.
+fn set_authn_state_cookie(response: &mut HttpResponse, state: &str) -> Result<(), SamlActixError> {
+    // The `__Host-` prefix is honored only with Secure, Path=/, and no Domain.
+    // Keep the lifetime aligned with the default request-tracker TTL.
+    let cookie = actix_web::cookie::Cookie::build(AUTHN_STATE_COOKIE, state.to_string())
+        .path("/")
+        .secure(true)
+        .http_only(true)
+        .same_site(actix_web::cookie::SameSite::None)
+        .max_age(actix_web::cookie::time::Duration::seconds(300))
+        .finish();
+    response
+        .add_cookie(&cookie)
+        .map_err(|e| SamlActixError::Internal(format!("failed to set SAML state cookie: {e}")))
+}
+
+/// Return whether `state` has the exact shape generated for browser binding:
+/// an underscore followed by 128 bits encoded as lowercase hexadecimal.
+fn is_generated_browser_state(state: &str) -> bool {
+    state.len() == 33
+        && state.starts_with('_')
+        && state[1..]
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 fn escape_html_text(value: &str) -> String {
@@ -417,8 +466,9 @@ fn trusted_idp_verifier(config: &SpConfig) -> Result<SamlVerifier, SamlActixErro
 ///
 /// SLO can arrive through HTTP Redirect, where the signature covers the query
 /// string, or through POST/SOAP-style XML with an enveloped XML-DSig signature.
-/// This helper accepts either form but never accepts unsigned SLO messages in
-/// the ready-to-use SP handler.
+/// This helper accepts either form but verifies every signature representation
+/// that is present. A valid Redirect signature therefore cannot mask an invalid
+/// XML signature on the same message.
 fn verify_slo_message_signature(
     msg: &SamlMessage,
     xml: &str,
@@ -426,13 +476,16 @@ fn verify_slo_message_signature(
     has_xml_signature: bool,
     config: &SpConfig,
 ) -> Result<(), SamlActixError> {
-    let verifier = if msg.redirect_signature.is_some() || has_xml_signature {
-        Some(trusted_idp_verifier(config)?)
-    } else {
-        None
-    };
+    if msg.redirect_signature.is_none() && !has_xml_signature {
+        return Err(SamlActixError::Profile(
+            gamlastan::profiles::ProfileError::AssertionValidation(
+                "SLO message must be signed".into(),
+            ),
+        ));
+    }
+    let verifier = trusted_idp_verifier(config)?;
 
-    if let (Some(sig), Some(verifier)) = (&msg.redirect_signature, verifier.as_ref()) {
+    if let Some(sig) = &msg.redirect_signature {
         let valid = verifier
             .verify_redirect_query(sig.signature_input.as_bytes(), &sig.signature, &sig.sig_alg)
             .map_err(|e| {
@@ -440,32 +493,22 @@ fn verify_slo_message_signature(
                     format!("SLO redirect signature verification failed: {e}"),
                 ))
             })?;
-        if valid {
-            return Ok(());
+        if !valid {
+            return Err(SamlActixError::Profile(
+                gamlastan::profiles::ProfileError::AssertionValidation(
+                    "SLO redirect signature verification failed".into(),
+                ),
+            ));
         }
-        return Err(SamlActixError::Profile(
-            gamlastan::profiles::ProfileError::AssertionValidation(
-                "SLO redirect signature verification failed".into(),
-            ),
-        ));
     }
 
     if !has_xml_signature {
-        return Err(SamlActixError::Profile(
-            gamlastan::profiles::ProfileError::AssertionValidation(
-                "SLO message must be signed".into(),
-            ),
-        ));
+        return Ok(());
     }
 
     // For XML signatures, require the verified same-document reference to name
     // the LogoutRequest/LogoutResponse ID parsed above. That keeps signature
     // verification bound to the object used for logout decisions.
-    let verifier = verifier.as_ref().ok_or_else(|| {
-        SamlActixError::Profile(gamlastan::profiles::ProfileError::AssertionValidation(
-            "SLO message must be signed".into(),
-        ))
-    })?;
     let verify_result = verifier.verify_enveloped(xml).map_err(|e| {
         SamlActixError::Profile(gamlastan::profiles::ProfileError::AssertionValidation(
             format!("SLO XML signature verification failed: {e}"),
@@ -685,8 +728,14 @@ async fn sp_slo(
                 &config,
             )?;
             validate_slo_logout_request(&logout_req, &config)?;
-            logout::validate_logout_request(&logout_req, now, config.security.clock_skew_seconds)
-                .map_err(|e| SamlActixError::Internal(format!("invalid LogoutRequest: {e}")))?;
+            logout::validate_logout_request(
+                &logout_req,
+                &config.idp_metadata.entity_id,
+                true,
+                now,
+                config.security.clock_skew_seconds,
+            )
+            .map_err(SamlActixError::Profile)?;
 
             // Create success response
             let in_response_to = &logout_req.id;
@@ -837,7 +886,7 @@ fn extract_query_param(query: &str, name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extractors::SamlBinding;
+    use crate::extractors::{RedirectSignatureData, SamlBinding};
     use base64::Engine;
     use chrono::TimeDelta;
     use gamlastan::core::assertion::authn::{AuthnContext, AuthnStatement};
@@ -860,6 +909,7 @@ mod tests {
     use gamlastan::metadata::types::role_descriptor::{RoleDescriptorBase, SsoDescriptorBase};
     use gamlastan::profiles::sso::sp as core_sp_profile;
     use gamlastan::security::config::SecurityConfig;
+    use gamlastan::security::replay::InMemoryReplayCache;
     use gamlastan::xml::deserialize::parse_saml;
 
     const SIGN_CERT_PEM: &str = include_str!("../../gamlastan-mdq/tests/fixtures/sign-cert.pem");
@@ -872,6 +922,18 @@ mod tests {
             escape_html_text(r#"<script>alert('xss')</script>&"name""#),
             "&lt;script&gt;alert(&#x27;xss&#x27;)&lt;/script&gt;&amp;&quot;name&quot;"
         );
+    }
+
+    /// Verifies that only the generated nonce shape is accepted as state.
+    #[test]
+    fn browser_state_accepts_only_generated_nonce_shape() {
+        assert!(is_generated_browser_state(
+            "_0123456789abcdef0123456789abcdef"
+        ));
+        assert!(!is_generated_browser_state("shared"));
+        assert!(!is_generated_browser_state(
+            "_0123456789abcdef0123456789abcdeg"
+        ));
     }
 
     fn test_sp_config() -> SpConfig {
@@ -1170,11 +1232,12 @@ mod tests {
             verify_acs_response_signatures(&signed_xml, &parsed_response, &config).unwrap();
         assert_eq!(verified_ids, vec!["_response".to_string()]);
         let verified_id_refs: Vec<&str> = verified_ids.iter().map(String::as_str).collect();
+        let replay_cache = InMemoryReplayCache::new();
 
         let result = core_sp_profile::process_response_with_verified_signatures(
             &parsed_response,
             &SecurityConfig::default(),
-            None,
+            &replay_cache,
             "https://sp.example.com",
             "https://sp.example.com/acs",
             None,
@@ -1214,11 +1277,12 @@ mod tests {
             verify_acs_response_signatures(&signed_xml, &parsed_response, &config).unwrap();
         assert_eq!(verified_ids, vec!["_signed_assertion".to_string()]);
         let verified_id_refs: Vec<&str> = verified_ids.iter().map(String::as_str).collect();
+        let replay_cache = InMemoryReplayCache::new();
 
         let result = core_sp_profile::process_response_with_verified_signatures(
             &parsed_response,
             &SecurityConfig::default(),
-            None,
+            &replay_cache,
             "https://sp.example.com",
             "https://sp.example.com/acs",
             None,
@@ -1301,10 +1365,11 @@ mod tests {
         );
 
         let verified_id_refs: Vec<&str> = verified_ids.iter().map(String::as_str).collect();
+        let replay_cache = InMemoryReplayCache::new();
         let result = core_sp_profile::process_response_with_verified_signatures(
             &parsed_response,
             &SecurityConfig::default(),
-            None,
+            &replay_cache,
             "https://sp.example.com",
             "https://sp.example.com/acs",
             None,
@@ -1359,6 +1424,60 @@ mod tests {
             verify_slo_message_signature(&msg, "<samlp:LogoutRequest/>", "_id", false, &config)
                 .unwrap_err();
         assert!(err.to_string().contains("SLO message must be signed"));
+    }
+
+    /// A valid detached Redirect signature is sufficient when XML-DSig is absent.
+    #[test]
+    fn slo_valid_redirect_signature_is_accepted() {
+        let sig_alg = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
+        let signature_input = format!("SAMLRequest=encoded&SigAlg={sig_alg}");
+        let signature = test_signer()
+            .sign_redirect_query(signature_input.as_bytes(), sig_alg)
+            .unwrap();
+        let msg = SamlMessage {
+            saml_xml: b"<samlp:LogoutRequest/>".to_vec(),
+            relay_state: None,
+            is_request: true,
+            binding: SamlBinding::HttpRedirect,
+            redirect_signature: Some(RedirectSignatureData {
+                sig_alg: sig_alg.to_string(),
+                signature,
+                signature_input,
+            }),
+        };
+        let config = test_sp_config_with_signing_cert(&cert_b64(SIGN_CERT_PEM));
+
+        verify_slo_message_signature(&msg, "<samlp:LogoutRequest/>", "_id", false, &config)
+            .expect("valid Redirect signature should authenticate the SLO message");
+    }
+
+    /// An invalid XML signature cannot be hidden by a valid Redirect signature.
+    #[test]
+    fn slo_valid_redirect_with_invalid_xml_signature_is_rejected() {
+        let sig_alg = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
+        let signature_input = format!("SAMLRequest=encoded&SigAlg={sig_alg}");
+        let signature = test_signer()
+            .sign_redirect_query(signature_input.as_bytes(), sig_alg)
+            .unwrap();
+        let xml = r#"<samlp:LogoutRequest xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" ID="_id" Version="2.0" IssueInstant="2026-08-03T00:00:00Z"><ds:Signature/></samlp:LogoutRequest>"#;
+        let msg = SamlMessage {
+            saml_xml: xml.as_bytes().to_vec(),
+            relay_state: None,
+            is_request: true,
+            binding: SamlBinding::HttpRedirect,
+            redirect_signature: Some(RedirectSignatureData {
+                sig_alg: sig_alg.to_string(),
+                signature,
+                signature_input,
+            }),
+        };
+        let config = test_sp_config_with_signing_cert(&cert_b64(SIGN_CERT_PEM));
+
+        let err = verify_slo_message_signature(&msg, xml, "_id", true, &config)
+            .expect_err("every signature representation must verify");
+        assert!(err
+            .to_string()
+            .contains("SLO XML signature verification failed"));
     }
 
     #[test]

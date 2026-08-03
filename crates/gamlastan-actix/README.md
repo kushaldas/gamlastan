@@ -44,31 +44,50 @@ async fn main() -> std::io::Result<()> {
 }
 ```
 
+> **HTTPS is required for solicited logins.** The ready SP binds every
+> AuthnRequest to the initiating browser with a `Secure`, `HttpOnly`
+> `__Host-gamlastan_authn_state` cookie (five-minute lifetime, matching the
+> request-tracker TTL). Browsers only store `Secure` cookies over HTTPS, so an
+> SP served over plain HTTP — including local development — never receives the
+> cookie back and every solicited response is rejected at the ACS with
+> "InResponseTo does not match". Terminate TLS in front of the SP (or serve
+> HTTPS directly) in every environment. IdP-initiated (unsolicited) responses
+> are unaffected.
+
 ## IdP Quick Start
 
 ```rust,no_run
 use std::sync::Arc;
 use actix_web::{web, App, HttpServer};
-use gamlastan_actix::{IdpConfig, IdpSigningContext, idp::configure_idp};
+use gamlastan_actix::{AuthnCallback, IdpConfig, IdpSigningContext, idp::configure_idp};
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    // Parse and validate the SP's metadata before registering its SSO role.
+    let trusted_sp = todo!("load trusted SP metadata");
     let config = IdpConfig::new(
         "https://idp.example.com",       // IdP entity ID
         "https://idp.example.com/sso",   // SSO URL
     )
-    .with_signing_cert("base64-encoded-DER-cert");
+    .with_signing_cert("base64-encoded-DER-cert")
+    .with_trusted_sp("https://sp.example.com", trusted_sp);
 
     // Set up signing context with your private key
     let signing_ctx: Arc<IdpSigningContext> = todo!("load signing key");
+    // Authenticate the request and return the subject, attributes, and session data.
+    let authn_callback: AuthnCallback = Box::new(|processed, request| {
+        todo!("authenticate the user for {processed:?} and {request:?}")
+    });
 
     let config = web::Data::new(config);
     let signing = web::Data::new(signing_ctx);
+    let authn_callback = web::Data::new(authn_callback);
 
     HttpServer::new(move || {
         App::new()
             .app_data(config.clone())
             .app_data(signing.clone())
+            .app_data(authn_callback.clone())
             .configure(configure_idp)
     })
     .bind("0.0.0.0:9443")?

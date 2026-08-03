@@ -7,11 +7,10 @@ ignore = [
     # side-channels in the `rsa` crate. No fixed upstream version exists (the
     # RustCrypto `rsa` crate has no constant-time PKCS#1 v1.5 decryption yet).
     #
-    # Reaches us transitively via bergshamra-crypto -> rsa, where it backs SAML
-    # XML-DSig RSA signature verification. We cannot drop RSA without breaking
-    # SAML conformance, and the attack requires an online decryption oracle with
-    # precise timing measurements against RSA *decryption/PKCS#1 v1.5* — not the
-    # signature-verification paths this library exercises.
+    # Reaches us transitively through the bergshamra key stack. SamlDecryptor
+    # rejects the vulnerable rsa-1_5 XML Encryption key-transport algorithm
+    # before entering bergshamra/rsa; supported RSA-OAEP decryption and RSA
+    # signature operations do not use PKCS#1 v1.5 decryption padding.
     #
     # Re-evaluate whenever a fixed `rsa` release lands.
     "RUSTSEC-2023-0071",

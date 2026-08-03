@@ -21,8 +21,11 @@ pub enum ProfileError {
     #[error("no ACS endpoint found for SP with binding: {0}")]
     NoAcsEndpoint(String),
 
-    #[error("ACS URL in AuthnRequest does not match any SP endpoint")]
+    #[error("ACS URL and binding in AuthnRequest do not match the same SP metadata endpoint")]
     AcsUrlMismatch,
+
+    #[error("AuthnRequest signature is required but was not verified")]
+    AuthnRequestSignatureRequired,
 
     #[error("response status indicates failure: {0}")]
     ResponseFailure(String),
@@ -118,6 +121,9 @@ pub enum ProfileError {
 
     #[error("discovery service request missing entityID parameter")]
     DiscoveryMissingEntityId,
+
+    #[error("invalid discovery return parameter name: {0}")]
+    DiscoveryInvalidReturnParameter(String),
 
     #[error("discovery service return URL is not registered in SP metadata: {0}")]
     DiscoveryReturnUrlNotRegistered(String),

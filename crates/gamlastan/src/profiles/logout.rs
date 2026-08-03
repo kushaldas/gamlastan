@@ -330,12 +330,25 @@ impl SpLogoutOrchestrator {
     /// Correlate a LogoutResponse with its in-progress request and record
     /// the outcome.
     ///
-    /// The response is matched by InResponseTo; if an Issuer is present it
-    /// must match the target's entity ID. Returns the per-entity outcome.
+    /// `signature_verified` must represent cryptographic verification performed
+    /// by the binding layer. The response is matched by `InResponseTo`, and its
+    /// required Issuer must match the target's entity ID. Returns the per-entity
+    /// outcome and consumes the target's in-progress state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unverified response, missing or unknown
+    /// correlation ID, missing Issuer, or an Issuer mismatch.
     pub fn handle_response(
         &mut self,
         response: &LogoutResponse,
+        signature_verified: bool,
     ) -> Result<LogoutResponseOutcome, ProfileError> {
+        if !signature_verified {
+            return Err(ProfileError::Other(
+                "LogoutResponse signature was not verified".to_string(),
+            ));
+        }
         let in_response_to = response
             .in_response_to
             .as_deref()
@@ -463,13 +476,36 @@ pub fn find_slo_endpoint<'a>(
 ///
 /// Checks:
 /// - NameID is present
-/// - Issuer is present
+/// - Issuer exactly matches `expected_issuer`
+/// - `signature_verified` proves cryptographic verification by the binding layer
 /// - NotOnOrAfter is not expired (if present)
+///
+/// # Errors
+///
+/// Returns an error when any required identity, signature, or time check fails.
 pub fn validate_logout_request(
     request: &LogoutRequest,
+    expected_issuer: &str,
+    signature_verified: bool,
     now: DateTime<Utc>,
     clock_skew_seconds: u64,
 ) -> Result<(), ProfileError> {
+    if !signature_verified {
+        return Err(ProfileError::Other(
+            "LogoutRequest signature was not verified".to_string(),
+        ));
+    }
+
+    let issuer = request
+        .issuer
+        .as_ref()
+        .ok_or_else(|| ProfileError::Other("LogoutRequest has no Issuer".to_string()))?;
+    if issuer.value != expected_issuer {
+        return Err(ProfileError::Other(format!(
+            "LogoutRequest issuer {} does not match expected issuer {expected_issuer}",
+            issuer.value
+        )));
+    }
     // NameID must be present (it's required in the type, but check for encrypted)
     match &request.name_id {
         NameIdOrEncryptedId::NameId(nid) if nid.value.is_empty() => {
@@ -583,7 +619,9 @@ mod tests {
             not_on_or_after: None,
         };
         let req = create_sp_logout_request(&options).unwrap();
-        assert!(validate_logout_request(&req, Utc::now(), 180).is_ok());
+        assert!(
+            validate_logout_request(&req, "https://sp.example.com", true, Utc::now(), 180,).is_ok()
+        );
     }
 
     #[test]
@@ -597,7 +635,7 @@ mod tests {
             not_on_or_after: Some(Utc::now() - TimeDelta::minutes(10)),
         };
         let req = create_sp_logout_request(&options).unwrap();
-        let result = validate_logout_request(&req, Utc::now(), 180);
+        let result = validate_logout_request(&req, "https://sp.example.com", true, Utc::now(), 180);
         assert!(result.is_err());
     }
 
@@ -649,7 +687,7 @@ mod tests {
                 &pending.request.id,
                 Some("https://sp.example.com/slo"),
             );
-            let outcome = orch.handle_response(&response).unwrap();
+            let outcome = orch.handle_response(&response, true).unwrap();
             assert!(outcome.success);
             assert!(!outcome.partial);
         }
@@ -668,7 +706,7 @@ mod tests {
         let pending = orch.next_request().unwrap().unwrap();
         let response =
             create_logout_response_partial("https://idp1.example.com", &pending.request.id, None);
-        let outcome = orch.handle_response(&response).unwrap();
+        let outcome = orch.handle_response(&response, true).unwrap();
         assert!(outcome.success);
         assert!(outcome.partial);
         assert!(orch.is_complete());
@@ -706,7 +744,7 @@ mod tests {
                 status_detail: None,
             },
         );
-        let outcome = orch.handle_response(&response).unwrap();
+        let outcome = orch.handle_response(&response, true).unwrap();
         assert!(!outcome.success);
 
         // Second target: transport failure
@@ -730,7 +768,18 @@ mod tests {
         let _ = orch.next_request().unwrap().unwrap();
 
         let response = create_logout_response_success("https://idp1.example.com", "_unknown", None);
-        assert!(orch.handle_response(&response).is_err());
+        assert!(orch.handle_response(&response, true).is_err());
+    }
+
+    /// Verifies that correlation alone cannot authenticate a LogoutResponse.
+    #[test]
+    fn test_orchestrator_rejects_unverified_response() {
+        let mut orch = SpLogoutOrchestrator::new("https://sp.example.com");
+        orch.add_target(make_target("https://idp1.example.com"));
+        let pending = orch.next_request().unwrap().unwrap();
+        let response =
+            create_logout_response_success("https://idp1.example.com", &pending.request.id, None);
+        assert!(orch.handle_response(&response, false).is_err());
     }
 
     #[test]
@@ -741,7 +790,7 @@ mod tests {
 
         let response =
             create_logout_response_success("https://evil.example.com", &pending.request.id, None);
-        assert!(orch.handle_response(&response).is_err());
+        assert!(orch.handle_response(&response, true).is_err());
     }
 
     #[test]
@@ -753,7 +802,7 @@ mod tests {
         let mut response =
             create_logout_response_success("https://idp1.example.com", &pending.request.id, None);
         response.issuer = None;
-        assert!(orch.handle_response(&response).is_err());
+        assert!(orch.handle_response(&response, true).is_err());
     }
 
     #[test]

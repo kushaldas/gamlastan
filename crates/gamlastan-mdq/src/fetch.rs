@@ -6,6 +6,7 @@
 //! the client.
 
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -16,10 +17,12 @@ use crate::error::MdqError;
 pub const SAML_METADATA_MIME: &str = "application/samlmetadata+xml";
 
 /// Maximum metadata response body accepted, in bytes. The MDQ server is
-/// untrusted, so an unbounded body would be a memory-exhaustion vector; 200 MiB
-/// accommodates large federation aggregates such as eduGAIN while still putting
-/// a hard ceiling on resource use.
-pub const MAX_BODY_BYTES: usize = 200 * 1024 * 1024;
+/// untrusted, so an unbounded body would be a memory-exhaustion vector. The
+/// conservative default targets per-entity MDQ responses; aggregate consumers
+/// must opt into a larger cap with [`ReqwestFetcher::with_limits`].
+pub const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+/// Maximum number of response bodies buffered concurrently by default.
+pub const MAX_CONCURRENT_FETCHES: usize = 8;
 
 /// Maximum number of bytes read from a non-success response body for error
 /// reporting. Error payloads are diagnostic only, so keep their footprint small
@@ -39,17 +42,47 @@ pub trait MetadataFetcher {
 #[derive(Debug, Clone)]
 pub struct ReqwestFetcher {
     client: reqwest::Client,
+    max_body_bytes: usize,
+    permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl ReqwestFetcher {
     /// Create a fetcher with the given request timeout.
     pub fn with_timeout(timeout: Duration) -> Result<Self, MdqError> {
+        Self::with_limits(timeout, MAX_BODY_BYTES, MAX_CONCURRENT_FETCHES)
+    }
+
+    /// Create a fetcher with explicit per-response and concurrency limits.
+    ///
+    /// `max_body_bytes` bounds each buffered response and
+    /// `max_concurrent_fetches` bounds simultaneous response buffering. Large
+    /// aggregate consumers can deliberately raise the body cap while the ready
+    /// MDQ path retains a conservative per-entity default.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MdqError::Transport`] if either limit is zero or the HTTP
+    /// client cannot be constructed.
+    pub fn with_limits(
+        timeout: Duration,
+        max_body_bytes: usize,
+        max_concurrent_fetches: usize,
+    ) -> Result<Self, MdqError> {
+        if max_body_bytes == 0 || max_concurrent_fetches == 0 {
+            return Err(MdqError::Transport(
+                "MDQ body and concurrency limits must be non-zero".into(),
+            ));
+        }
         let client = reqwest::Client::builder()
             .timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| MdqError::Transport(e.to_string()))?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            max_body_bytes,
+            permits: Arc::new(tokio::sync::Semaphore::new(max_concurrent_fetches)),
+        })
     }
 
     /// Build a fetcher with the default 10s timeout, returning an error instead
@@ -65,7 +98,33 @@ impl ReqwestFetcher {
 
     /// Wrap a pre-built [`reqwest::Client`].
     pub fn from_client(client: reqwest::Client) -> Self {
-        Self { client }
+        Self::from_client_with_limits(client, MAX_BODY_BYTES, MAX_CONCURRENT_FETCHES)
+            .expect("default MDQ limits are non-zero")
+    }
+
+    /// Wrap a pre-built client while applying explicit resource limits.
+    ///
+    /// `max_body_bytes` bounds each response body and
+    /// `max_concurrent_fetches` bounds simultaneous response buffering.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MdqError::Transport`] if either limit is zero.
+    pub fn from_client_with_limits(
+        client: reqwest::Client,
+        max_body_bytes: usize,
+        max_concurrent_fetches: usize,
+    ) -> Result<Self, MdqError> {
+        if max_body_bytes == 0 || max_concurrent_fetches == 0 {
+            return Err(MdqError::Transport(
+                "MDQ body and concurrency limits must be non-zero".into(),
+            ));
+        }
+        Ok(Self {
+            client,
+            max_body_bytes,
+            permits: Arc::new(tokio::sync::Semaphore::new(max_concurrent_fetches)),
+        })
     }
 }
 
@@ -87,6 +146,11 @@ impl Default for ReqwestFetcher {
 
 impl MetadataFetcher for ReqwestFetcher {
     async fn fetch(&self, url: &str) -> Result<Bytes, MdqError> {
+        let _permit = self
+            .permits
+            .acquire()
+            .await
+            .map_err(|_| MdqError::Transport("MDQ fetch limiter closed".into()))?;
         let mut resp = self
             .client
             .get(url)
@@ -104,7 +168,9 @@ impl MetadataFetcher for ReqwestFetcher {
             });
         }
 
-        Ok(Bytes::from(read_body(&mut resp, MAX_BODY_BYTES).await?))
+        Ok(Bytes::from(
+            read_body(&mut resp, self.max_body_bytes).await?,
+        ))
     }
 }
 
@@ -205,5 +271,12 @@ mod tests {
 
         handle.join().unwrap();
         assert!(matches!(err, MdqError::Http { status: 302, .. }));
+    }
+
+    /// Verifies that zero-valued resource limits fail during construction.
+    #[test]
+    fn reqwest_fetcher_rejects_zero_limits() {
+        assert!(ReqwestFetcher::with_limits(Duration::from_secs(1), 0, 1).is_err());
+        assert!(ReqwestFetcher::with_limits(Duration::from_secs(1), 1, 0).is_err());
     }
 }

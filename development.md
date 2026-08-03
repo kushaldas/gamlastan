@@ -1,6 +1,6 @@
 ## Prerequisites
 
-- **Rust** 1.75 or later
+- **Rust** 1.88 or later
 - **[just](https://github.com/casey/just)** command runner
 - **Docker** (needed for SPID conformance testing and E2E IdP testing)
 
@@ -359,5 +359,4 @@ Remove all build artifacts:
 ```sh
 just clean
 ```
-
 

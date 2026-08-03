@@ -265,12 +265,27 @@ impl SamlVerifier {
     /// CRITICAL: The query_string must be the original URL-encoded parameter values,
     /// NOT re-encoded values. Per SAML spec, the signature is computed over the
     /// exact URL-encoded form.
+    ///
+    /// HMAC algorithms are rejected by default because federation metadata
+    /// distributes public verification keys, not shared secrets.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the algorithm is prohibited or unsupported, no
+    /// verification key is available, or signature verification fails.
     pub fn verify_redirect_query(
         &self,
         query_string: &[u8],
         signature: &[u8],
         algorithm_uri: &str,
     ) -> Result<bool, CryptoError> {
+        if self.reject_hmac_signatures
+            && crate::security::signature::is_hmac_algorithm(algorithm_uri)
+        {
+            return Err(CryptoError::VerificationFailed(
+                "HMAC-based SignatureMethod is not allowed for SAML signatures".to_string(),
+            ));
+        }
         let sig_alg = bergshamra_crypto::sign::from_uri(algorithm_uri)
             .map_err(CryptoError::BergshamraError)?;
         let key = self
@@ -292,5 +307,24 @@ impl SamlVerifier {
     /// Get a reference to the underlying keys manager.
     pub fn keys_manager(&self) -> &KeysManager {
         &self.keys_manager
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verifies that HMAC Redirect signatures fail before verification-key lookup.
+    #[test]
+    fn redirect_verification_rejects_hmac_before_key_lookup() {
+        let verifier = SamlVerifier::new(KeysManager::new());
+        let err = verifier
+            .verify_redirect_query(
+                b"SAMLRequest=x&SigAlg=hmac",
+                b"signature",
+                "http://www.w3.org/2000/09/xmldsig#hmac-sha1",
+            )
+            .expect_err("SAML redirect HMAC must be rejected by policy");
+        assert!(err.to_string().contains("HMAC-based SignatureMethod"));
     }
 }

@@ -168,7 +168,7 @@ pub fn find_acs_endpoint_by_binding<'a>(
 pub fn process_response(
     response: &Response,
     config: &SecurityConfig,
-    replay_cache: Option<&dyn ReplayCache>,
+    replay_cache: &dyn ReplayCache,
     sp_entity_id: &str,
     acs_url: &str,
     expected_request_id: Option<&str>,
@@ -201,7 +201,7 @@ pub fn process_response(
 pub fn process_response_with_verified_signatures(
     response: &Response,
     config: &SecurityConfig,
-    replay_cache: Option<&dyn ReplayCache>,
+    replay_cache: &dyn ReplayCache,
     sp_entity_id: &str,
     acs_url: &str,
     expected_request_id: Option<&str>,
@@ -232,11 +232,7 @@ pub fn process_response_with_verified_signatures(
     }
 
     // Run the assertion validator
-    let validator = if let Some(cache) = replay_cache {
-        AssertionValidator::new(config).with_replay_cache(cache)
-    } else {
-        AssertionValidator::new(config)
-    };
+    let validator = AssertionValidator::new(config).with_replay_cache(replay_cache);
 
     let params = ValidationParams {
         received_url: acs_url,
@@ -383,6 +379,7 @@ mod tests {
     use crate::core::constants;
     use crate::core::protocol::response::ResponseBase;
     use crate::core::protocol::status::{Status, StatusCode};
+    use crate::security::replay::InMemoryReplayCache;
     use chrono::TimeDelta;
 
     #[allow(dead_code)]
@@ -620,10 +617,11 @@ mod tests {
         };
 
         let config = SecurityConfig::permissive();
+        let replay_cache = InMemoryReplayCache::new();
         let result = process_response(
             &response,
             &config,
-            None,
+            &replay_cache,
             "https://sp.example.com",
             "https://sp.example.com/acs",
             None,
@@ -658,10 +656,11 @@ mod tests {
         };
 
         let config = SecurityConfig::permissive();
+        let replay_cache = InMemoryReplayCache::new();
         let result = process_response(
             &response,
             &config,
-            None,
+            &replay_cache,
             "https://sp.example.com",
             "https://sp.example.com/acs",
             None,
@@ -692,10 +691,11 @@ mod tests {
         };
 
         let config = SecurityConfig::permissive();
+        let replay_cache = InMemoryReplayCache::new();
         let result = process_response(
             &response,
             &config,
-            None,
+            &replay_cache,
             "https://sp.example.com",
             "https://sp.example.com/acs",
             None,
@@ -724,11 +724,12 @@ mod tests {
         let response = make_test_response(assertion, None);
         let mut config = SecurityConfig::permissive();
         config.require_encrypted_assertions = true;
+        let replay_cache = InMemoryReplayCache::new();
 
         let result = process_response(
             &response,
             &config,
-            None,
+            &replay_cache,
             "https://sp.example.com",
             "https://sp.example.com/acs",
             None,
@@ -758,11 +759,12 @@ mod tests {
         let assertion_id = assertion.id.clone();
         let response = make_test_response(assertion, None);
         let config = SecurityConfig::default();
+        let replay_cache = InMemoryReplayCache::new();
 
         let result = process_response(
             &response,
             &config,
-            None,
+            &replay_cache,
             "https://sp.example.com",
             "https://sp.example.com/acs",
             None,
@@ -772,10 +774,11 @@ mod tests {
         assert!(matches!(result, Err(ProfileError::AssertionValidation(_))));
 
         let verified_ids = [assertion_id.as_str()];
+        let verified_replay_cache = InMemoryReplayCache::new();
         let result = process_response_with_verified_signatures(
             &response,
             &config,
-            None,
+            &verified_replay_cache,
             "https://sp.example.com",
             "https://sp.example.com/acs",
             None,

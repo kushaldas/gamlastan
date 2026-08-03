@@ -202,7 +202,31 @@ mod tests {
         use crate::xml::deserialize::SamlDeserialize;
         let parsed = AuthnRequestRef::from_xml(&doc, root).unwrap().to_owned();
 
-        let processed = crate::profiles::sso::idp::process_authn_request(&parsed, None).unwrap();
+        let sp_metadata = crate::metadata::types::sp::SpSsoDescriptor {
+            sso_base: crate::metadata::types::role_descriptor::SsoDescriptorBase {
+                base: crate::metadata::types::role_descriptor::RoleDescriptorBase::new(vec![
+                    "urn:oasis:names:tc:SAML:2.0:protocol".to_string(),
+                ]),
+                artifact_resolution_services: vec![],
+                single_logout_services: vec![],
+                manage_name_id_services: vec![],
+                name_id_formats: vec![],
+            },
+            authn_requests_signed: Some(false),
+            want_assertions_signed: Some(true),
+            assertion_consumer_services: vec![
+                crate::metadata::types::endpoint::IndexedEndpoint::new_default(
+                    crate::metadata::types::endpoint::Endpoint::new(
+                        crate::profiles::sso::web_browser::bindings::HTTP_POST,
+                        "https://sp.example.com/acs",
+                    ),
+                    0,
+                ),
+            ],
+            attribute_consuming_services: vec![],
+        };
+        let processed =
+            crate::profiles::sso::idp::process_authn_request(&parsed, &sp_metadata, false).unwrap();
         let extensions = processed.extensions.expect("extensions present");
         let certs = extract_encryption_certs(&extensions).unwrap();
         assert_eq!(certs, vec![CERT_B64.to_string()]);

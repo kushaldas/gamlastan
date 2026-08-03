@@ -130,7 +130,9 @@ impl SwedenConnectConfig {
             // Tight assertion lifetime — stolen-assertion window (section 6.3.5).
             max_assertion_age_seconds: 300,
             reject_signatures_with_ds_object: true,
-            enforce_persistent_id_uniqueness: true,
+            // Requires an application-provided independent local principal;
+            // enable explicitly on AssertionValidator when that context exists.
+            enforce_persistent_id_uniqueness: false,
             sanitize_relay_state: true,
             require_integrity_with_cbc: true,
             verify_destination: true,

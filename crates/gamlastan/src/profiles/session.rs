@@ -173,7 +173,7 @@ impl SessionStore for InMemorySessionStore {
         self.sessions.lock().unwrap().retain(|_, session| {
             session
                 .session_not_on_or_after
-                .map_or(true, |expiry| now < expiry)
+                .is_none_or(|expiry| now < expiry)
         });
     }
 }
