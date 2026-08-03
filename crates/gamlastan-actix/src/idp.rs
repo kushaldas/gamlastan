@@ -415,12 +415,18 @@ async fn idp_slo(
                 Some(id) => resolve_trusted_sp(&config, id).await,
                 None => None,
             };
-            authorize_slo_request(&config, &logout_req, xml_str, slo_sp.as_ref())?;
+            let slo_authorized =
+                authorize_slo_request(&config, &logout_req, xml_str, slo_sp.as_ref())?;
             let now = Utc::now();
+            // `expected_issuer` is the request's own issuer: on the IdP side the
+            // real issuer trust decision is the metadata resolution and signature
+            // check that produced `slo_authorized`, so the equality check inside
+            // `validate_logout_request` is already established. The remaining
+            // value of the call is the NameID and NotOnOrAfter validation.
             logout::validate_logout_request(
                 &logout_req,
                 slo_issuer.unwrap_or_default(),
-                true,
+                slo_authorized.message_authenticated(),
                 now,
                 config.security.clock_skew_seconds,
             )
@@ -772,26 +778,29 @@ async fn resolve_trusted_sp(
 /// which case the request is accepted without a message signature.
 ///
 /// `sp` is the metadata resolved for `logout_req`'s issuer, or `None` if the
-/// issuer is unknown/untrusted. Returns `Ok(())` when the logout is authorized,
-/// otherwise a 403-mapped [`SamlActixError::Profile`] explaining the rejection
-/// (these are request authorization failures, not server faults).
+/// issuer is unknown/untrusted. Returns an [`SloAuthorization`] proof when the
+/// logout is authorized, otherwise a 403-mapped [`SamlActixError::Profile`]
+/// explaining the rejection (these are request authorization failures, not
+/// server faults).
 ///
 /// # Examples
 ///
 /// ```ignore
 /// // In the SLO handler, after structural validation and issuer resolution:
-/// authorize_slo_request(&config, &logout_req, xml_str, slo_sp.as_ref())?;
-/// // Safe to look up and destroy the principal's sessions now.
+/// let slo_authorized =
+///     authorize_slo_request(&config, &logout_req, xml_str, slo_sp.as_ref())?;
+/// // Safe to look up and destroy the principal's sessions now; thread
+/// // `slo_authorized.message_authenticated()` into `validate_logout_request`.
 /// ```
 fn authorize_slo_request(
     config: &IdpConfig,
     logout_req: &gamlastan::core::protocol::logout::LogoutRequest,
     xml_str: &str,
     sp: Option<&gamlastan::metadata::types::sp::SpSsoDescriptor>,
-) -> Result<(), SamlActixError> {
+) -> Result<SloAuthorization, SamlActixError> {
     // Transport-authenticated deployments opt out of message-signature checks.
     if config.allow_unauthenticated_backchannel {
-        return Ok(());
+        return Ok(SloAuthorization);
     }
 
     // The issuer must resolve to trusted SP metadata.
@@ -827,7 +836,31 @@ fn authorize_slo_request(
         }
     }
 
-    verify_sp_message_signature(config, sp, xml_str, &logout_req.id, "LogoutRequest")
+    verify_sp_message_signature(config, sp, xml_str, &logout_req.id, "LogoutRequest")?;
+    Ok(SloAuthorization)
+}
+
+/// Proof that [`authorize_slo_request`] authenticated a logout message.
+///
+/// The token is produced only by that function, so the authentication flag
+/// threaded into `logout::validate_logout_request` reflects work that actually
+/// ran — a refactor that removes or reorders the authorization step loses the
+/// token and fails to compile instead of silently passing a stale `true`.
+#[derive(Clone, Copy, Debug)]
+#[must_use = "thread this proof into logout validation"]
+struct SloAuthorization;
+
+impl SloAuthorization {
+    /// The message-authentication flag for `logout::validate_logout_request`.
+    ///
+    /// This token exists only after a bound message signature verified against
+    /// trusted SP metadata, or after the deployment's explicit
+    /// [`IdpConfig::allow_unauthenticated_backchannel`] transport policy
+    /// accepted the message; either satisfies the validation layer's
+    /// authentication requirement.
+    fn message_authenticated(self) -> bool {
+        true
+    }
 }
 
 /// Authorize an incoming `ArtifactResolve` before the referenced artifact is

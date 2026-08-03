@@ -35,6 +35,16 @@ where needed to correct protocol handling.
   authentication context, instant, and session index.
 - The example IdP loads trusted SP metadata with `parse_secure_metadata`, so
   legitimate federation comments remain compatible with the hardened parser.
+- **Breaking (operational):** the default MDQ fetch body cap dropped from
+  200 MiB to 10 MiB per response, with at most 8 response bodies buffered
+  concurrently. Per-entity MDQ lookups are unaffected. Deployments fetching
+  large federation *aggregates* (e.g. eduGAIN, on the order of 100 MiB) through
+  `ReqwestFetcher` must now opt in deliberately with
+  `ReqwestFetcher::with_limits(timeout, max_body_bytes, max_concurrent_fetches)`
+  or `from_client_with_limits`; the previous 200 MiB-per-request default sized
+  every consumer for the worst case. Dynamically fetched MDQ metadata is also
+  cached with a 1024-entry bound by default (`MdqClient::with_cache_capacity`;
+  oldest fetch evicted first, zero disables caching).
 - Upgraded the XML-security/crypto stack: `bergshamra` 0.7.0 → 0.8.0 and the
   direct `kryptering` dependency 0.4 → 0.5, features still mirroring bergshamra
   (`legacy`, `post-quantum`, `pkcs11`) so the shared `Signer` / `Pkcs11Signer`
@@ -50,6 +60,21 @@ where needed to correct protocol handling.
 
 - SPID and example IdP pending authentication state is TTL-bounded, capacity-
   bounded, and atomically consumed only after all terminal validation succeeds.
+- The ready Actix SP binds each AuthnRequest to the initiating browser:
+  `/saml/login` sets a five-minute `__Host-gamlastan_authn_state` cookie
+  (Secure, HttpOnly, SameSite=None) and the ACS consumes an outstanding request
+  ID only when the presenting browser holds the state it was issued with, so a
+  response solicited in one browser cannot be injected into another.
+  **Deployment note:** the cookie is `Secure`, so solicited logins require the
+  SP to be served over HTTPS — including local development; over plain HTTP the
+  cookie is never stored and every solicited response is rejected at the ACS
+  with "InResponseTo does not match". Custom `RequestIdTracker` implementations
+  must override `store_bound`/`consume_bound`; the defaults fail closed for the
+  ready ACS flow.
+- `InMemoryRequestIdTracker` is capacity-bounded (default 1024 outstanding IDs,
+  configurable via `with_limits`), evicting the oldest live entry at capacity.
+  The login endpoint is unauthenticated, so unbounded correlation state was a
+  memory-growth vector (ADR 0041).
 - Actix SLO verifies every signature representation supplied with a message; a
   valid Redirect signature can no longer mask an invalid enveloped XML-DSig.
 - The SPID ACS now parses network-supplied responses exclusively through the

@@ -44,6 +44,16 @@ async fn main() -> std::io::Result<()> {
 }
 ```
 
+> **HTTPS is required for solicited logins.** The ready SP binds every
+> AuthnRequest to the initiating browser with a `Secure`, `HttpOnly`
+> `__Host-gamlastan_authn_state` cookie (five-minute lifetime, matching the
+> request-tracker TTL). Browsers only store `Secure` cookies over HTTPS, so an
+> SP served over plain HTTP — including local development — never receives the
+> cookie back and every solicited response is rejected at the ACS with
+> "InResponseTo does not match". Terminate TLS in front of the SP (or serve
+> HTTPS directly) in every environment. IdP-initiated (unsolicited) responses
+> are unaffected.
+
 ## IdP Quick Start
 
 ```rust,no_run

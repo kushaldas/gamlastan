@@ -175,29 +175,78 @@ struct TrackedRequestId {
     browser_state: Option<String>,
 }
 
+/// Default maximum number of outstanding request IDs retained in memory.
+const DEFAULT_MAX_TRACKED_REQUESTS: usize = 1024;
+
 /// In-memory request ID tracker with automatic expiry.
+///
+/// Entries expire after `ttl` and the tracker never retains more than
+/// `max_entries` outstanding IDs. The login endpoint that feeds this tracker is
+/// unauthenticated, so an unbounded map would let a request flood grow memory
+/// for the full TTL window (see ADR 0041). At capacity the oldest live entry is
+/// evicted so the current login can still proceed.
 pub struct InMemoryRequestIdTracker {
     /// Map of request_id -> insertion time (for TTL)
     ids: Mutex<HashMap<String, TrackedRequestId>>,
     /// TTL for stored request IDs (default: 5 minutes)
     ttl: std::time::Duration,
+    /// Hard bound on retained entries (default: 1024).
+    max_entries: usize,
 }
 
 impl InMemoryRequestIdTracker {
-    /// Create a new tracker with the default TTL of 5 minutes.
+    /// Create a new tracker with the default TTL of 5 minutes and the default
+    /// capacity of 1024 outstanding request IDs.
     pub fn new() -> Self {
-        Self {
-            ids: Mutex::new(HashMap::new()),
-            ttl: std::time::Duration::from_secs(300),
-        }
+        Self::with_limits(
+            std::time::Duration::from_secs(300),
+            DEFAULT_MAX_TRACKED_REQUESTS,
+        )
     }
 
-    /// Create a new tracker with a custom TTL.
+    /// Create a new tracker with a custom TTL and the default capacity.
     pub fn with_ttl(ttl: std::time::Duration) -> Self {
+        Self::with_limits(ttl, DEFAULT_MAX_TRACKED_REQUESTS)
+    }
+
+    /// Create a new tracker with a custom TTL and entry capacity.
+    ///
+    /// `max_entries` is clamped to at least 1: a zero-capacity tracker could
+    /// never correlate any response and would silently break every login.
+    pub fn with_limits(ttl: std::time::Duration, max_entries: usize) -> Self {
         Self {
             ids: Mutex::new(HashMap::new()),
             ttl,
+            max_entries: max_entries.max(1),
         }
+    }
+
+    /// Insert an entry after purging expired IDs, evicting the oldest live
+    /// entry when the tracker is at capacity.
+    ///
+    /// Eviction (rather than refusing the insert) keeps unauthenticated login
+    /// floods memory-bounded while letting the current login proceed; under a
+    /// flood the evicted entries are overwhelmingly the flooder's own.
+    fn insert(&self, request_id: &str, browser_state: Option<String>) {
+        let mut ids = self.ids.lock().unwrap();
+        let now = std::time::Instant::now();
+        ids.retain(|_, entry| now.duration_since(entry.inserted) < self.ttl);
+        if !ids.contains_key(request_id) && ids.len() >= self.max_entries {
+            if let Some(oldest) = ids
+                .iter()
+                .min_by_key(|(_, entry)| entry.inserted)
+                .map(|(id, _)| id.clone())
+            {
+                ids.remove(&oldest);
+            }
+        }
+        ids.insert(
+            request_id.to_string(),
+            TrackedRequestId {
+                inserted: now,
+                browser_state,
+            },
+        );
     }
 }
 
@@ -209,17 +258,7 @@ impl Default for InMemoryRequestIdTracker {
 
 impl RequestIdTracker for InMemoryRequestIdTracker {
     fn store(&self, request_id: &str) {
-        let mut ids = self.ids.lock().unwrap();
-        // Purge expired entries while we're here
-        let now = std::time::Instant::now();
-        ids.retain(|_, entry| now.duration_since(entry.inserted) < self.ttl);
-        ids.insert(
-            request_id.to_string(),
-            TrackedRequestId {
-                inserted: now,
-                browser_state: None,
-            },
-        );
+        self.insert(request_id, None);
     }
 
     fn consume(&self, request_id: &str) -> bool {
@@ -241,16 +280,7 @@ impl RequestIdTracker for InMemoryRequestIdTracker {
 
     /// Store a browser-bound request, replacing any entry with the same ID.
     fn store_bound(&self, request_id: &str, browser_state: &str) {
-        let mut ids = self.ids.lock().unwrap();
-        let now = std::time::Instant::now();
-        ids.retain(|_, entry| now.duration_since(entry.inserted) < self.ttl);
-        ids.insert(
-            request_id.to_string(),
-            TrackedRequestId {
-                inserted: now,
-                browser_state: Some(browser_state.to_string()),
-            },
-        );
+        self.insert(request_id, Some(browser_state.to_string()));
     }
 
     /// Consume a live request only when its stored browser state matches.
@@ -737,6 +767,16 @@ mod tests {
     fn test_request_id_tracker_consume_unknown() {
         let tracker = InMemoryRequestIdTracker::new();
         assert!(!tracker.consume("_nonexistent"));
+    }
+
+    /// Verifies the tracker stays bounded by evicting the oldest live entry.
+    #[test]
+    fn test_request_id_tracker_capacity_evicts_oldest() {
+        let tracker = InMemoryRequestIdTracker::with_limits(std::time::Duration::from_secs(300), 1);
+        tracker.store_bound("_first", "browser-a");
+        tracker.store_bound("_second", "browser-a");
+        assert!(!tracker.consume_bound("_first", "browser-a"));
+        assert!(tracker.consume_bound("_second", "browser-a"));
     }
 
     /// Verifies browser binding, mismatch preservation, and one-time use.
