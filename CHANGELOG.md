@@ -5,7 +5,7 @@ All notable changes to this repository will be documented in this file.
 The project is still pre-1.0, so minor releases may include behavior changes
 where needed to correct protocol handling.
 
-## [0.8.0] - 2026-08-02
+## [0.8.0] - 2026-08-03
 
 ### Added
 
