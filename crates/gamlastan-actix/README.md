@@ -34,9 +34,9 @@ async fn main() -> std::io::Result<()> {
     let config = web::Data::new(sp_config);
     let slo_callback: SloCallback = Box::new(|event, request| Box::pin(async move {
         let _ = (event, request);
-        // Await durable local-session invalidation here. Returning an error
-        // prevents gamlastan from reporting protocol success.
-        Ok(())
+        // Await durable local-session invalidation and return its Result.
+        // Never return Ok(()) while the local session is still valid.
+        todo!("invalidate the local application session")
     }));
     let slo_callback = web::Data::new(slo_callback);
 

@@ -22,12 +22,37 @@
 //!
 //! ```rust,no_run
 //! use actix_web::{web, App, HttpServer};
-//! use gamlastan_actix::{SpConfig, sp::configure_sp};
+//! use gamlastan_actix::{SloCallback, SpConfig, sp::configure_sp};
 //!
-//! // 1. Build SpConfig with your entity ID, ACS URL, and IdP metadata
-//! // 2. Register routes with configure_sp()
-//! // 3. The library handles AuthnRequest creation, Response validation,
-//! //    LogoutRequest/Response, and metadata generation.
+//! #[actix_web::main]
+//! async fn main() -> std::io::Result<()> {
+//!     // Load IdP metadata (from file, URL, etc.).
+//!     let idp_metadata = todo!("parse IdP metadata XML");
+//!
+//!     let config = web::Data::new(SpConfig::new(
+//!         "https://sp.example.com",
+//!         "https://sp.example.com/acs",
+//!         idp_metadata,
+//!     ));
+//!
+//!     let slo_callback: SloCallback = Box::new(|event, request| Box::pin(async move {
+//!         let _ = (event, request);
+//!         // Await durable local-session invalidation and return its Result.
+//!         // Never return Ok(()) while the local session is still valid.
+//!         todo!("invalidate the local application session")
+//!     }));
+//!     let slo_callback = web::Data::new(slo_callback);
+//!
+//!     HttpServer::new(move || {
+//!         App::new()
+//!             .app_data(config.clone())
+//!             .app_data(slo_callback.clone())
+//!             .configure(configure_sp)
+//!     })
+//!     .bind("0.0.0.0:8080")?
+//!     .run()
+//!     .await
+//! }
 //! ```
 
 pub mod config;

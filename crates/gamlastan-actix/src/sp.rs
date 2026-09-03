@@ -104,9 +104,9 @@ pub type SloCallbackFuture<'a> = Pin<Box<dyn Future<Output = Result<(), SamlActi
 ///
 /// let callback: SloCallback = Box::new(|event, request| Box::pin(async move {
 ///     let _ = (event, request);
-///     // Invalidate the matching local application session here. Propagate
-///     // failures so gamlastan does not report protocol success.
-///     Ok(())
+///     // Await durable local-session invalidation and return its Result.
+///     // Never return Ok(()) while the local session is still valid.
+///     todo!("invalidate the local application session")
 /// }));
 /// let callback_data = web::Data::new(callback);
 /// // Register with `App::new().app_data(callback_data.clone())` before
