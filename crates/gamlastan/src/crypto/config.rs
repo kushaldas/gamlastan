@@ -5,7 +5,7 @@
 /// Algorithm preferences and security policy for SAML operations.
 ///
 /// These defaults follow SAML errata recommendations:
-/// - E81: any algorithm supported by bergshamra is allowed
+/// - E81: algorithm support is extensible, while verification applies a local policy
 /// - E91: reject signatures containing ds:Object elements
 /// - E93: prefer GCM modes over CBC for built-in integrity protection
 #[derive(Debug, Clone)]
@@ -45,6 +45,133 @@ pub struct CryptoConfig {
     /// Maximum XML Encryption PBKDF2 iterations accepted from XML-controlled
     /// parameters. Default matches bergshamra.
     pub max_pbkdf2_iterations: u32,
+}
+
+/// Local allowlist for algorithms accepted while verifying SAML signatures.
+///
+/// The default permits RSA and ECDSA signatures with SHA-256, SHA-384, or
+/// SHA-512, and reference digests with SHA-256, SHA-384, or SHA-512. This is a
+/// SAML policy layered above bergshamra: the lower-level XML-DSig library keeps
+/// its broader algorithm support for xmlsec interoperability tests.
+///
+/// Use [`AlgorithmPolicy::permissive`] only for explicit legacy or non-SAML
+/// interoperability. HMAC remains independently prohibited by
+/// [`SamlVerifier`](crate::crypto::SamlVerifier) unless its HMAC guard is also
+/// disabled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlgorithmPolicy {
+    // None means backend-compatible/unrestricted. Some(empty) intentionally
+    // denies every algorithm rather than acting as an accidental opt-out.
+    allowed_signature_algorithms: Option<Vec<String>>,
+    allowed_digest_algorithms: Option<Vec<String>>,
+}
+
+impl Default for AlgorithmPolicy {
+    fn default() -> Self {
+        use bergshamra_core::algorithm;
+
+        Self::allow_only(
+            [
+                algorithm::RSA_SHA256,
+                algorithm::RSA_SHA384,
+                algorithm::RSA_SHA512,
+                algorithm::ECDSA_SHA256,
+                algorithm::ECDSA_SHA384,
+                algorithm::ECDSA_SHA512,
+            ],
+            [algorithm::SHA256, algorithm::SHA384, algorithm::SHA512],
+        )
+    }
+}
+
+impl AlgorithmPolicy {
+    /// Construct the secure default SAML algorithm policy.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Accept any signature and digest algorithm supported by bergshamra.
+    ///
+    /// This preserves the old verification behavior for legacy XML security
+    /// interoperability. It is not recommended for production SAML deployments.
+    pub fn permissive() -> Self {
+        Self {
+            allowed_signature_algorithms: None,
+            allowed_digest_algorithms: None,
+        }
+    }
+
+    /// Construct a policy containing exactly the supplied allowlists.
+    ///
+    /// Empty iterators deny all algorithms of the corresponding kind.
+    pub fn allow_only<S, D, SI, DI>(signature_algorithms: S, digest_algorithms: D) -> Self
+    where
+        S: IntoIterator<Item = SI>,
+        D: IntoIterator<Item = DI>,
+        SI: Into<String>,
+        DI: Into<String>,
+    {
+        Self {
+            allowed_signature_algorithms: Some(
+                signature_algorithms.into_iter().map(Into::into).collect(),
+            ),
+            allowed_digest_algorithms: Some(
+                digest_algorithms.into_iter().map(Into::into).collect(),
+            ),
+        }
+    }
+
+    /// Replace the signature algorithm allowlist.
+    ///
+    /// An empty iterator denies every signature algorithm.
+    pub fn with_signature_algorithms<I, T>(mut self, algorithms: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
+        self.allowed_signature_algorithms = Some(algorithms.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Replace the reference digest algorithm allowlist.
+    ///
+    /// An empty iterator denies every reference digest algorithm.
+    pub fn with_digest_algorithms<I, T>(mut self, algorithms: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
+        self.allowed_digest_algorithms = Some(algorithms.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Return the signature allowlist, or `None` for backend-compatible mode.
+    pub fn allowed_signature_algorithms(&self) -> Option<&[String]> {
+        self.allowed_signature_algorithms.as_deref()
+    }
+
+    /// Return the reference digest allowlist, or `None` for backend-compatible mode.
+    pub fn allowed_digest_algorithms(&self) -> Option<&[String]> {
+        self.allowed_digest_algorithms.as_deref()
+    }
+
+    /// Return whether a signature method URI is accepted by this policy.
+    pub fn allows_signature_algorithm(&self, uri: &str) -> bool {
+        self.allowed_signature_algorithms
+            .as_ref()
+            .is_none_or(|allowed| allowed.iter().any(|candidate| candidate == uri))
+    }
+
+    /// Return whether a reference digest method URI is accepted by this policy.
+    pub fn allows_digest_algorithm(&self, uri: &str) -> bool {
+        self.allowed_digest_algorithms
+            .as_ref()
+            .is_none_or(|allowed| allowed.iter().any(|candidate| candidate == uri))
+    }
+
+    pub(crate) fn is_permissive(&self) -> bool {
+        self.allowed_signature_algorithms.is_none() && self.allowed_digest_algorithms.is_none()
+    }
 }
 
 impl Default for CryptoConfig {

@@ -21,6 +21,14 @@ pub enum CryptoError {
     #[error("Unsupported algorithm: {0}")]
     UnsupportedAlgorithm(String),
 
+    /// A signature algorithm is supported by the backend but denied by policy.
+    #[error("Signature algorithm is not allowed by SAML algorithm policy: {0}")]
+    DisallowedSignatureAlgorithm(String),
+
+    /// A reference digest algorithm is supported by the backend but denied by policy.
+    #[error("Digest algorithm is not allowed by SAML algorithm policy: {0}")]
+    DisallowedDigestAlgorithm(String),
+
     /// Signature verification failed.
     #[error("Signature verification failed: {0}")]
     VerificationFailed(String),

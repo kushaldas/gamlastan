@@ -2,10 +2,11 @@
 //
 // Per Errata:
 // - E91: Reject signatures containing ds:Object elements.
-// - E81: Any signature algorithm is supported (not just RSA-SHA1).
+// - E81: Algorithm support is extensible and not limited to RSA-SHA1.
 //
 // This module provides functions to validate signature properties
-// before/after cryptographic verification.
+// before/after cryptographic verification. `crypto::AlgorithmPolicy` separately
+// controls which supported algorithms are acceptable at a SAML trust boundary.
 
 /// Check whether XML contains an XMLDSig `Object` element (E91).
 ///
@@ -140,8 +141,9 @@ pub fn contains_hmac_signature_method(signed_xml: &str) -> Result<bool, uppsala:
 
 /// Known signature algorithm URIs.
 ///
-/// Per E81: any algorithm supported by the implementation may be used.
-/// This list includes algorithms from XMLDSig, XMLDSig 1.1, and common extensions.
+/// This informational backend-capability list includes algorithms from XMLDSig,
+/// XMLDSig 1.1, and common extensions. It is not the SAML verification
+/// allowlist; use [`crate::crypto::AlgorithmPolicy`] for that decision.
 pub const KNOWN_SIGNATURE_ALGORITHMS: &[&str] = &[
     // RSA
     "http://www.w3.org/2000/09/xmldsig#rsa-sha1",

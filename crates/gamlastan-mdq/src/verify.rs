@@ -228,7 +228,8 @@ fn verify_if_configured(
 
     MetadataSigningProfile::validate_signature_profile(xml, id)?;
 
-    let verifier = SamlVerifier::new(trust.keys().clone());
+    let verifier = SamlVerifier::new(trust.keys().clone())
+        .with_algorithm_policy(trust.algorithm_policy().clone());
     let references = match verifier
         .verify_enveloped(xml)
         .map_err(|e| MdqError::SignatureInvalid(e.to_string()))?

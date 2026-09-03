@@ -51,3 +51,4 @@ rewriting history (mark the old one `Superseded by NNNN`).
 | [0040](0040-ready-handlers-bind-browser-and-signing-state.md) | Ready handlers bind browser and signing state | Accepted |
 | [0041](0041-bound-untrusted-resource-state.md) | Bound untrusted resource state | Accepted |
 | [0042](0042-complete-inbound-protocol-validation.md) | Complete inbound protocol validation | Accepted |
+| [0043](0043-saml-verification-algorithm-policy.md) | Enforce algorithms at the SAML verification boundary | Accepted |

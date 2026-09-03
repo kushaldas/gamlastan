@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use gamlastan::bindings::traits::ArtifactStore;
 use gamlastan::crypto::keys::loader;
-use gamlastan::crypto::{KeysManager, SamlVerifier};
+use gamlastan::crypto::{AlgorithmPolicy, KeysManager, SamlVerifier};
 use gamlastan::metadata::types::entity_descriptor::EntityDescriptor;
 use gamlastan::metadata::types::sp::SpSsoDescriptor;
 use gamlastan::profiles::session::SessionStore;
@@ -109,6 +109,9 @@ pub struct SpConfig {
 
     /// Security configuration (clock skew, signature requirements, etc.).
     pub security: SecurityConfig,
+
+    /// Signature and reference-digest algorithms accepted from the IdP.
+    pub algorithm_policy: AlgorithmPolicy,
 
     /// Replay cache for one-time-use assertion ID enforcement.
     pub replay_cache: Arc<dyn ReplayCache>,
@@ -318,6 +321,7 @@ impl SpConfig {
             metadata_url: String::new(),
             idp_metadata,
             security: SecurityConfig::default(),
+            algorithm_policy: AlgorithmPolicy::default(),
             replay_cache: Arc::new(InMemoryReplayCache::new()),
             want_assertions_signed: true,
             name_id_format: None,
@@ -349,6 +353,12 @@ impl SpConfig {
         self
     }
 
+    /// Set the signature and reference-digest algorithms accepted from the IdP.
+    pub fn with_algorithm_policy(mut self, policy: AlgorithmPolicy) -> Self {
+        self.algorithm_policy = policy;
+        self
+    }
+
     /// Set a custom replay cache.
     pub fn with_replay_cache(mut self, cache: Arc<dyn ReplayCache>) -> Self {
         self.replay_cache = cache;
@@ -375,6 +385,9 @@ pub struct IdpConfig {
 
     /// Security configuration.
     pub security: SecurityConfig,
+
+    /// Signature and reference-digest algorithms accepted from trusted SPs.
+    pub algorithm_policy: AlgorithmPolicy,
 
     /// Default assertion lifetime in seconds.
     pub assertion_lifetime_seconds: u64,
@@ -435,6 +448,7 @@ impl IdpConfig {
             slo_url: String::new(),
             metadata_url: String::new(),
             security: SecurityConfig::default(),
+            algorithm_policy: AlgorithmPolicy::default(),
             assertion_lifetime_seconds: 300,
             session_lifetime_seconds: 28800, // 8 hours
             sign_responses: true,
@@ -463,6 +477,12 @@ impl IdpConfig {
     /// Set the security configuration.
     pub fn with_security(mut self, security: SecurityConfig) -> Self {
         self.security = security;
+        self
+    }
+
+    /// Set the signature and reference-digest algorithms accepted from trusted SPs.
+    pub fn with_algorithm_policy(mut self, policy: AlgorithmPolicy) -> Self {
+        self.algorithm_policy = policy;
         self
     }
 
@@ -657,6 +677,7 @@ impl IdpConfig {
                 keys,
                 self.security.reject_signatures_with_ds_object,
             )
+            .with_algorithm_policy(self.algorithm_policy.clone())
         })
     }
 }
@@ -702,16 +723,19 @@ mod tests {
 
     #[test]
     fn test_sp_config_builder() {
+        let algorithm_policy = AlgorithmPolicy::permissive();
         let config = SpConfig::new(
             "https://sp.example.com",
             "https://sp.example.com/acs",
             make_dummy_entity_descriptor(),
         )
         .with_slo_url("https://sp.example.com/slo")
-        .with_metadata_url("https://sp.example.com/metadata");
+        .with_metadata_url("https://sp.example.com/metadata")
+        .with_algorithm_policy(algorithm_policy.clone());
 
         assert_eq!(config.slo_url, "https://sp.example.com/slo");
         assert_eq!(config.metadata_url, "https://sp.example.com/metadata");
+        assert_eq!(config.algorithm_policy, algorithm_policy);
     }
 
     #[test]
@@ -725,12 +749,29 @@ mod tests {
 
     #[test]
     fn test_idp_config_builder() {
+        let algorithm_policy = AlgorithmPolicy::permissive();
         let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
             .with_slo_url("https://idp.example.com/slo")
-            .with_metadata_url("https://idp.example.com/metadata");
+            .with_metadata_url("https://idp.example.com/metadata")
+            .with_algorithm_policy(algorithm_policy.clone());
 
         assert_eq!(config.slo_url, "https://idp.example.com/slo");
         assert_eq!(config.metadata_url, "https://idp.example.com/metadata");
+        assert_eq!(config.algorithm_policy, algorithm_policy);
+    }
+
+    #[test]
+    fn idp_verifier_inherits_algorithm_policy() {
+        let policy = AlgorithmPolicy::allow_only(Vec::<String>::new(), Vec::<String>::new());
+        let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
+            .with_algorithm_policy(policy.clone());
+        let mut keys = KeysManager::new();
+        keys.add_trusted_cert(vec![0]);
+
+        let verifier = config
+            .finish_verifier(keys)
+            .expect("a trust anchor is configured");
+        assert_eq!(verifier.algorithm_policy(), &policy);
     }
 
     #[test]

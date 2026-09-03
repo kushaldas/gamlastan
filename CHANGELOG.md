@@ -21,6 +21,14 @@ where needed to correct protocol handling.
   pinned to the affected `h2` 0.3 line; the exception is scoped to that advisory
   and should be removed when Actix adopts `h2` 0.4.16 or newer.
 
+### Security
+
+- Added a configurable signature and Reference-digest algorithm policy at every
+  `SamlVerifier` boundary. The default accepts RSA/ECDSA with SHA-256, SHA-384,
+  or SHA-512 and SHA-256/384/512 digests; SHA-1 and other legacy methods now
+  require an exact custom allowlist or explicit `AlgorithmPolicy::permissive`.
+  Bergshamra retains its full xmlsec-compatible algorithm support.
+
 ## [0.8.0] - 2026-08-03
 
 ### Added
