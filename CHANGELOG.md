@@ -5,6 +5,22 @@ All notable changes to this repository will be documented in this file.
 The project is still pre-1.0, so minor releases may include behavior changes
 where needed to correct protocol handling.
 
+## [0.9.0] - 2026-09-03
+
+### Changed
+
+- Upgraded the XML-security stack from `bergshamra` 0.8.0 to 0.9.0 across all
+  directly used workspace crates.
+- Upgraded the XML parser from `uppsala` 0.9.0 to 0.10.1, matching the version
+  used by `bergshamra` 0.9.0 so the workspace resolves a single parser version.
+- Refreshed compatible dependency versions in `Cargo.lock`.
+- Kept `aes` at 0.9.2 because the otherwise compatible 0.9.3 patch raises its
+  minimum supported Rust version to 1.89; gamlastan continues to support Rust
+  1.88 as declared.
+- Suppressed `RUSTSEC-2026-0258` in the CI audit gate while Actix HTTP remains
+  pinned to the affected `h2` 0.3 line; the exception is scoped to that advisory
+  and should be removed when Actix adopts `h2` 0.4.16 or newer.
+
 ## [0.8.0] - 2026-08-03
 
 ### Added
@@ -484,6 +500,7 @@ Historical release recorded before changelog adoption.
 
 Historical release recorded before changelog adoption.
 
+[0.9.0]: https://github.com/kushaldas/gamlastan/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/kushaldas/gamlastan/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/kushaldas/gamlastan/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/kushaldas/gamlastan/compare/v0.5.0...v0.6.0

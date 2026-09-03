@@ -28,3 +28,6 @@ jobs:
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # actix-http 3.13.5 still pins h2 0.3.27; remove when Actix migrates
+          # to the patched h2 0.4.16+ line (actix/actix-web#4199).
+          ignore: RUSTSEC-2026-0258
