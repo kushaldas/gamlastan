@@ -65,6 +65,44 @@ pub struct SpAuthnResult {
 pub type AcsCallback =
     Box<dyn Fn(SpAuthnResult, &HttpRequest) -> HttpResponse + Send + Sync + 'static>;
 
+/// A verified SLO event for which the application must invalidate local state.
+#[derive(Debug, Clone)]
+pub enum SpLogoutEvent {
+    /// An IdP-initiated request targeting the supplied federated subject and
+    /// optional session indexes.
+    IdpInitiated {
+        /// The exact NameID carried by the verified request.
+        name_id: gamlastan::core::assertion::name_id::NameIdOrEncryptedId,
+        /// Session indexes the IdP requested be terminated.
+        session_indexes: Vec<String>,
+    },
+    /// A verified response completed an SP-initiated logout.
+    SpInitiatedComplete {
+        /// The locally issued LogoutRequest ID consumed by correlation.
+        in_response_to: String,
+    },
+}
+
+/// Callback that invalidates the application's local session after SLO
+/// protocol validation. It is intentionally infallible: protocol replay and
+/// correlation state is consumed atomically before invocation, so a fallible
+/// callback could leave a valid retry impossible while the session remained.
+pub type SloCallback = Box<dyn Fn(SpLogoutEvent, &HttpRequest) + Send + Sync + 'static>;
+
+fn invalidate_local_sp_session(
+    callback: Option<&SloCallback>,
+    event: SpLogoutEvent,
+    request: &HttpRequest,
+) -> Result<(), SamlActixError> {
+    let callback = callback.ok_or_else(|| {
+        SamlActixError::Configuration(
+            "SloCallback is required to invalidate the local SP session".into(),
+        )
+    })?;
+    callback(event, request);
+    Ok(())
+}
+
 /// Register all SP routes on the given service configuration.
 ///
 /// Routes:
@@ -244,7 +282,7 @@ async fn sp_acs(
         &verified_signed_id_refs,
         now,
     )
-    .map_err(|e| SamlActixError::Internal(format!("response validation failed: {e}")))?;
+    .map_err(SamlActixError::Profile)?;
 
     let sp_result = SpAuthnResult {
         authn: authn_result,
@@ -561,6 +599,18 @@ fn validate_slo_logout_response(
         config,
     )?;
 
+    if !response.status.is_success() {
+        return Err(SamlActixError::Profile(
+            gamlastan::profiles::ProfileError::ResponseFailure(
+                response
+                    .status
+                    .status_message
+                    .clone()
+                    .unwrap_or_else(|| response.status.status_code.value.clone()),
+            ),
+        ));
+    }
+
     let in_response_to = response.in_response_to.as_deref().ok_or_else(|| {
         SamlActixError::Profile(gamlastan::profiles::ProfileError::AssertionValidation(
             "LogoutResponse missing InResponseTo".into(),
@@ -571,18 +621,6 @@ fn validate_slo_logout_response(
             gamlastan::profiles::ProfileError::AssertionValidation(format!(
                 "LogoutResponse InResponseTo {in_response_to} matches no outstanding LogoutRequest"
             )),
-        ));
-    }
-
-    if !response.status.is_success() {
-        return Err(SamlActixError::Profile(
-            gamlastan::profiles::ProfileError::ResponseFailure(
-                response
-                    .status
-                    .status_message
-                    .clone()
-                    .unwrap_or_else(|| response.status.status_code.value.clone()),
-            ),
         ));
     }
 
@@ -697,9 +735,23 @@ async fn sp_logout(
 
 /// SP Single Logout Service handler: process incoming LogoutRequest or LogoutResponse from IdP.
 async fn sp_slo(
+    req: HttpRequest,
     msg: SamlMessage,
     config: web::Data<SpConfig>,
+    slo_callback: Option<web::Data<SloCallback>>,
 ) -> Result<HttpResponse, SamlActixError> {
+    // Check the application contract before consuming replay/correlation
+    // state. A missing callback is a configuration error, not a terminal
+    // protocol attempt that should make a later correctly configured retry
+    // impossible.
+    let slo_callback = slo_callback
+        .as_ref()
+        .map(web::Data::get_ref)
+        .ok_or_else(|| {
+            SamlActixError::Configuration(
+                "SloCallback is required to invalidate the local SP session".into(),
+            )
+        })?;
     let xml_str = msg.saml_xml_str()?;
     let doc = gamlastan::xml::parse_secure(xml_str).map_err(|e: uppsala::XmlError| {
         SamlActixError::Xml(gamlastan::xml::error::XmlError::ParseError(e))
@@ -729,14 +781,25 @@ async fn sp_slo(
                 &config,
             )?;
             validate_slo_logout_request(&logout_req, &config)?;
-            logout::validate_logout_request(
+            logout::validate_logout_request_with_replay(
                 &logout_req,
                 &config.idp_metadata.entity_id,
                 true,
                 now,
                 config.security.clock_skew_seconds,
+                config.max_logout_request_age_seconds,
+                config.logout_replay_cache.as_ref(),
             )
             .map_err(SamlActixError::Profile)?;
+
+            invalidate_local_sp_session(
+                Some(slo_callback),
+                SpLogoutEvent::IdpInitiated {
+                    name_id: logout_req.name_id.clone(),
+                    session_indexes: logout_req.session_indexes.clone(),
+                },
+                &req,
+            )?;
 
             // Create success response
             let in_response_to = &logout_req.id;
@@ -791,6 +854,16 @@ async fn sp_slo(
                 &config,
             )?;
             validate_slo_logout_response(&logout_resp, &config)?;
+            let in_response_to = logout_resp.in_response_to.clone().ok_or_else(|| {
+                SamlActixError::Internal(
+                    "validated LogoutResponse unexpectedly lacks InResponseTo".into(),
+                )
+            })?;
+            invalidate_local_sp_session(
+                Some(slo_callback),
+                SpLogoutEvent::SpInitiatedComplete { in_response_to },
+                &req,
+            )?;
             Ok(HttpResponse::Ok().body("Logout completed"))
         }
         other => Err(SamlActixError::UnsupportedBinding(format!(
@@ -1174,6 +1247,29 @@ mod tests {
     }
 
     #[test]
+    fn slo_callback_is_required_and_receives_terminal_event() {
+        let request = actix_web::test::TestRequest::default().to_http_request();
+        let event = SpLogoutEvent::SpInitiatedComplete {
+            in_response_to: "_logout".to_string(),
+        };
+        assert!(matches!(
+            invalidate_local_sp_session(None, event.clone(), &request),
+            Err(SamlActixError::Configuration(_))
+        ));
+
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let callback_seen = Arc::clone(&seen);
+        let callback: SloCallback = Box::new(move |event, _request| {
+            let SpLogoutEvent::SpInitiatedComplete { in_response_to } = event else {
+                panic!("unexpected SLO event")
+            };
+            *callback_seen.lock().unwrap() = Some(in_response_to);
+        });
+        invalidate_local_sp_session(Some(&callback), event, &request).unwrap();
+        assert_eq!(seen.lock().unwrap().as_deref(), Some("_logout"));
+    }
+
+    #[test]
     fn test_trusted_idp_verifier_rejects_unusable_signing_cert() {
         let mut config = test_sp_config();
         let EntityRoles::Roles { idp_sso, .. } = &mut config.idp_metadata.roles else {
@@ -1244,10 +1340,14 @@ mod tests {
         assert_eq!(verified_ids, vec!["_response".to_string()]);
         let verified_id_refs: Vec<&str> = verified_ids.iter().map(String::as_str).collect();
         let replay_cache = InMemoryReplayCache::new();
+        let security = SecurityConfig {
+            allow_unsolicited_responses: true,
+            ..SecurityConfig::default()
+        };
 
         let result = core_sp_profile::process_response_with_verified_signatures(
             &parsed_response,
-            &SecurityConfig::default(),
+            &security,
             &replay_cache,
             "https://sp.example.com",
             "https://sp.example.com/acs",
@@ -1289,10 +1389,14 @@ mod tests {
         assert_eq!(verified_ids, vec!["_signed_assertion".to_string()]);
         let verified_id_refs: Vec<&str> = verified_ids.iter().map(String::as_str).collect();
         let replay_cache = InMemoryReplayCache::new();
+        let security = SecurityConfig {
+            allow_unsolicited_responses: true,
+            ..SecurityConfig::default()
+        };
 
         let result = core_sp_profile::process_response_with_verified_signatures(
             &parsed_response,
-            &SecurityConfig::default(),
+            &security,
             &replay_cache,
             "https://sp.example.com",
             "https://sp.example.com/acs",
@@ -1377,9 +1481,13 @@ mod tests {
 
         let verified_id_refs: Vec<&str> = verified_ids.iter().map(String::as_str).collect();
         let replay_cache = InMemoryReplayCache::new();
+        let security = SecurityConfig {
+            allow_unsolicited_responses: true,
+            ..SecurityConfig::default()
+        };
         let result = core_sp_profile::process_response_with_verified_signatures(
             &parsed_response,
-            &SecurityConfig::default(),
+            &security,
             &replay_cache,
             "https://sp.example.com",
             "https://sp.example.com/acs",

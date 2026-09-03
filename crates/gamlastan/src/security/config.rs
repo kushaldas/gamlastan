@@ -67,6 +67,12 @@ pub struct SecurityConfig {
     /// Check that the client IP address matches the SubjectConfirmationData Address
     /// (optional, default false).
     pub check_client_address: bool,
+
+    /// Accept IdP-initiated Web SSO responses that have no `InResponseTo`.
+    ///
+    /// Unsolicited responses make login CSRF substantially easier, so this is
+    /// disabled by default and must be an explicit deployment decision.
+    pub allow_unsolicited_responses: bool,
 }
 
 impl Default for SecurityConfig {
@@ -84,6 +90,7 @@ impl Default for SecurityConfig {
             verify_destination: true,
             verify_recipient: true,
             check_client_address: false, // optional, off by default
+            allow_unsolicited_responses: false,
         }
     }
 }
@@ -111,6 +118,7 @@ impl SecurityConfig {
             verify_destination: false,
             verify_recipient: false,
             check_client_address: false,
+            allow_unsolicited_responses: true,
         }
     }
 
@@ -133,6 +141,7 @@ impl SecurityConfig {
             verify_destination: true,
             verify_recipient: true,
             check_client_address: true, // enable address check
+            allow_unsolicited_responses: false,
         }
     }
 }
@@ -156,6 +165,7 @@ mod tests {
         assert!(config.verify_destination);
         assert!(config.verify_recipient);
         assert!(!config.check_client_address);
+        assert!(!config.allow_unsolicited_responses);
     }
 
     #[test]

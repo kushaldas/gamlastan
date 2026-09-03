@@ -116,6 +116,12 @@ pub struct SpConfig {
     /// Replay cache for one-time-use assertion ID enforcement.
     pub replay_cache: Arc<dyn ReplayCache>,
 
+    /// Dedicated replay cache for incoming LogoutRequest IDs.
+    pub logout_replay_cache: Arc<dyn ReplayCache>,
+
+    /// Maximum accepted age of an incoming LogoutRequest.
+    pub max_logout_request_age_seconds: u64,
+
     /// Whether to require signed assertions.
     pub want_assertions_signed: bool,
 
@@ -323,6 +329,8 @@ impl SpConfig {
             security: SecurityConfig::default(),
             algorithm_policy: AlgorithmPolicy::default(),
             replay_cache: Arc::new(InMemoryReplayCache::new()),
+            logout_replay_cache: Arc::new(InMemoryReplayCache::new()),
+            max_logout_request_age_seconds: 300,
             want_assertions_signed: true,
             name_id_format: None,
             allow_create: false,
@@ -362,6 +370,18 @@ impl SpConfig {
     /// Set a custom replay cache.
     pub fn with_replay_cache(mut self, cache: Arc<dyn ReplayCache>) -> Self {
         self.replay_cache = cache;
+        self
+    }
+
+    /// Set the dedicated LogoutRequest replay cache.
+    pub fn with_logout_replay_cache(mut self, cache: Arc<dyn ReplayCache>) -> Self {
+        self.logout_replay_cache = cache;
+        self
+    }
+
+    /// Set the maximum accepted age of incoming LogoutRequests.
+    pub fn with_max_logout_request_age_seconds(mut self, seconds: u64) -> Self {
+        self.max_logout_request_age_seconds = seconds;
         self
     }
 }
@@ -414,8 +434,16 @@ pub struct IdpConfig {
     pub session_store: Option<Arc<dyn SessionStore>>,
 
     /// Artifact store for HTTP Artifact binding resolution.
-    /// If None, artifact resolution returns an error response.
+    /// If None, artifact resolution returns an error response. Ready-handler
+    /// users must populate it through [`ArtifactStore::store_for_recipient`];
+    /// legacy unbound `store` entries deliberately cannot be resolved here.
     pub artifact_store: Option<Arc<dyn ArtifactStore + Send + Sync>>,
+
+    /// Dedicated replay cache for incoming LogoutRequest IDs.
+    pub logout_replay_cache: Arc<dyn ReplayCache>,
+
+    /// Maximum accepted age of an incoming LogoutRequest.
+    pub max_logout_request_age_seconds: u64,
 
     /// Service providers this IdP trusts statically. The ready SSO/SLO/artifact
     /// handlers fail closed when the relevant trust material is absent: an
@@ -430,13 +458,6 @@ pub struct IdpConfig {
     /// the resolver fetches and signature-verifies SP metadata by `entityID` at
     /// request time. Without either source, the ready handlers fail closed.
     pub sp_resolver: Option<Arc<dyn TrustedSpResolver>>,
-
-    /// Escape hatch for deployments that authenticate the SAML SOAP back-channel
-    /// and front-channel at the transport layer (e.g. mutual TLS) instead of via
-    /// message signatures. When `false` (the default), the ready artifact and SLO
-    /// handlers require a signature from a trusted SP before acting. Only set
-    /// this `true` if the transport already authenticates the requester.
-    pub allow_unauthenticated_backchannel: bool,
 }
 
 impl IdpConfig {
@@ -456,9 +477,10 @@ impl IdpConfig {
             signing_cert_b64: None,
             session_store: None,
             artifact_store: None,
+            logout_replay_cache: Arc::new(InMemoryReplayCache::new()),
+            max_logout_request_age_seconds: 300,
             trusted_sps: Vec::new(),
             sp_resolver: None,
-            allow_unauthenticated_backchannel: false,
         }
     }
 
@@ -501,6 +523,18 @@ impl IdpConfig {
     /// Set the artifact store for HTTP Artifact binding resolution.
     pub fn with_artifact_store(mut self, store: Arc<dyn ArtifactStore + Send + Sync>) -> Self {
         self.artifact_store = Some(store);
+        self
+    }
+
+    /// Set the dedicated LogoutRequest replay cache.
+    pub fn with_logout_replay_cache(mut self, cache: Arc<dyn ReplayCache>) -> Self {
+        self.logout_replay_cache = cache;
+        self
+    }
+
+    /// Set the maximum accepted age of incoming LogoutRequests.
+    pub fn with_max_logout_request_age_seconds(mut self, seconds: u64) -> Self {
+        self.max_logout_request_age_seconds = seconds;
         self
     }
 
@@ -553,30 +587,6 @@ impl IdpConfig {
         self
     }
 
-    /// Opt into transport-authenticated back-channel/front-channel operation
-    /// (builder style).
-    ///
-    /// When set to `true` *and* no trusted SPs are registered, the ready SLO and
-    /// artifact-resolution handlers skip the message-signature requirement,
-    /// trusting that the transport (e.g. mutual TLS) has already authenticated
-    /// the requester. Leave this at its default (`false`) unless that is
-    /// genuinely the case — otherwise the endpoints accept unauthenticated
-    /// destructive requests. See
-    /// [`allow_unauthenticated_backchannel`](IdpConfig::allow_unauthenticated_backchannel).
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use gamlastan_actix::IdpConfig;
-    /// // Deployment terminates mutual TLS in front of the IdP.
-    /// let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
-    ///     .allow_unauthenticated_backchannel(true);
-    /// ```
-    pub fn allow_unauthenticated_backchannel(mut self, allow: bool) -> Self {
-        self.allow_unauthenticated_backchannel = allow;
-        self
-    }
-
     /// Look up a registered trusted SP's SSO descriptor by `entityID`.
     ///
     /// Returns `None` when no SP with that entityID has been registered via
@@ -606,10 +616,8 @@ impl IdpConfig {
     /// certificates, and the verifier inherits the configured `ds:Object`
     /// (E91) rejection policy.
     ///
-    /// Returns `None` when no trusted SP exposes a usable signing certificate —
-    /// in which case the caller fails closed unless
-    /// [`allow_unauthenticated_backchannel`](IdpConfig::allow_unauthenticated_backchannel)
-    /// is set. An empty result deliberately does not distinguish "no SPs
+    /// Returns `None` when no trusted SP exposes a usable signing certificate.
+    /// An empty result deliberately does not distinguish "no SPs
     /// registered" from "registered SPs had unparseable KeyInfo": both mean
     /// "cannot authenticate the requester", and both must fail closed.
     ///

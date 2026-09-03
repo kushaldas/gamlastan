@@ -20,6 +20,7 @@ use crate::metadata::types::role_descriptor::SsoDescriptorBase;
 
 use crate::profiles::error::ProfileError;
 use crate::profiles::session::SessionParticipant;
+use crate::security::replay::ReplayCache;
 
 /// Logout reason URIs.
 pub mod reason {
@@ -120,7 +121,7 @@ pub fn create_idp_propagation_request(
         format: participant.name_id_format.clone(),
         name_qualifier: participant.name_qualifier.clone(),
         sp_name_qualifier: participant.sp_name_qualifier.clone(),
-        sp_provided_id: None,
+        sp_provided_id: participant.sp_provided_id.clone(),
     };
 
     LogoutRequest {
@@ -519,8 +520,10 @@ pub fn validate_logout_request(
 
     // Check NotOnOrAfter if present
     if let Some(not_on_or_after) = request.not_on_or_after {
-        let skew = TimeDelta::seconds(clock_skew_seconds as i64);
-        if now - skew >= not_on_or_after {
+        let earliest_accepted = now
+            .checked_sub_signed(safe_duration(clock_skew_seconds))
+            .unwrap_or(DateTime::<Utc>::MIN_UTC);
+        if earliest_accepted >= not_on_or_after {
             return Err(ProfileError::Other(format!(
                 "LogoutRequest expired: NotOnOrAfter={not_on_or_after}, now={now}"
             )));
@@ -528,6 +531,77 @@ pub fn validate_logout_request(
     }
 
     Ok(())
+}
+
+/// Validate a LogoutRequest and atomically enforce freshness and one-time use.
+///
+/// This is the stateful entry point for handlers that can mutate sessions. The
+/// older [`validate_logout_request`] remains available for callers that manage
+/// replay and freshness in an outer, compatibility-specific layer.
+pub fn validate_logout_request_with_replay(
+    request: &LogoutRequest,
+    expected_issuer: &str,
+    signature_verified: bool,
+    now: DateTime<Utc>,
+    clock_skew_seconds: u64,
+    max_request_age_seconds: u64,
+    replay_cache: &dyn ReplayCache,
+) -> Result<(), ProfileError> {
+    validate_logout_request(
+        request,
+        expected_issuer,
+        signature_verified,
+        now,
+        clock_skew_seconds,
+    )?;
+
+    let skew = safe_duration(clock_skew_seconds);
+    let max_age = safe_duration(max_request_age_seconds);
+    let latest_future = now
+        .checked_add_signed(skew)
+        .unwrap_or(DateTime::<Utc>::MAX_UTC);
+    if request.issue_instant > latest_future {
+        return Err(ProfileError::Other(
+            "LogoutRequest IssueInstant is in the future beyond accepted clock skew".to_string(),
+        ));
+    }
+
+    let oldest_accepted = now
+        .checked_sub_signed(max_age)
+        .and_then(|value| value.checked_sub_signed(skew))
+        .unwrap_or(DateTime::<Utc>::MIN_UTC);
+    if request.issue_instant <= oldest_accepted {
+        return Err(ProfileError::Other(format!(
+            "LogoutRequest is older than the maximum accepted age of {max_request_age_seconds}s"
+        )));
+    }
+
+    let age_expiry = request
+        .issue_instant
+        .checked_add_signed(max_age)
+        .and_then(|value| value.checked_add_signed(skew))
+        .unwrap_or(DateTime::<Utc>::MAX_UTC);
+    let expiry = request
+        .not_on_or_after
+        .and_then(|value| value.checked_add_signed(skew))
+        .map_or(age_expiry, |declared| declared.min(age_expiry));
+
+    // Scope IDs by the authenticated issuer. A shared cache must not let one
+    // trusted peer reserve an ID and cause another peer's request to be
+    // rejected as a replay.
+    let replay_key = format!("logout-request\0{expected_issuer}\0{}", request.id);
+    if !replay_cache.check_and_insert(&replay_key, expiry) {
+        return Err(ProfileError::Other(format!(
+            "LogoutRequest replay detected for ID {}",
+            request.id
+        )));
+    }
+
+    Ok(())
+}
+
+fn safe_duration(seconds: u64) -> TimeDelta {
+    TimeDelta::try_seconds(i64::try_from(seconds).unwrap_or(i64::MAX)).unwrap_or(TimeDelta::MAX)
 }
 
 #[cfg(test)]
@@ -572,6 +646,7 @@ mod tests {
             ),
             name_qualifier: None,
             sp_name_qualifier: None,
+            sp_provided_id: None,
             session_indexes: vec!["_sess1".to_string()],
             slo_url: Some("https://sp.example.com/slo".to_string()),
             slo_binding: None,
@@ -637,6 +712,133 @@ mod tests {
         let req = create_sp_logout_request(&options).unwrap();
         let result = validate_logout_request(&req, "https://sp.example.com", true, Utc::now(), 180);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn logout_request_replay_is_rejected() {
+        let now = Utc::now();
+        let req = create_sp_logout_request(&SpLogoutRequestOptions {
+            sp_entity_id: "https://sp.example.com".to_string(),
+            name_id: make_name_id(),
+            session_indexes: vec!["_session".to_string()],
+            reason: None,
+            destination: None,
+            not_on_or_after: Some(now + TimeDelta::minutes(5)),
+        })
+        .unwrap();
+        let cache = crate::security::replay::InMemoryReplayCache::new();
+
+        assert!(validate_logout_request_with_replay(
+            &req,
+            "https://sp.example.com",
+            true,
+            now,
+            180,
+            300,
+            &cache,
+        )
+        .is_ok());
+        assert!(validate_logout_request_with_replay(
+            &req,
+            "https://sp.example.com",
+            true,
+            now,
+            180,
+            300,
+            &cache,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("replay"));
+    }
+
+    #[test]
+    fn logout_request_age_and_future_issue_instant_are_bounded() {
+        let now = Utc::now();
+        let cache = crate::security::replay::InMemoryReplayCache::new();
+        let mut req = create_sp_logout_request(&SpLogoutRequestOptions {
+            sp_entity_id: "https://sp.example.com".to_string(),
+            name_id: make_name_id(),
+            session_indexes: vec![],
+            reason: None,
+            destination: None,
+            not_on_or_after: Some(now + TimeDelta::hours(1)),
+        })
+        .unwrap();
+        req.issue_instant = now - TimeDelta::minutes(10);
+        assert!(validate_logout_request_with_replay(
+            &req,
+            "https://sp.example.com",
+            true,
+            now,
+            30,
+            300,
+            &cache,
+        )
+        .is_err());
+
+        req.issue_instant = now - TimeDelta::seconds(330);
+        assert!(validate_logout_request_with_replay(
+            &req,
+            "https://sp.example.com",
+            true,
+            now,
+            30,
+            300,
+            &cache,
+        )
+        .is_err());
+
+        req.issue_instant = now + TimeDelta::minutes(2);
+        assert!(validate_logout_request_with_replay(
+            &req,
+            "https://sp.example.com",
+            true,
+            now,
+            30,
+            300,
+            &cache,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn logout_replay_ids_are_scoped_by_authenticated_issuer() {
+        let now = Utc::now();
+        let cache = crate::security::replay::InMemoryReplayCache::new();
+        let mut first = create_sp_logout_request(&SpLogoutRequestOptions {
+            sp_entity_id: "https://first-sp.example.com".to_string(),
+            name_id: make_name_id(),
+            session_indexes: vec![],
+            reason: None,
+            destination: None,
+            not_on_or_after: Some(now + TimeDelta::minutes(5)),
+        })
+        .unwrap();
+        first.id = "_same-id".to_string();
+        let mut second = first.clone();
+        second.issuer = Some(Issuer::entity("https://second-sp.example.com"));
+
+        assert!(validate_logout_request_with_replay(
+            &first,
+            "https://first-sp.example.com",
+            true,
+            now,
+            180,
+            300,
+            &cache,
+        )
+        .is_ok());
+        assert!(validate_logout_request_with_replay(
+            &second,
+            "https://second-sp.example.com",
+            true,
+            now,
+            180,
+            300,
+            &cache,
+        )
+        .is_ok());
     }
 
     #[test]

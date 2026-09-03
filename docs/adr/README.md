@@ -52,3 +52,4 @@ rewriting history (mark the old one `Superseded by NNNN`).
 | [0041](0041-bound-untrusted-resource-state.md) | Bound untrusted resource state | Accepted |
 | [0042](0042-complete-inbound-protocol-validation.md) | Complete inbound protocol validation | Accepted |
 | [0043](0043-saml-verification-algorithm-policy.md) | Enforce algorithms at the SAML verification boundary | Accepted |
+| [0044](0044-bind-security-state-to-acceptance-context.md) | Bind security state to its acceptance context | Accepted |

@@ -215,26 +215,28 @@ pub fn parse_secure_metadata(xml: &str) -> Result<Document<'_>, uppsala::XmlErro
 /// prevent consumers from observing only the first text node of signed data.
 fn reject_split_metadata_text(doc: &Document<'_>) -> Result<(), uppsala::XmlError> {
     for parent in doc.descendants(doc.root()) {
-        let children = doc.children(parent);
-        for (index, child) in children.iter().enumerate() {
-            if !matches!(
-                doc.node_kind(*child),
+        let mut saw_meaningful_text = false;
+        let mut separator_after_text = false;
+        for child in doc.children(parent) {
+            match doc.node_kind(child) {
+                Some(NodeKind::Text(value) | NodeKind::CData(value))
+                    if !value.trim().is_empty() =>
+                {
+                    if separator_after_text {
+                        return Err(uppsala::XmlError::well_formedness(
+                            "metadata comment or processing instruction split element text",
+                            0,
+                            0,
+                        ));
+                    }
+                    saw_meaningful_text = true;
+                }
                 Some(NodeKind::Comment(_) | NodeKind::ProcessingInstruction(_))
-            ) {
-                continue;
-            }
-            let meaningful_text = |id| match doc.node_kind(id) {
-                Some(NodeKind::Text(value) | NodeKind::CData(value)) => !value.trim().is_empty(),
-                _ => false,
-            };
-            if children[..index].iter().copied().any(meaningful_text)
-                && children[index + 1..].iter().copied().any(meaningful_text)
-            {
-                return Err(uppsala::XmlError::well_formedness(
-                    "metadata comment or processing instruction split element text",
-                    0,
-                    0,
-                ));
+                    if saw_meaningful_text =>
+                {
+                    separator_after_text = true;
+                }
+                _ => {}
             }
         }
     }
@@ -391,6 +393,15 @@ mod parse_secure_tests {
         let xml = "<AdditionalMetadataLocation>https://safe.example/<!--x-->evil</AdditionalMetadataLocation>";
         let err = parse_secure_metadata(xml).expect_err("split metadata text must be rejected");
         assert!(err.to_string().contains("split element text"));
+    }
+
+    #[test]
+    fn metadata_many_structural_comments_are_scanned_linearly() {
+        let comments = "<!--x-->".repeat(10_000);
+        let xml = format!(
+            r#"<md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" entityID="https://sp.example.com">{comments}</md:EntityDescriptor>"#
+        );
+        assert!(parse_secure_metadata(&xml).is_ok());
     }
 
     #[test]

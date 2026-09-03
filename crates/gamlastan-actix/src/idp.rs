@@ -423,52 +423,56 @@ async fn idp_slo(
             // check that produced `slo_authorized`, so the equality check inside
             // `validate_logout_request` is already established. The remaining
             // value of the call is the NameID and NotOnOrAfter validation.
-            logout::validate_logout_request(
+            logout::validate_logout_request_with_replay(
                 &logout_req,
                 slo_issuer.unwrap_or_default(),
                 slo_authorized.message_authenticated(),
                 now,
                 config.security.clock_skew_seconds,
+                config.max_logout_request_age_seconds,
+                config.logout_replay_cache.as_ref(),
             )
             .map_err(SamlActixError::Profile)?;
 
             // Propagate logout to session participants via the SessionStore
             if let Some(ref session_store) = config.session_store {
                 use gamlastan::core::assertion::name_id::NameIdOrEncryptedId;
-                let name_id_value = match &logout_req.name_id {
-                    NameIdOrEncryptedId::NameId(nid) => nid.value.as_str(),
-                    NameIdOrEncryptedId::EncryptedId(_) => "",
+                let request_name_id = match &logout_req.name_id {
+                    NameIdOrEncryptedId::NameId(nid) => nid,
+                    NameIdOrEncryptedId::EncryptedId(_) => {
+                        return Err(SamlActixError::Profile(
+                            gamlastan::profiles::ProfileError::AssertionValidation(
+                                "ready IdP SLO cannot correlate an encrypted NameID; decrypt it in a custom handler"
+                                    .into(),
+                            ),
+                        ));
+                    }
                 };
 
-                if !name_id_value.is_empty() {
-                    let sessions = session_store.get_sessions_by_name_id(name_id_value);
+                let requester_entity_id = slo_issuer.unwrap_or_default();
+                let sessions = session_store.get_sessions_for_participant(
+                    requester_entity_id,
+                    request_name_id,
+                    &logout_req.session_indexes,
+                );
 
-                    for session in &sessions {
-                        // Build LogoutRequest for each participant (except the requester)
-                        let requester_entity_id = logout_req
-                            .issuer
-                            .as_ref()
-                            .map(|i| i.value.as_str())
-                            .unwrap_or("");
-
-                        for participant in &session.participants {
-                            if participant.entity_id == requester_entity_id {
-                                continue; // Don't send back to the requester
-                            }
-                            let propagation_req = logout::create_idp_propagation_request(
-                                &config.entity_id,
-                                participant,
-                            );
-                            let _propagation_xml = propagation_req.to_xml_string().ok();
-                            // Note: actual HTTP delivery requires an async HTTP client.
-                            // The application should implement a SoapTransport or
-                            // use the propagation request XML directly. The SessionStore
-                            // tracks who needs logout; the application handles delivery.
+                for session in &sessions {
+                    // Build LogoutRequest for each participant (except the requester)
+                    for participant in &session.participants {
+                        if participant.entity_id == requester_entity_id {
+                            continue; // Don't send back to the requester
                         }
-
-                        // Clean up session
-                        session_store.destroy_session(&session.session_index);
+                        let propagation_req =
+                            logout::create_idp_propagation_request(&config.entity_id, participant);
+                        let _propagation_xml = propagation_req.to_xml_string().ok();
+                        // Note: actual HTTP delivery requires an async HTTP client.
+                        // The application should implement a SoapTransport or
+                        // use the propagation request XML directly. The SessionStore
+                        // tracks who needs logout; the application handles delivery.
                     }
+
+                    // Clean up session
+                    session_store.destroy_session(&session.session_index);
                 }
             }
 
@@ -528,10 +532,17 @@ async fn idp_artifact_resolve(
         None => None,
     };
     authorize_artifact_resolve(&config, &resolve, xml_str, ar_sp.as_ref())?;
+    let requester_entity_id = ar_issuer.ok_or_else(|| {
+        SamlActixError::Profile(gamlastan::profiles::ProfileError::AssertionValidation(
+            "ArtifactResolve missing Issuer required for artifact ownership".into(),
+        ))
+    })?;
 
     // Look up the artifact in the artifact store
     let response_xml = if let Some(ref artifact_store) = config.artifact_store {
-        match artifact_store.resolve_and_consume(&resolve.artifact) {
+        match artifact_store
+            .resolve_and_consume_for_requester(&resolve.artifact, requester_entity_id)
+        {
             Ok(Some(message_xml)) => {
                 // Build a successful ArtifactResponse wrapping the resolved SAML message
                 let art_response = artifact_resolution::create_artifact_response(
@@ -773,10 +784,6 @@ async fn resolve_trusted_sp(
 /// 3. the message must carry a valid signature from that SP, bound to the
 ///    request (delegated to [`verify_sp_message_signature`]).
 ///
-/// As an escape hatch, a deployment that authenticates the front channel at the
-/// transport layer may set [`IdpConfig::allow_unauthenticated_backchannel`], in
-/// which case the request is accepted without a message signature.
-///
 /// `sp` is the metadata resolved for `logout_req`'s issuer, or `None` if the
 /// issuer is unknown/untrusted. Returns an [`SloAuthorization`] proof when the
 /// logout is authorized, otherwise a 403-mapped [`SamlActixError::Profile`]
@@ -798,11 +805,6 @@ fn authorize_slo_request(
     xml_str: &str,
     sp: Option<&gamlastan::metadata::types::sp::SpSsoDescriptor>,
 ) -> Result<SloAuthorization, SamlActixError> {
-    // Transport-authenticated deployments opt out of message-signature checks.
-    if config.allow_unauthenticated_backchannel {
-        return Ok(SloAuthorization);
-    }
-
     // The issuer must resolve to trusted SP metadata.
     let issuer = logout_req.issuer.as_ref().map(|i| i.value.as_str());
     // Untrusted/missing issuer and Destination mismatch are authorization
@@ -854,10 +856,7 @@ impl SloAuthorization {
     /// The message-authentication flag for `logout::validate_logout_request`.
     ///
     /// This token exists only after a bound message signature verified against
-    /// trusted SP metadata, or after the deployment's explicit
-    /// [`IdpConfig::allow_unauthenticated_backchannel`] transport policy
-    /// accepted the message; either satisfies the validation layer's
-    /// authentication requirement.
+    /// trusted SP metadata.
     fn message_authenticated(self) -> bool {
         true
     }
@@ -877,9 +876,9 @@ impl SloAuthorization {
 /// It requires the `ArtifactResolve` `Issuer` to resolve to trusted SP metadata
 /// (`sp`, resolved by the handler from the static registry or the MDQ resolver)
 /// and the message to carry a valid, bound signature from that SP (delegated to
-/// [`verify_sp_message_signature`]). Deployments that authenticate the SOAP
-/// transport (e.g. mutual TLS) may instead set
-/// [`IdpConfig::allow_unauthenticated_backchannel`].
+/// [`verify_sp_message_signature`]). A generic transport-authenticated bypass
+/// cannot securely bind the claimed SAML Issuer to the transport principal, so
+/// the ready handler deliberately does not provide one.
 ///
 /// `sp` is the metadata resolved for `resolve`'s issuer, or `None` if the issuer
 /// is unknown/untrusted. Returns `Ok(())` when the requester is authorized,
@@ -899,11 +898,6 @@ fn authorize_artifact_resolve(
     xml_str: &str,
     sp: Option<&gamlastan::metadata::types::sp::SpSsoDescriptor>,
 ) -> Result<(), SamlActixError> {
-    // Transport-authenticated deployments opt out of message-signature checks.
-    if config.allow_unauthenticated_backchannel {
-        return Ok(());
-    }
-
     let issuer = resolve.issuer.as_ref().map(|i| i.value.as_str());
     // Untrusted/missing requester is an authentication failure on
     // attacker-controllable input → 403 (via ProfileError), not 500.
@@ -1178,16 +1172,6 @@ mod tests {
             artifact: "AAQAAD...".to_string(),
         };
         assert!(authorize_artifact_resolve(&config, &resolve, "<ArtifactResolve/>", None).is_err());
-    }
-
-    #[test]
-    fn test_backchannel_opt_in_allows_unauthenticated() {
-        // The explicit transport-auth opt-in (mTLS deployments) bypasses the
-        // message-signature requirement.
-        let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
-            .allow_unauthenticated_backchannel(true);
-        let req = logout_request(Some("https://sp.example.com"));
-        assert!(authorize_slo_request(&config, &req, "<LogoutRequest/>", None).is_ok());
     }
 
     #[actix_web::test]

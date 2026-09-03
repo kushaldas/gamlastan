@@ -152,6 +152,7 @@ fn validate_enveloped_algorithm_policy(
 /// that each signed reference target is either the document root, an ancestor of the
 /// `<Signature>`, or a sibling of the `<Signature>`. This prevents XML Signature
 /// Wrapping attacks where signed content is moved to an unexpected position.
+#[derive(Clone)]
 pub struct SamlVerifier {
     keys_manager: KeysManager,
     /// Signature and reference-digest algorithms accepted before crypto dispatch.

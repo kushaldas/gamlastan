@@ -7,6 +7,20 @@ where needed to correct protocol handling.
 
 ## [0.9.0] - 2026-09-03
 
+### Added
+
+- Added recipient-aware `ArtifactStore::store_for_recipient` and
+  `resolve_and_consume_for_requester` operations. Their defaults fail closed so
+  legacy stores cannot accidentally serve an artifact to the wrong SP.
+- Added participant-aware session lookup, including SP entity ID, full NameID
+  (with `SPProvidedID`), and optional SessionIndex matching.
+- Added stateful LogoutRequest freshness and replay validation, configurable
+  logout replay caches and maximum request ages for the ready Actix handlers,
+  and the required Actix `SloCallback` / `SpLogoutEvent` integration point for
+  invalidating local SP sessions.
+- Added `SecurityConfig::allow_unsolicited_responses`. It defaults to `false`;
+  deployments that intentionally support IdP-initiated SSO must opt in.
+
 ### Changed
 
 - Upgraded the XML-security stack from `bergshamra` 0.8.0 to 0.9.0 across all
@@ -20,6 +34,18 @@ where needed to correct protocol handling.
 - Suppressed `RUSTSEC-2026-0258` in the CI audit gate while Actix HTTP remains
   pinned to the affected `h2` 0.3 line; the exception is scoped to that advisory
   and should be removed when Actix adopts `h2` 0.4.16 or newer.
+- **Breaking:** ready Actix SP SLO routes now require an application-provided
+  `SloCallback`; a successful protocol response is no longer returned without
+  first notifying the application to invalidate its local session.
+- **Breaking:** `SessionParticipant` now includes `sp_provided_id`. Custom
+  `SessionStore` implementations should override `get_sessions_for_participant`
+  when their principal index differs from the participant NameID.
+- **Breaking:** removed `IdpConfig::allow_unauthenticated_backchannel`. The
+  generic bypass could not prove that a transport identity matched the claimed
+  SAML Issuer; custom mutual-TLS handlers must perform that binding explicitly.
+- Custom artifact stores used with the ready IdP must issue artifacts through
+  `store_for_recipient` and atomically enforce the same recipient in
+  `resolve_and_consume_for_requester`.
 
 ### Security
 
@@ -28,6 +54,24 @@ where needed to correct protocol handling.
   or SHA-512 and SHA-256/384/512 digests; SHA-1 and other legacy methods now
   require an exact custom allowlist or explicit `AlgorithmPolicy::permissive`.
   Bergshamra retains its full xmlsec-compatible algorithm support.
+- Replaced the metadata comment/processing-instruction split-text check with a
+  linear scan, preventing quadratic CPU consumption before MDQ signature
+  verification while preserving legitimate structural metadata comments.
+- Assertion replay entries now remain live through the complete accepted clock
+  skew window instead of expiring while an assertion is still valid.
+- Artifact resolution now binds atomic lookup and consumption to the
+  authenticated requesting SP, preventing a trusted peer from resolving or
+  burning another SP's artifact.
+- Ready IdP SLO now destroys only sessions containing the authenticated SP as an
+  exact participant, with full NameID and requested SessionIndex matching.
+- Ready SP and IdP SLO handlers now reject stale, future-dated, and replayed
+  LogoutRequests using issuer-scoped replay keys. Ready SP SLO also requires
+  local-session invalidation before reporting protocol success.
+- Unsolicited SSO responses are rejected by default at the shared response
+  validation boundary. Explicitly enabled unsolicited responses must still omit
+  `InResponseTo` and pass all signature, audience, recipient, time, and replay
+  checks.
+- See ADR 0044 for the state-binding decisions and migration consequences.
 
 ## [0.8.0] - 2026-08-03
 
