@@ -114,3 +114,8 @@ browser-bound LogoutResponse correlation, Redirect-only and mixed-signature
 IdP SLO, omitted/explicit unspecified NameID equivalence, bounded replay-cache
 retention, atomic participant-bound session removal, signed SP-initiated
 LogoutRequests, and PySAML2 `allow_unsolicited` behavior.
+
+SP-initiated logout validation includes:
+
+- `sp_logout_requires_signing_and_authenticated_session_callbacks`
+- `sp_logout_binds_request_id_to_emitted_browser_cookie`
