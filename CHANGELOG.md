@@ -57,8 +57,11 @@ where needed to correct protocol handling.
 - Replaced the metadata comment/processing-instruction split-text check with a
   linear scan, preventing quadratic CPU consumption before MDQ signature
   verification while preserving legitimate structural metadata comments.
-- Assertion replay entries now remain live through the complete accepted clock
-  skew window instead of expiring while an assertion is still valid.
+- Assertion replay entries now remain live through the complete acceptance
+  window, including clock skew and future IssueInstant fallback lifetimes.
+  Assertion IssueInstant values beyond accepted clock skew are rejected, and
+  the in-memory replay cache prunes expired distinct IDs without scanning its
+  live map on every insertion.
 - Artifact resolution now binds atomic lookup and consumption to the
   authenticated requesting SP, preventing a trusted peer from resolving or
   burning another SP's artifact.

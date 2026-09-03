@@ -1,10 +1,15 @@
 # ADR 0029 - Solicited responses require a present, matching InResponseTo
 
-- **Status:** Accepted
+- **Status:** Superseded by 0044
 - **Date:** 2026-06-28
 - **Deciders:** gamlastan maintainers
 - **Spec:** SAML 2.0 Core / Profiles, CWE-345 / CWE-294 (capture-replay)
 - **Implementation:** `crates/gamlastan/src/profiles/artifact_resolution.rs`, `crates/gamlastan/src/profiles/name_id_mgmt.rs`, `crates/gamlastan/src/profiles/name_id_mapping.rs`, `crates/gamlastan/src/profiles/assertion_query.rs`, `crates/gamlastan/src/security/validation.rs`
+
+> **Superseded by ADR 0044.** ADR 0044 carries forward the solicited-response and
+> dangling-correlation rules below while replacing the decision to accept
+> genuinely unsolicited responses unconditionally; they now require an explicit
+> secure-policy opt-in.
 
 ## Context
 

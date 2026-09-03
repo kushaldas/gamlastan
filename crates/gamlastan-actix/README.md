@@ -16,7 +16,7 @@ Three layers of abstraction:
 
 ```rust,no_run
 use actix_web::{web, App, HttpServer};
-use gamlastan_actix::{SpConfig, sp::configure_sp};
+use gamlastan_actix::{SloCallback, SpConfig, sp::configure_sp};
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -32,10 +32,16 @@ async fn main() -> std::io::Result<()> {
     .with_metadata_url("https://sp.example.com/metadata");
 
     let config = web::Data::new(sp_config);
+    let slo_callback: SloCallback = Box::new(|event, request| {
+        let _ = (event, request);
+        // Invalidate the matching local application session here.
+    });
+    let slo_callback = web::Data::new(slo_callback);
 
     HttpServer::new(move || {
         App::new()
             .app_data(config.clone())
+            .app_data(slo_callback.clone())
             .configure(configure_sp)
     })
     .bind("0.0.0.0:8080")?
@@ -51,8 +57,8 @@ async fn main() -> std::io::Result<()> {
 > SP served over plain HTTP — including local development — never receives the
 > cookie back and every solicited response is rejected at the ACS with
 > "InResponseTo does not match". Terminate TLS in front of the SP (or serve
-> HTTPS directly) in every environment. IdP-initiated (unsolicited) responses
-> are unaffected.
+> HTTPS directly) in every environment. IdP-initiated responses must be enabled
+> explicitly with `SecurityConfig::allow_unsolicited_responses`.
 
 ## IdP Quick Start
 

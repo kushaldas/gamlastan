@@ -14,7 +14,8 @@ use actix_web::{web, HttpRequest, HttpResponse};
 use chrono::{DateTime, Utc};
 
 use gamlastan::bindings::relay_state::RelayState;
-use gamlastan::core::assertion::name_id::NameId;
+use gamlastan::core::assertion::name_id::{NameId, NameIdOrEncryptedId};
+use gamlastan::core::protocol::logout::LogoutRequest;
 use gamlastan::crypto::signer::SamlSigner;
 use gamlastan::profiles::artifact_resolution;
 use gamlastan::profiles::logout;
@@ -407,9 +408,8 @@ async fn idp_slo(
             // request lets anyone who guesses a NameID force-logout a victim
             // (CWE-306/CWE-862). Require the LogoutRequest to be signed by a
             // trusted SP, carry a trusted issuer, and (if present) target this
-            // IdP's SLO endpoint — unless the deployment authenticates the
-            // transport and explicitly opted in. Resolve the issuer's metadata
-            // (static registry or MDQ resolver) before the synchronous check.
+            // IdP's SLO endpoint. Resolve the issuer's metadata (static registry
+            // or MDQ resolver) before the synchronous check.
             let slo_issuer = logout_req.issuer.as_ref().map(|i| i.value.as_str());
             let slo_sp = match slo_issuer {
                 Some(id) => resolve_trusted_sp(&config, id).await,
@@ -417,6 +417,11 @@ async fn idp_slo(
             };
             let slo_authorized =
                 authorize_slo_request(&config, &logout_req, xml_str, slo_sp.as_ref())?;
+            // The ready handler has no decryption context. Reject an encrypted
+            // identifier after authenticating the requester but before
+            // reserving replay state, regardless of whether session storage is
+            // configured.
+            let request_name_id = ready_idp_logout_name_id(&logout_req)?;
             let now = Utc::now();
             // `expected_issuer` is the request's own issuer: on the IdP side the
             // real issuer trust decision is the metadata resolution and signature
@@ -436,19 +441,6 @@ async fn idp_slo(
 
             // Propagate logout to session participants via the SessionStore
             if let Some(ref session_store) = config.session_store {
-                use gamlastan::core::assertion::name_id::NameIdOrEncryptedId;
-                let request_name_id = match &logout_req.name_id {
-                    NameIdOrEncryptedId::NameId(nid) => nid,
-                    NameIdOrEncryptedId::EncryptedId(_) => {
-                        return Err(SamlActixError::Profile(
-                            gamlastan::profiles::ProfileError::AssertionValidation(
-                                "ready IdP SLO cannot correlate an encrypted NameID; decrypt it in a custom handler"
-                                    .into(),
-                            ),
-                        ));
-                    }
-                };
-
                 let requester_entity_id = slo_issuer.unwrap_or_default();
                 let sessions = session_store.get_sessions_for_participant(
                     requester_entity_id,
@@ -501,6 +493,18 @@ async fn idp_slo(
     }
 }
 
+fn ready_idp_logout_name_id(request: &LogoutRequest) -> Result<&NameId, SamlActixError> {
+    match &request.name_id {
+        NameIdOrEncryptedId::NameId(name_id) => Ok(name_id),
+        NameIdOrEncryptedId::EncryptedId(_) => Err(SamlActixError::Profile(
+            gamlastan::profiles::ProfileError::AssertionValidation(
+                "ready IdP SLO cannot correlate an encrypted NameID; decrypt it in a custom handler"
+                    .into(),
+            ),
+        )),
+    }
+}
+
 /// IdP Artifact Resolution handler: resolve artifacts over SOAP back-channel.
 ///
 /// Expects a SOAP-wrapped ArtifactResolve request.
@@ -523,9 +527,8 @@ async fn idp_artifact_resolve(
     // back-channel; without authentication anyone who obtains a live artifact can
     // drain it (receiving the stored SAML message) or burn it to deny the
     // legitimate resolver (CWE-306). Require a signature from a trusted SP whose
-    // issuer matches, unless the deployment authenticates the transport (mTLS)
-    // and explicitly opted in. Resolve the issuer's metadata (static registry or
-    // MDQ resolver) before the synchronous check.
+    // issuer matches. Resolve the issuer's metadata (static registry or MDQ
+    // resolver) before the synchronous check.
     let ar_issuer = resolve.issuer.as_ref().map(|i| i.value.as_str());
     let ar_sp = match ar_issuer {
         Some(id) => resolve_trusted_sp(&config, id).await,
@@ -1044,7 +1047,7 @@ mod tests {
 
     use crate::config::TrustedSpResolver;
     use gamlastan::core::assertion::issuer::Issuer;
-    use gamlastan::core::assertion::name_id::{NameId as CoreNameId, NameIdOrEncryptedId};
+    use gamlastan::core::assertion::name_id::{EncryptedId, NameId as CoreNameId};
     use gamlastan::core::identifiers::SamlVersion;
     use gamlastan::core::protocol::artifact::ArtifactResolve;
     use gamlastan::core::protocol::logout::LogoutRequest;
@@ -1089,6 +1092,20 @@ mod tests {
             }),
             session_indexes: vec![],
         }
+    }
+
+    #[test]
+    fn encrypted_logout_name_id_is_rejected_without_session_store() {
+        let mut request = logout_request(Some("https://sp.example.com"));
+        assert!(ready_idp_logout_name_id(&request).is_ok());
+
+        request.name_id = NameIdOrEncryptedId::EncryptedId(EncryptedId {
+            raw: b"<saml:EncryptedID/>".to_vec(),
+        });
+        assert!(matches!(
+            ready_idp_logout_name_id(&request),
+            Err(SamlActixError::Profile(_))
+        ));
     }
 
     #[test]

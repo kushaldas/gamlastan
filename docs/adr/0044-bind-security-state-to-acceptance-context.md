@@ -50,13 +50,16 @@ transport peer to a claimed SAML issuer.
    it only after trust, freshness, replay, destination, and correlation checks,
    and before returning protocol success. This callback is the application
    boundary that invalidates its server-side session.
-7. Reject unsolicited Web SSO by default. `SecurityConfig` provides an explicit
+7. Supersede ADR 0029 while retaining its solicited-response and dangling-
+   correlation requirements. Reject unsolicited Web SSO by default.
+   `SecurityConfig` provides an explicit
    `allow_unsolicited_responses` opt-in, and the core profile returns
-   `UnsolicitedNotAllowed`. This amends ADR 0029's unsolicited-response choice.
-8. Ready destructive IdP handlers always require a signature bound to trusted
-   SP metadata. A transport-only deployment must use a custom handler that maps
-   the authenticated transport identity to an entity ID. This amends ADR 0030's
-   generic bypass.
+   `UnsolicitedNotAllowed`.
+8. Supersede ADR 0030 while retaining its metadata trust, signature, issuer, and
+   destination requirements. Ready destructive IdP handlers always require a
+   signature bound to trusted SP metadata. A transport-only deployment must use
+   a custom handler that maps the authenticated transport identity to an entity
+   ID; the generic bypass is removed.
 9. The PySAML2 compatibility layer retains its public shapes and existing
    logout replay controls. It reads PySAML2's `allow_unsolicited` setting and
    maps missing correlation to `UnsolicitedResponse`; deployments that

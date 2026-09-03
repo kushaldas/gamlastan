@@ -87,6 +87,24 @@ pub enum SpLogoutEvent {
 /// protocol validation. It is intentionally infallible: protocol replay and
 /// correlation state is consumed atomically before invocation, so a fallible
 /// callback could leave a valid retry impossible while the session remained.
+///
+/// Register the exact boxed callback type as Actix application data:
+///
+/// ```rust,no_run
+/// use actix_web::web;
+/// use gamlastan_actix::SloCallback;
+///
+/// let callback: SloCallback = Box::new(|event, request| {
+///     let _ = (event, request);
+///     // Invalidate the matching local application session here.
+/// });
+/// let callback_data = web::Data::new(callback);
+/// // Register with `App::new().app_data(callback_data.clone())` before
+/// // calling `configure_sp`.
+/// ```
+///
+/// Actix application-data extraction is type-exact: register
+/// `web::Data<SloCallback>`, not `web::Data<Arc<SloCallback>>`.
 pub type SloCallback = Box<dyn Fn(SpLogoutEvent, &HttpRequest) + Send + Sync + 'static>;
 
 fn invalidate_local_sp_session(
