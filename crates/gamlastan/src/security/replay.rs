@@ -31,25 +31,31 @@ pub trait ReplayCache: Send + Sync {
 /// Suitable for single-process deployments. For distributed systems,
 /// implement `ReplayCache` with Redis/Memcached/database backing.
 pub struct InMemoryReplayCache {
-    entries: Mutex<HashMap<String, DateTime<Utc>>>,
+    state: Mutex<ReplayState>,
+}
+
+#[derive(Default)]
+struct ReplayState {
+    entries: HashMap<String, DateTime<Utc>>,
+    next_expiry: Option<DateTime<Utc>>,
 }
 
 impl InMemoryReplayCache {
     /// Create a new empty replay cache.
     pub fn new() -> Self {
         Self {
-            entries: Mutex::new(HashMap::new()),
+            state: Mutex::new(ReplayState::default()),
         }
     }
 
     /// Get the number of entries currently in the cache.
     pub fn len(&self) -> usize {
-        self.entries.lock().unwrap().len()
+        self.state.lock().unwrap().entries.len()
     }
 
     /// Check if the cache is empty.
     pub fn is_empty(&self) -> bool {
-        self.entries.lock().unwrap().is_empty()
+        self.state.lock().unwrap().entries.is_empty()
     }
 }
 
@@ -61,11 +67,21 @@ impl Default for InMemoryReplayCache {
 
 impl ReplayCache for InMemoryReplayCache {
     fn check_and_insert(&self, id: &str, expiry: DateTime<Utc>) -> bool {
-        let mut entries = self.entries.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         let now = Utc::now();
 
+        // Ready handlers insert automatically but do not have a maintenance
+        // loop. Use the earliest known expiry to avoid scanning the live map on
+        // every insertion while still pruning expired distinct IDs promptly.
+        if state.next_expiry.is_some_and(|next| next <= now) {
+            state
+                .entries
+                .retain(|_, existing_expiry| *existing_expiry > now);
+            state.next_expiry = state.entries.values().copied().min();
+        }
+
         // Check if the ID already exists and hasn't expired
-        if let Some(existing_expiry) = entries.get(id) {
+        if let Some(existing_expiry) = state.entries.get(id) {
             if *existing_expiry > now {
                 // ID exists and hasn't expired - this is a replay
                 return false;
@@ -73,15 +89,25 @@ impl ReplayCache for InMemoryReplayCache {
             // ID exists but has expired - treat as new
         }
 
+        // The caller may validate a message whose acceptance window has
+        // already ended. It is still a new ID, but retaining an already-due
+        // entry would keep next_expiry due and force a full-map cleanup scan on
+        // every repeated submission.
+        if expiry <= now {
+            return true;
+        }
+
         // Insert/update the entry
-        entries.insert(id.to_string(), expiry);
+        state.entries.insert(id.to_string(), expiry);
+        state.next_expiry = Some(state.next_expiry.map_or(expiry, |next| next.min(expiry)));
         true
     }
 
     fn cleanup(&self) {
-        let mut entries = self.entries.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         let now = Utc::now();
-        entries.retain(|_, expiry| *expiry > now);
+        state.entries.retain(|_, expiry| *expiry > now);
+        state.next_expiry = state.entries.values().copied().min();
     }
 }
 
@@ -119,6 +145,7 @@ mod tests {
         // Insert with an already-expired time
         let past_expiry = Utc::now() - TimeDelta::seconds(10);
         assert!(cache.check_and_insert("_assertion_1", past_expiry));
+        assert!(cache.is_empty());
         // Same ID should be accepted again because the previous entry expired
         let future_expiry = Utc::now() + TimeDelta::seconds(300);
         assert!(cache.check_and_insert("_assertion_1", future_expiry));
@@ -129,11 +156,51 @@ mod tests {
         let cache = InMemoryReplayCache::new();
         let past_expiry = Utc::now() - TimeDelta::seconds(10);
         let future_expiry = Utc::now() + TimeDelta::seconds(300);
-        cache.check_and_insert("_expired", past_expiry);
-        cache.check_and_insert("_valid", future_expiry);
+        {
+            let mut state = cache.state.lock().unwrap();
+            state.entries.insert("_valid".to_string(), future_expiry);
+            state.entries.insert("_expired".to_string(), past_expiry);
+            state.next_expiry = Some(past_expiry);
+        }
         assert_eq!(cache.len(), 2);
 
         cache.cleanup();
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn insertion_prunes_distinct_expired_ids() {
+        let cache = InMemoryReplayCache::new();
+        let past_expiry = Utc::now() - TimeDelta::seconds(10);
+        let future_expiry = Utc::now() + TimeDelta::seconds(300);
+        {
+            let mut state = cache.state.lock().unwrap();
+            state.entries.insert("_expired_1".to_string(), past_expiry);
+            state.entries.insert("_expired_2".to_string(), past_expiry);
+            state.next_expiry = Some(past_expiry);
+        }
+        cache.check_and_insert("_valid", future_expiry);
+
+        assert_eq!(cache.len(), 1);
+        assert!(!cache.check_and_insert("_valid", future_expiry));
+    }
+
+    #[test]
+    fn already_due_insertions_do_not_schedule_repeated_cleanup() {
+        let cache = InMemoryReplayCache::new();
+        let past_expiry = Utc::now() - TimeDelta::seconds(10);
+        let future_expiry = Utc::now() + TimeDelta::seconds(300);
+        assert!(cache.check_and_insert("_valid", future_expiry));
+
+        for index in 0..10 {
+            assert!(cache.check_and_insert(&format!("_expired_{index}"), past_expiry));
+        }
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.state.lock().unwrap().next_expiry, Some(future_expiry));
+
+        // A due expiry supplied for an ID that is already live must still be
+        // rejected as a replay before the no-retention fast path.
+        assert!(!cache.check_and_insert("_valid", past_expiry));
         assert_eq!(cache.len(), 1);
     }
 

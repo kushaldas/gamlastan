@@ -53,4 +53,3 @@ and Redirect binding signatures.
 - `test_slo_common_rejects_issuer_and_destination_mismatch`
 - `test_slo_logout_response_requires_matching_in_response_to`
 - `cargo test -p gamlastan-actix`
-

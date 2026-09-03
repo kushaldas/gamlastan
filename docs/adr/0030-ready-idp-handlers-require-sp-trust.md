@@ -1,10 +1,15 @@
 # ADR 0030 - Ready-made IdP handlers require SP trust and fail closed
 
-- **Status:** Accepted
+- **Status:** Superseded by 0044
 - **Date:** 2026-06-28
 - **Deciders:** gamlastan maintainers
 - **Spec:** SAML 2.0 Profiles (SSO, SLO, Artifact Resolution), CWE-346 / CWE-306 / CWE-862
 - **Implementation:** `crates/gamlastan-actix/src/config.rs`, `crates/gamlastan-actix/src/idp.rs`
+
+> **Superseded by ADR 0044.** ADR 0044 carries forward the metadata trust,
+> signature, issuer, and destination requirements below while removing the
+> generic `allow_unauthenticated_backchannel` escape hatch because it could not
+> bind a transport identity to the claimed SAML Issuer.
 
 ## Context
 

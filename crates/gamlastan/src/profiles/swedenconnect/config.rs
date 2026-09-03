@@ -139,6 +139,7 @@ impl SwedenConnectConfig {
             verify_recipient: true,
             // The Address check is optional per section 6.3.2.
             check_client_address: false,
+            allow_unsolicited_responses: self.accept_unsolicited,
         }
     }
 }

@@ -107,11 +107,70 @@ pub trait ArtifactStore {
         &self,
         artifact: &str,
     ) -> Result<Option<Vec<u8>>, crate::bindings::error::BindingError>;
+
+    /// Store an artifact bound to the SP entity ID allowed to resolve it.
+    ///
+    /// Existing stores compile unchanged, but fail closed until they implement
+    /// recipient-aware storage. Ready IdP handlers only use the bound API.
+    fn store_for_recipient(
+        &self,
+        _artifact: &str,
+        _recipient_entity_id: &str,
+        _message_xml: &[u8],
+    ) -> Result<(), crate::bindings::error::BindingError> {
+        Err(crate::bindings::error::BindingError::InvalidArtifact(
+            "artifact store does not implement recipient binding".to_string(),
+        ))
+    }
+
+    /// Resolve and consume an artifact only for its authenticated SP owner.
+    ///
+    /// A requester mismatch must return an error or `None` without consuming
+    /// the artifact, so the intended SP can still resolve it.
+    fn resolve_and_consume_for_requester(
+        &self,
+        _artifact: &str,
+        _requester_entity_id: &str,
+    ) -> Result<Option<Vec<u8>>, crate::bindings::error::BindingError> {
+        Err(crate::bindings::error::BindingError::InvalidArtifact(
+            "artifact store does not implement requester binding".to_string(),
+        ))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct LegacyArtifactStore;
+
+    impl ArtifactStore for LegacyArtifactStore {
+        fn store(
+            &self,
+            _artifact: &str,
+            _message_xml: &[u8],
+        ) -> Result<(), crate::bindings::error::BindingError> {
+            Ok(())
+        }
+
+        fn resolve_and_consume(
+            &self,
+            _artifact: &str,
+        ) -> Result<Option<Vec<u8>>, crate::bindings::error::BindingError> {
+            Ok(Some(b"legacy-unbound-message".to_vec()))
+        }
+    }
+
+    #[test]
+    fn legacy_artifact_stores_fail_closed_for_owner_aware_operations() {
+        let store = LegacyArtifactStore;
+        assert!(store
+            .store_for_recipient("artifact", "https://sp.example.com", b"message")
+            .is_err());
+        assert!(store
+            .resolve_and_consume_for_requester("artifact", "https://sp.example.com")
+            .is_err());
+    }
 
     /// Simple in-memory HTTP request for testing.
     struct TestRequest {

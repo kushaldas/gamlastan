@@ -15,7 +15,7 @@
 //! This layer validates decrypted assertions only. A response carrying only
 //! `EncryptedAssertion` elements must be decrypted before validation.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 
 use crate::core::assertion::types::Assertion;
 use crate::core::constants::{CM_BEARER, NAMEID_ENTITY, NAMEID_PERSISTENT};
@@ -245,8 +245,15 @@ impl<'a> AssertionValidator<'a> {
                 }
             }
             (None, None) => {
-                // Unsolicited response with no InResponseTo - OK
-                result.add(ValidationCheck::pass(3, "InResponseTo matches"));
+                if self.config.allow_unsolicited_responses {
+                    result.add(ValidationCheck::pass(3, "InResponseTo matches"));
+                } else {
+                    result.add(ValidationCheck::fail(
+                        3,
+                        "InResponseTo matches",
+                        "Unsolicited response is not allowed by configuration",
+                    ));
+                }
             }
             (Some(irt), None) => {
                 // The response claims to answer a request (it carries
@@ -623,11 +630,18 @@ impl<'a> AssertionValidator<'a> {
                 }
             }
             (None, None) => {
-                // Unsolicited - OK
-                result.add(ValidationCheck::pass(
-                    17,
-                    "SubjectConfirmation InResponseTo",
-                ));
+                if self.config.allow_unsolicited_responses {
+                    result.add(ValidationCheck::pass(
+                        17,
+                        "SubjectConfirmation InResponseTo",
+                    ));
+                } else {
+                    result.add(ValidationCheck::fail(
+                        17,
+                        "SubjectConfirmation InResponseTo",
+                        "Unsolicited response is not allowed by configuration",
+                    ));
+                }
             }
             (Some(irt), None) => {
                 // Dangling InResponseTo on the bearer SubjectConfirmationData: it
@@ -707,15 +721,42 @@ impl<'a> AssertionValidator<'a> {
         result: &mut ValidationResult,
     ) {
         if let Some(cache) = self.replay_cache {
-            // Use NotOnOrAfter as expiry, or fall back to max_assertion_age from now
-            let expiry = assertion
+            // The assertion remains acceptable through the configured clock
+            // skew, so retain its ID for that entire acceptance window too.
+            // Otherwise a replay just after the raw NotOnOrAfter would be
+            // accepted while validation still considers the assertion valid.
+            let skew = TimeDelta::try_seconds(
+                i64::try_from(self.config.clock_skew_seconds).unwrap_or(i64::MAX),
+            )
+            .unwrap_or(TimeDelta::MAX);
+            let max_age = TimeDelta::try_seconds(
+                i64::try_from(self.config.max_assertion_age_seconds).unwrap_or(i64::MAX),
+            )
+            .unwrap_or(TimeDelta::MAX);
+            let latest_accepted_issue_instant = params
+                .now
+                .checked_add_signed(skew)
+                .unwrap_or(DateTime::<Utc>::MAX_UTC);
+            let age_expiry = assertion
+                .issue_instant
+                .min(latest_accepted_issue_instant)
+                .checked_add_signed(max_age)
+                // `is_within_age_limit` compares whole seconds, so an
+                // assertion can remain acceptable for almost one more second
+                // beyond the nominal maximum age.
+                .and_then(|expiry| expiry.checked_add_signed(TimeDelta::seconds(1)))
+                .unwrap_or(DateTime::<Utc>::MAX_UTC);
+            let expiry = match assertion
                 .conditions
                 .as_ref()
                 .and_then(|c| c.not_on_or_after)
-                .unwrap_or_else(|| {
-                    params.now
-                        + chrono::TimeDelta::seconds(self.config.max_assertion_age_seconds as i64)
-                });
+            {
+                Some(expiry) => expiry
+                    .checked_add_signed(skew)
+                    .unwrap_or(DateTime::<Utc>::MAX_UTC)
+                    .min(age_expiry),
+                None => age_expiry,
+            };
 
             if cache.check_and_insert(&assertion.id, expiry) {
                 result.add(ValidationCheck::pass(20, "Assertion ID not replayed"));
@@ -919,7 +960,23 @@ impl<'a> AssertionValidator<'a> {
         issue_instant: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> ValidationCheck {
-        if is_within_age_limit(now, issue_instant, self.config.max_assertion_age_seconds) {
+        let skew = TimeDelta::try_seconds(
+            i64::try_from(self.config.clock_skew_seconds).unwrap_or(i64::MAX),
+        )
+        .unwrap_or(TimeDelta::MAX);
+        let latest_accepted = now
+            .checked_add_signed(skew)
+            .unwrap_or(DateTime::<Utc>::MAX_UTC);
+        if issue_instant > latest_accepted {
+            ValidationCheck::fail(
+                35,
+                "Assertion age within limit",
+                format!(
+                    "Assertion issued at {} is in the future beyond accepted clock skew of {}s",
+                    issue_instant, self.config.clock_skew_seconds
+                ),
+            )
+        } else if is_within_age_limit(now, issue_instant, self.config.max_assertion_age_seconds) {
             ValidationCheck::pass(35, "Assertion age within limit")
         } else {
             ValidationCheck::fail(
@@ -949,6 +1006,21 @@ mod tests {
     use crate::security::name_id::InMemoryPersistentIdStore;
     use crate::security::replay::InMemoryReplayCache;
     use chrono::TimeDelta;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecordingReplayCache {
+        expiry: Mutex<Option<DateTime<Utc>>>,
+    }
+
+    impl ReplayCache for RecordingReplayCache {
+        fn check_and_insert(&self, _id: &str, expiry: DateTime<Utc>) -> bool {
+            *self.expiry.lock().unwrap() = Some(expiry);
+            true
+        }
+
+        fn cleanup(&self) {}
+    }
 
     fn make_valid_response(now: chrono::DateTime<Utc>) -> Response {
         Response {
@@ -1561,6 +1633,7 @@ mod tests {
         let now = Utc::now();
         let config = SecurityConfig {
             require_signed_assertions: false,
+            allow_unsolicited_responses: true,
             ..SecurityConfig::default()
         };
         let replay_cache = InMemoryReplayCache::new();
@@ -1585,6 +1658,234 @@ mod tests {
 
         let result = validator.validate_response(&response, &params);
         assert!(result.is_valid(), "Failures: {:?}", result.failures());
+    }
+
+    #[test]
+    fn unsolicited_response_is_rejected_by_default() {
+        let now = Utc::now();
+        let config = SecurityConfig {
+            require_signed_assertions: false,
+            ..SecurityConfig::default()
+        };
+        let replay_cache = InMemoryReplayCache::new();
+        let validator = AssertionValidator::new(&config).with_replay_cache(&replay_cache);
+        let mut response = make_valid_response(now);
+        response.base.in_response_to = None;
+        response.assertions[0]
+            .subject
+            .as_mut()
+            .unwrap()
+            .subject_confirmations[0]
+            .subject_confirmation_data
+            .as_mut()
+            .unwrap()
+            .in_response_to = None;
+
+        let params = ValidationParams {
+            expected_request_id: None,
+            ..make_params(now)
+        };
+        let result = validator.validate_response(&response, &params);
+
+        assert!(!result.is_valid());
+        assert!(result.failures().iter().any(|check| {
+            (check.check_number == 3 || check.check_number == 17)
+                && check
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("Unsolicited"))
+        }));
+    }
+
+    #[test]
+    fn replay_entry_covers_the_accepted_clock_skew_window() {
+        let now = Utc::now();
+        let config = SecurityConfig {
+            require_signed_assertions: false,
+            clock_skew_seconds: 180,
+            ..SecurityConfig::default()
+        };
+        let replay_cache = InMemoryReplayCache::new();
+        let validator = AssertionValidator::new(&config).with_replay_cache(&replay_cache);
+        let mut response = make_valid_response(now);
+        response.assertions[0]
+            .conditions
+            .as_mut()
+            .unwrap()
+            .not_on_or_after = Some(now - TimeDelta::seconds(1));
+        let params = make_params(now);
+
+        let first = validator.validate_response(&response, &params);
+        assert!(first.is_valid(), "Failures: {:?}", first.failures());
+        let second = validator.validate_response(&response, &params);
+        assert!(second
+            .failures()
+            .iter()
+            .any(|check| check.check_number == 20));
+    }
+
+    #[test]
+    fn replay_fallback_covers_future_issue_instant_age_window() {
+        let now = Utc::now();
+        let issue_instant = now + TimeDelta::seconds(30);
+        let config = SecurityConfig {
+            require_signed_assertions: false,
+            max_assertion_age_seconds: 60,
+            ..SecurityConfig::default()
+        };
+        let replay_cache = RecordingReplayCache::default();
+        let validator = AssertionValidator::new(&config).with_replay_cache(&replay_cache);
+        let mut response = make_valid_response(now);
+        let assertion = &mut response.assertions[0];
+        assertion.issue_instant = issue_instant;
+        assertion.conditions.as_mut().unwrap().not_on_or_after = None;
+        let params = make_params(now);
+        let mut result = ValidationResult::new();
+
+        validator.check_replay(assertion, &params, &mut result);
+
+        assert!(result.is_valid());
+        assert_eq!(
+            *replay_cache.expiry.lock().unwrap(),
+            Some(issue_instant + TimeDelta::seconds(61))
+        );
+    }
+
+    #[test]
+    fn replay_conditions_expiry_is_capped_by_assertion_age() {
+        let now = Utc::now();
+        let config = SecurityConfig {
+            require_signed_assertions: false,
+            clock_skew_seconds: 180,
+            max_assertion_age_seconds: 60,
+            ..SecurityConfig::default()
+        };
+        let replay_cache = RecordingReplayCache::default();
+        let validator = AssertionValidator::new(&config).with_replay_cache(&replay_cache);
+        let mut response = make_valid_response(now);
+        let assertion = &mut response.assertions[0];
+        assertion.conditions.as_mut().unwrap().not_on_or_after = Some(DateTime::<Utc>::MAX_UTC);
+        let params = make_params(now);
+        let mut result = ValidationResult::new();
+
+        validator.check_replay(assertion, &params, &mut result);
+
+        assert!(result.is_valid());
+        assert_eq!(
+            *replay_cache.expiry.lock().unwrap(),
+            Some(now + TimeDelta::seconds(61))
+        );
+    }
+
+    #[test]
+    fn replay_long_finite_conditions_expiry_is_capped_by_assertion_age() {
+        let now = Utc::now();
+        let config = SecurityConfig {
+            require_signed_assertions: false,
+            clock_skew_seconds: 180,
+            max_assertion_age_seconds: 60,
+            ..SecurityConfig::default()
+        };
+        let replay_cache = RecordingReplayCache::default();
+        let validator = AssertionValidator::new(&config).with_replay_cache(&replay_cache);
+        let mut response = make_valid_response(now);
+        let assertion = &mut response.assertions[0];
+        assertion.conditions.as_mut().unwrap().not_on_or_after = Some(now + TimeDelta::days(365));
+        let params = make_params(now);
+        let mut result = ValidationResult::new();
+
+        validator.check_replay(assertion, &params, &mut result);
+
+        assert!(result.is_valid());
+        assert_eq!(
+            *replay_cache.expiry.lock().unwrap(),
+            Some(now + TimeDelta::seconds(61))
+        );
+    }
+
+    #[test]
+    fn replay_age_cap_uses_the_assertions_actual_issue_instant() {
+        let now = Utc::now();
+        let issue_instant = now - TimeDelta::seconds(59);
+        let config = SecurityConfig {
+            require_signed_assertions: false,
+            max_assertion_age_seconds: 60,
+            ..SecurityConfig::default()
+        };
+        let replay_cache = RecordingReplayCache::default();
+        let validator = AssertionValidator::new(&config).with_replay_cache(&replay_cache);
+        let mut response = make_valid_response(now);
+        let assertion = &mut response.assertions[0];
+        assertion.issue_instant = issue_instant;
+        assertion.conditions.as_mut().unwrap().not_on_or_after = Some(now + TimeDelta::days(365));
+        let params = make_params(now);
+        let mut result = ValidationResult::new();
+
+        validator.check_replay(assertion, &params, &mut result);
+
+        assert!(result.is_valid());
+        assert_eq!(
+            *replay_cache.expiry.lock().unwrap(),
+            Some(issue_instant + TimeDelta::seconds(61))
+        );
+    }
+
+    #[test]
+    fn replay_short_conditions_expiry_remains_authoritative() {
+        let now = Utc::now();
+        let config = SecurityConfig {
+            require_signed_assertions: false,
+            clock_skew_seconds: 5,
+            max_assertion_age_seconds: 300,
+            ..SecurityConfig::default()
+        };
+        let replay_cache = RecordingReplayCache::default();
+        let validator = AssertionValidator::new(&config).with_replay_cache(&replay_cache);
+        let mut response = make_valid_response(now);
+        let assertion = &mut response.assertions[0];
+        assertion.conditions.as_mut().unwrap().not_on_or_after = Some(now + TimeDelta::seconds(10));
+        let params = make_params(now);
+        let mut result = ValidationResult::new();
+
+        validator.check_replay(assertion, &params, &mut result);
+
+        assert!(result.is_valid());
+        assert_eq!(
+            *replay_cache.expiry.lock().unwrap(),
+            Some(now + TimeDelta::seconds(15))
+        );
+    }
+
+    #[test]
+    fn rejected_far_future_assertion_cannot_pin_replay_state_indefinitely() {
+        let now = Utc::now();
+        let config = SecurityConfig {
+            require_signed_assertions: false,
+            clock_skew_seconds: 180,
+            max_assertion_age_seconds: 60,
+            ..SecurityConfig::default()
+        };
+        let replay_cache = RecordingReplayCache::default();
+        let validator = AssertionValidator::new(&config).with_replay_cache(&replay_cache);
+        let mut response = make_valid_response(now);
+        let assertion = &mut response.assertions[0];
+        assertion.issue_instant = DateTime::<Utc>::MAX_UTC;
+        assertion.conditions.as_mut().unwrap().not_on_or_after = None;
+        let params = make_params(now);
+        let mut result = ValidationResult::new();
+
+        validator.check_replay(assertion, &params, &mut result);
+
+        assert!(result.is_valid());
+        assert_eq!(
+            *replay_cache.expiry.lock().unwrap(),
+            Some(now + TimeDelta::seconds(241))
+        );
+        assert!(
+            !validator
+                .check_assertion_age(assertion.issue_instant, now)
+                .passed
+        );
     }
 
     #[test]
@@ -1651,6 +1952,12 @@ mod tests {
 
         let old = now - TimeDelta::seconds(600);
         assert!(!validator.check_assertion_age(old, now).passed);
+
+        let within_skew = now + TimeDelta::seconds(120);
+        assert!(validator.check_assertion_age(within_skew, now).passed);
+
+        let beyond_skew = now + TimeDelta::seconds(181);
+        assert!(!validator.check_assertion_age(beyond_skew, now).passed);
     }
 
     /// Verifies that response validation executes and reports assertion-age check 35.

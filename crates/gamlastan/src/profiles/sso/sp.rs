@@ -221,6 +221,13 @@ pub fn process_response_with_verified_signatures(
         ));
     }
 
+    if response.base.in_response_to.is_none()
+        && expected_request_id.is_none()
+        && !config.allow_unsolicited_responses
+    {
+        return Err(ProfileError::UnsolicitedNotAllowed);
+    }
+
     ensure_processable_assertions(response, config)?;
 
     // Must have at least one plaintext assertion. EncryptedAssertion elements
@@ -671,6 +678,39 @@ mod tests {
     }
 
     #[test]
+    fn test_process_response_rejects_unsolicited_by_default() {
+        let response = Response {
+            base: ResponseBase {
+                id: "_resp1".to_string(),
+                version: SamlVersion::V2_0,
+                issue_instant: Utc::now(),
+                destination: None,
+                consent: None,
+                issuer: None,
+                has_signature: false,
+                in_response_to: None,
+                status: Status::success(),
+            },
+            assertions: vec![],
+            encrypted_assertions: vec![],
+        };
+        let replay_cache = InMemoryReplayCache::new();
+
+        let result = process_response(
+            &response,
+            &SecurityConfig::default(),
+            &replay_cache,
+            "https://sp.example.com",
+            "https://sp.example.com/acs",
+            None,
+            "https://idp.example.com",
+            Utc::now(),
+        );
+
+        assert!(matches!(result, Err(ProfileError::UnsolicitedNotAllowed)));
+    }
+
+    #[test]
     fn test_process_response_rejects_encrypted_only_response() {
         let response = Response {
             base: ResponseBase {
@@ -758,7 +798,10 @@ mod tests {
         assertion.has_signature = true;
         let assertion_id = assertion.id.clone();
         let response = make_test_response(assertion, None);
-        let config = SecurityConfig::default();
+        let config = SecurityConfig {
+            allow_unsolicited_responses: true,
+            ..SecurityConfig::default()
+        };
         let replay_cache = InMemoryReplayCache::new();
 
         let result = process_response(

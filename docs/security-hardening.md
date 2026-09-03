@@ -78,14 +78,25 @@ was found (tracker miss / expiry), instead of treating it as unsolicited.
 `IdpConfig` carries a registry of trusted SPs. The SSO handler validates the
 request-supplied `AssertionConsumerServiceURL` against SP metadata; the artifact
 and SLO handlers require a trusted, signature-bound, correctly-addressed message
-before consuming an artifact or destroying a session. Deployments that
-authenticate the transport (mutual TLS) may opt out via
-`allow_unauthenticated_backchannel`.
+before consuming an artifact or destroying a session. IdP SLO accepts either a
+valid HTTP-Redirect query signature or an enveloped XML signature and verifies
+both when both representations are present. The ready handlers do not offer a
+generic transport-only bypass because they cannot bind a claimed SAML Issuer to
+an mTLS principal; deployments needing that model must implement a custom
+handler with an explicit certificate-to-entity-ID mapping.
 
 Federation deployments that learn SP metadata from MDQ rather than registering
 SPs statically implement `TrustedSpResolver` (over a `gamlastan_mdq::MdqClient`)
 and register it with `IdpConfig::with_sp_resolver`; the handlers resolve trust
 dynamically and still fail closed when an issuer is unknown.
+
+IdP session lookup and removal are a single participant-bound store operation,
+so a concurrent replacement at the same SessionIndex cannot be deleted using a
+stale lookup result. Custom stores must implement that atomic operation for the
+ready IdP handler. Ready SP-initiated logout obtains its identity from an
+application callback bound to the local authenticated session and signs the
+Redirect request with `SpSigningContext`; it does not authenticate arbitrary
+NameID or SessionIndex query parameters.
 
 - See **ADR 0030** and **ADR 0019** (SP SLO). Findings 4, 5, 13.
 
