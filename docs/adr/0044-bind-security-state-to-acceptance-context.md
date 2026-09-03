@@ -41,7 +41,9 @@ transport peer to a claimed SAML issuer.
    the full participant NameID, including qualifiers and `SPProvidedID`, plus
    any supplied SessionIndex. Treat omitted NameID Format as the explicit SAML
    `unspecified` format. Encrypted NameIDs require a custom decrypting handler
-   rather than returning false success.
+   rather than returning false success. Recheck that participant match and
+   remove the current session record in one store transaction or lock; legacy
+   custom stores fail closed until they implement the compound operation.
 5. Add stateful LogoutRequest validation that bounds `IssueInstant`, applies a
    maximum age and clock skew, and atomically reserves an issuer-scoped replay
    key before session mutation. Ready SP and IdP configurations use dedicated
@@ -58,6 +60,10 @@ transport peer to a claimed SAML issuer.
    browser nonce used for AuthnRequest correlation. Atomically consume a
    LogoutResponse correlation only when the returning browser presents that
    nonce, so one browser cannot terminate another browser's local session.
+   Obtain the outgoing NameID and SessionIndex values from a fallible
+   application callback bound to that authenticated local session, and require
+   `SpSigningContext` to sign the Redirect LogoutRequest before reserving its
+   correlation state.
 8. Supersede ADR 0029 while retaining its solicited-response and dangling-
    correlation requirements. Reject unsolicited Web SSO by default.
    `SecurityConfig` provides an explicit
@@ -79,15 +85,19 @@ transport peer to a claimed SAML issuer.
 - Replays cannot re-enter during accepted skew, and one trusted peer cannot
   reserve another peer's logout ID.
 - A trusted SP can resolve only artifacts issued for it and can terminate only
-  sessions in which it is the exactly matched participant.
+  sessions in which it is the exactly matched participant at the instant of
+  atomic removal.
 - Custom artifact stores must migrate issuance to `store_for_recipient` and
-  implement requester-aware atomic consumption. Custom session stores using
-  participant-specific pseudonyms should override participant lookup.
+  implement requester-aware atomic consumption. Custom session stores used by
+  ready IdP SLO must implement atomic participant-bound removal.
 - Ready SP SLO configuration without a local invalidation callback, or with a
   callback that returns an error, now fails closed instead of reporting a
   logout it did not perform. A failed callback does not make the authenticated
   SLO message reusable.
 - SP-initiated logout correlation is accepted only from its initiating browser.
+- Ready SP-initiated logout fails closed without an authenticated-session
+  callback and signing context; the IdP receives a signed Redirect request
+  rather than application-authenticated arbitrary query parameters.
 - Unsolicited SSO and transport-only ready-handler operation become explicit
   compatibility decisions rather than implicit defaults.
 - The new public configuration and participant fields can require updates to
@@ -102,4 +112,5 @@ and SessionIndex matching, fail-closed legacy artifact stores, unsolicited SSO
 default denial and explicit opt-in, async SLO callback success and failure,
 browser-bound LogoutResponse correlation, Redirect-only and mixed-signature
 IdP SLO, omitted/explicit unspecified NameID equivalence, bounded replay-cache
-retention, and PySAML2 `allow_unsolicited` behavior.
+retention, atomic participant-bound session removal, signed SP-initiated
+LogoutRequests, and PySAML2 `allow_unsolicited` behavior.

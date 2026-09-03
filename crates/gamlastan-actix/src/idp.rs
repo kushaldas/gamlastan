@@ -445,14 +445,23 @@ async fn idp_slo(
             )
             .map_err(SamlActixError::Profile)?;
 
-            // Propagate logout to session participants via the SessionStore
+            // Atomically recheck and remove the exact participant-bound
+            // sessions before using the removed live records for propagation.
+            // A split lookup followed by index-only deletion would allow a
+            // concurrent replacement to be destroyed without authorization.
             if let Some(ref session_store) = config.session_store {
                 let requester_entity_id = slo_issuer.unwrap_or_default();
-                let sessions = session_store.get_sessions_for_participant(
-                    requester_entity_id,
-                    request_name_id,
-                    &logout_req.session_indexes,
-                );
+                let sessions = session_store
+                    .take_sessions_for_participant(
+                        requester_entity_id,
+                        request_name_id,
+                        &logout_req.session_indexes,
+                    )
+                    .map_err(|error| {
+                        SamlActixError::Internal(format!(
+                            "atomic participant-bound session removal failed: {error}"
+                        ))
+                    })?;
 
                 for session in &sessions {
                     // Build LogoutRequest for each participant (except the requester)
@@ -468,9 +477,6 @@ async fn idp_slo(
                         // use the propagation request XML directly. The SessionStore
                         // tracks who needs logout; the application handles delivery.
                     }
-
-                    // Clean up session
-                    session_store.destroy_session(&session.session_index);
                 }
             }
 

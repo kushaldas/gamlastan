@@ -90,6 +90,14 @@ SPs statically implement `TrustedSpResolver` (over a `gamlastan_mdq::MdqClient`)
 and register it with `IdpConfig::with_sp_resolver`; the handlers resolve trust
 dynamically and still fail closed when an issuer is unknown.
 
+IdP session lookup and removal are a single participant-bound store operation,
+so a concurrent replacement at the same SessionIndex cannot be deleted using a
+stale lookup result. Custom stores must implement that atomic operation for the
+ready IdP handler. Ready SP-initiated logout obtains its identity from an
+application callback bound to the local authenticated session and signs the
+Redirect request with `SpSigningContext`; it does not authenticate arbitrary
+NameID or SessionIndex query parameters.
+
 - See **ADR 0030** and **ADR 0019** (SP SLO). Findings 4, 5, 13.
 
 ## Metadata trust anchors and input validation

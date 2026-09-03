@@ -15,8 +15,12 @@ Three layers of abstraction:
 ## SP Quick Start
 
 ```rust,no_run
+use std::sync::Arc;
 use actix_web::{web, App, HttpServer};
-use gamlastan_actix::{SloCallback, SpConfig, sp::configure_sp};
+use gamlastan_actix::{
+    SloCallback, SloInitiationCallback, SpConfig, SpSigningContext,
+    sp::configure_sp,
+};
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -32,6 +36,20 @@ async fn main() -> std::io::Result<()> {
     .with_metadata_url("https://sp.example.com/metadata");
 
     let config = web::Data::new(sp_config);
+    // The matching public certificate must be present in the SP metadata
+    // trusted by the IdP.
+    let signing_context: Arc<SpSigningContext> = todo!("load SP signing key");
+    let signing_context = web::Data::new(signing_context);
+
+    let slo_initiation_callback: SloInitiationCallback = Box::new(|request| {
+        Box::pin(async move {
+            let _ = request;
+            // Authenticate the local session and return its full federated
+            // NameID and SessionIndex values as SpLogoutTarget.
+            todo!("load the authenticated local session's SAML identity")
+        })
+    });
+    let slo_initiation_callback = web::Data::new(slo_initiation_callback);
     let slo_callback: SloCallback = Box::new(|event, request| Box::pin(async move {
         let _ = (event, request);
         // Await durable local-session invalidation and return its Result.
@@ -43,6 +61,8 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .app_data(config.clone())
+            .app_data(signing_context.clone())
+            .app_data(slo_initiation_callback.clone())
             .app_data(slo_callback.clone())
             .configure(configure_sp)
     })
@@ -68,6 +88,11 @@ external session store. It should make invalidation durable and idempotent
 before returning `Ok(())`. On `Err`, gamlastan returns no SAML success, but the
 message's replay or correlation reservation remains terminal and cannot be
 retried.
+
+SP-initiated logout obtains its NameID and SessionIndex values from the
+`SloInitiationCallback`, which must bind them to the authenticated local
+session. The ready handler ignores caller-supplied identity query parameters,
+requires `SpSigningContext`, and signs the Redirect query before sending it.
 
 ## IdP Quick Start
 

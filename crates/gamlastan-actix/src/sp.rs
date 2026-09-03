@@ -37,16 +37,43 @@ use crate::responders::MetadataXml;
 
 const AUTHN_STATE_COOKIE: &str = "__Host-gamlastan_authn_state";
 
-/// SP signing context for signing AuthnRequests in HTTP-Redirect binding.
+/// SP signing context for signing requests in HTTP-Redirect binding.
 ///
 /// Register as `web::Data<Arc<SpSigningContext>>`. If present, the SP login
-/// handler will sign the redirect query string.
+/// handler signs Redirect AuthnRequests. The ready SP logout initiation handler
+/// requires this context and fails closed rather than emitting an unsigned
+/// LogoutRequest.
 pub struct SpSigningContext {
     /// The SAML signer (wraps bergshamra).
     pub signer: SamlSigner,
     /// The signature algorithm URI (e.g., `http://www.w3.org/2001/04/xmldsig-more#rsa-sha256`).
     pub sig_algorithm: String,
 }
+
+/// Participant identity obtained from the authenticated local SP session for
+/// an SP-initiated LogoutRequest.
+#[derive(Debug, Clone)]
+pub struct SpLogoutTarget {
+    /// The full federated NameID issued for the local session.
+    pub name_id: NameId,
+    /// SessionIndex values belonging to that same local session.
+    pub session_indexes: Vec<String>,
+}
+
+/// Future returned by [`SloInitiationCallback`].
+pub type SloInitiationCallbackFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<SpLogoutTarget, SamlActixError>> + 'a>>;
+
+/// Async callback that binds SP-initiated logout to the authenticated local
+/// application session.
+///
+/// The ready route must not sign caller-supplied NameID or SessionIndex query
+/// parameters. Applications register this callback as
+/// `web::Data<SloInitiationCallback>` and return the federated identity stored
+/// with the currently authenticated local session. Returning an error aborts
+/// logout before a request ID is reserved or a signed message is emitted.
+pub type SloInitiationCallback =
+    Box<dyn for<'a> Fn(&'a HttpRequest) -> SloInitiationCallbackFuture<'a> + Send + Sync + 'static>;
 
 /// The result returned by the ACS handler after validating a SAML Response.
 ///
@@ -716,12 +743,23 @@ fn validate_slo_common(
 async fn sp_logout(
     req: HttpRequest,
     config: web::Data<SpConfig>,
+    signing_ctx: Option<web::Data<Arc<SpSigningContext>>>,
+    initiation_callback: Option<web::Data<SloInitiationCallback>>,
 ) -> Result<HttpResponse, SamlActixError> {
-    let query_string = req.query_string();
-    let name_id_value = extract_query_param(query_string, "NameID").ok_or_else(|| {
-        SamlActixError::Configuration("NameID query parameter required for logout".into())
+    let signing_ctx = signing_ctx.as_ref().ok_or_else(|| {
+        SamlActixError::Configuration(
+            "SpSigningContext is required to sign SP-initiated LogoutRequest messages".into(),
+        )
     })?;
-    let session_index = extract_query_param(query_string, "SessionIndex");
+    let initiation_callback = initiation_callback
+        .as_ref()
+        .map(web::Data::get_ref)
+        .ok_or_else(|| {
+            SamlActixError::Configuration(
+                "SloInitiationCallback is required to bind logout to the local session".into(),
+            )
+        })?;
+    let target = initiation_callback(&req).await?;
 
     // Find IdP SLO endpoint
     let idp_descriptors = config.idp_metadata.idp_sso_descriptors();
@@ -729,24 +767,21 @@ async fn sp_logout(
         .first()
         .ok_or_else(|| SamlActixError::Configuration("no IdP SSO descriptor in metadata".into()))?;
 
-    let slo_endpoint = logout::find_slo_endpoint(
-        &idp_desc.sso_base,
-        gamlastan::profiles::sso::web_browser::bindings::HTTP_REDIRECT,
-    )
-    .ok_or_else(|| SamlActixError::Configuration("no SLO endpoint in IdP metadata".into()))?;
-
-    let name_id = NameId {
-        value: name_id_value,
-        format: None,
-        name_qualifier: None,
-        sp_name_qualifier: None,
-        sp_provided_id: None,
-    };
+    let slo_endpoint = idp_desc
+        .sso_base
+        .single_logout_services
+        .iter()
+        .find(|endpoint| {
+            endpoint.binding == gamlastan::profiles::sso::web_browser::bindings::HTTP_REDIRECT
+        })
+        .ok_or_else(|| {
+            SamlActixError::Configuration("no HTTP-Redirect SLO endpoint in IdP metadata".into())
+        })?;
 
     let options = logout::SpLogoutRequestOptions {
         sp_entity_id: config.entity_id.clone(),
-        name_id,
-        session_indexes: session_index.into_iter().collect(),
+        name_id: target.name_id,
+        session_indexes: target.session_indexes,
         reason: Some(logout::reason::USER.to_string()),
         destination: Some(slo_endpoint.location.clone()),
         not_on_or_after: None,
@@ -755,9 +790,6 @@ async fn sp_logout(
     let logout_request = logout::create_sp_logout_request(&options)
         .map_err(|e| SamlActixError::Internal(format!("failed to create LogoutRequest: {e}")))?;
     let browser_state = browser_state_for_request(&req);
-    config
-        .request_id_tracker
-        .store_bound(&logout_request.id, &browser_state);
 
     let xml = logout_request
         .to_xml_string()
@@ -768,12 +800,15 @@ async fn sp_logout(
         is_request: true,
         destination: &slo_endpoint.location,
         relay_state: None,
-        signer: None,
+        signer: Some((&signing_ctx.signer, signing_ctx.sig_algorithm.as_str())),
     })
     .map_err(|e| SamlActixError::Internal(format!("redirect encode failed: {e}")))?;
 
     let mut response = crate::response_adapter::redirect_binding_response(&redirect_url);
     set_authn_state_cookie(&mut response, &browser_state)?;
+    config
+        .request_id_tracker
+        .store_bound(&logout_request.id, &browser_state);
     Ok(response)
 }
 
@@ -1142,6 +1177,31 @@ mod tests {
         let mut keys = KeysManager::new();
         keys.add_key(key);
         SamlSigner::new(keys)
+    }
+
+    fn test_sp_signing_context() -> web::Data<Arc<SpSigningContext>> {
+        web::Data::new(Arc::new(SpSigningContext {
+            signer: test_signer(),
+            sig_algorithm: "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256".to_string(),
+        }))
+    }
+
+    fn test_slo_initiation_callback() -> web::Data<SloInitiationCallback> {
+        let target = SpLogoutTarget {
+            name_id: NameId {
+                value: "user@example.com".to_string(),
+                format: None,
+                name_qualifier: None,
+                sp_name_qualifier: None,
+                sp_provided_id: None,
+            },
+            session_indexes: vec!["_session".to_string()],
+        };
+        let callback: SloInitiationCallback = Box::new(move |_request| {
+            let target = target.clone();
+            Box::pin(async move { Ok(target) })
+        });
+        web::Data::new(callback)
     }
 
     fn test_signature_template(reference_id: &str, cert: &str) -> String {
@@ -1795,10 +1855,17 @@ mod tests {
     async fn sp_logout_binds_request_id_to_emitted_browser_cookie() {
         let config = web::Data::new(test_sp_config());
         let request = actix_web::test::TestRequest::get()
-            .uri("/saml/logout?NameID=user%40example.com")
+            .uri("/saml/logout?NameID=attacker%40example.com&SessionIndex=_attacker")
             .to_http_request();
 
-        let response = sp_logout(request, config.clone()).await.unwrap();
+        let response = sp_logout(
+            request,
+            config.clone(),
+            Some(test_sp_signing_context()),
+            Some(test_slo_initiation_callback()),
+        )
+        .await
+        .unwrap();
         let cookie_header = response
             .headers()
             .get(actix_web::http::header::SET_COOKIE)
@@ -1824,6 +1891,16 @@ mod tests {
             .to_http_request();
         let adapter = crate::request_adapter::ActixHttpRequest::new(&redirected_request, &[]);
         let decoded = gamlastan::bindings::redirect::redirect_decode(&adapter).unwrap();
+        let cert_der = base64::engine::general_purpose::STANDARD
+            .decode(cert_b64(SIGN_CERT_PEM))
+            .unwrap();
+        let mut verification_keys = KeysManager::new();
+        verification_keys.add_key(loader::load_x509_cert_der(&cert_der).unwrap());
+        verification_keys.add_trusted_cert(cert_der);
+        let verifier = SamlVerifier::new(verification_keys);
+        assert!(
+            gamlastan::bindings::redirect::redirect_verify_signature(&decoded, &verifier).unwrap()
+        );
         let xml = std::str::from_utf8(&decoded.saml_xml).unwrap();
         let document = gamlastan::xml::parse_secure(xml).unwrap();
         let logout_request = gamlastan::xml::deserialize::parse_saml::<
@@ -1832,11 +1909,75 @@ mod tests {
         .unwrap()
         .to_owned();
 
+        let NameIdOrEncryptedId::NameId(name_id) = &logout_request.name_id else {
+            panic!("SP-initiated logout should carry a plain NameID");
+        };
+        assert_eq!(name_id.value, "user@example.com");
+        assert_eq!(logout_request.session_indexes, vec!["_session"]);
+
         assert!(config
             .request_id_tracker
             .consume_bound(&logout_request.id, cookie.value()));
         assert!(!config
             .request_id_tracker
             .consume_bound(&logout_request.id, cookie.value()));
+    }
+
+    #[actix_web::test]
+    async fn sp_logout_requires_signing_and_authenticated_session_callbacks() {
+        let config = web::Data::new(test_sp_config());
+        let request = || {
+            actix_web::test::TestRequest::get()
+                .uri("/saml/logout")
+                .to_http_request()
+        };
+
+        let missing_signer = sp_logout(
+            request(),
+            config.clone(),
+            None,
+            Some(test_slo_initiation_callback()),
+        )
+        .await;
+        assert!(matches!(
+            missing_signer,
+            Err(SamlActixError::Configuration(message))
+                if message.contains("SpSigningContext")
+        ));
+
+        let missing_session =
+            sp_logout(request(), config, Some(test_sp_signing_context()), None).await;
+        assert!(matches!(
+            missing_session,
+            Err(SamlActixError::Configuration(message))
+                if message.contains("SloInitiationCallback")
+        ));
+    }
+
+    #[actix_web::test]
+    async fn sp_logout_requires_redirect_slo_metadata_endpoint() {
+        let mut config = test_sp_config();
+        let EntityRoles::Roles { idp_sso, .. } = &mut config.idp_metadata.roles else {
+            panic!("test metadata should contain IdP SSO role");
+        };
+        idp_sso[0].sso_base.single_logout_services[0].binding =
+            gamlastan::profiles::sso::web_browser::bindings::HTTP_POST.to_string();
+        let request = actix_web::test::TestRequest::get()
+            .uri("/saml/logout")
+            .to_http_request();
+
+        let result = sp_logout(
+            request,
+            web::Data::new(config),
+            Some(test_sp_signing_context()),
+            Some(test_slo_initiation_callback()),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(SamlActixError::Configuration(message))
+                if message.contains("HTTP-Redirect SLO endpoint")
+        ));
     }
 }

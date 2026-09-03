@@ -434,6 +434,9 @@ pub struct IdpConfig {
 
     /// Session store for tracking IdP sessions and participants.
     /// Required for SLO propagation. If None, logout propagation is skipped.
+    /// Custom stores used by the ready IdP SLO handler must implement
+    /// [`SessionStore::take_sessions_for_participant`] with transactional or
+    /// lock-scoped participant revalidation and removal.
     pub session_store: Option<Arc<dyn SessionStore>>,
 
     /// Artifact store for HTTP Artifact binding resolution.

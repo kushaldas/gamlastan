@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 
 use crate::core::assertion::name_id::NameId;
 use crate::core::constants::NAMEID_UNSPECIFIED;
+use crate::profiles::ProfileError;
 
 /// A participant in a SAML session (typically an SP that received an assertion).
 #[derive(Debug, Clone)]
@@ -104,6 +105,29 @@ pub trait SessionStore: Send + Sync {
             .collect()
     }
 
+    /// Atomically remove and return sessions still containing the exact
+    /// authenticated participant named by a LogoutRequest.
+    ///
+    /// Implementations must recheck the requester entity ID, full NameID, and
+    /// any supplied SessionIndex in the same transaction or lock that removes
+    /// the sessions. Returning earlier lookup snapshots and deleting later by
+    /// index is unsafe because a concurrent update can replace the matched
+    /// session between those operations.
+    ///
+    /// The default fails closed so existing custom stores remain source
+    /// compatible without silently retaining the lookup/removal race. Ready
+    /// IdP SLO users with a custom store must override this method.
+    fn take_sessions_for_participant(
+        &self,
+        _requester_entity_id: &str,
+        _name_id: &NameId,
+        _session_indexes: &[String],
+    ) -> Result<Vec<SamlSession>, ProfileError> {
+        Err(ProfileError::Other(
+            "session store does not implement atomic participant-bound removal".to_string(),
+        ))
+    }
+
     /// Add a participant to an existing session.
     fn add_participant(&self, session_index: &str, participant: SessionParticipant) -> bool;
 
@@ -184,6 +208,29 @@ impl SessionStore for InMemorySessionStore {
             })
             .cloned()
             .collect()
+    }
+
+    fn take_sessions_for_participant(
+        &self,
+        requester_entity_id: &str,
+        name_id: &NameId,
+        session_indexes: &[String],
+    ) -> Result<Vec<SamlSession>, ProfileError> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let matching_indexes: Vec<String> = sessions
+            .iter()
+            .filter(|(_, session)| {
+                session.participants.iter().any(|participant| {
+                    participant_matches(participant, requester_entity_id, name_id, session_indexes)
+                })
+            })
+            .map(|(index, _)| index.clone())
+            .collect();
+
+        Ok(matching_indexes
+            .into_iter()
+            .filter_map(|index| sessions.remove(&index))
+            .collect())
     }
 
     fn add_participant(&self, session_index: &str, participant: SessionParticipant) -> bool {
@@ -393,6 +440,124 @@ mod tests {
         assert!(store
             .get_sessions_for_participant("https://sp.example.com", &different_format, &[])
             .is_empty());
+    }
+
+    #[test]
+    fn participant_take_atomically_returns_and_removes_the_live_record() {
+        let store = InMemorySessionStore::new();
+        let mut session = make_session("_s1");
+        session.principal_name_id = "internal-principal".to_string();
+        session.participants = vec![make_participant("https://sp.example.com")];
+        store.create_session(session);
+        let name_id = NameId {
+            value: "user@example.com".to_string(),
+            format: None,
+            name_qualifier: None,
+            sp_name_qualifier: None,
+            sp_provided_id: None,
+        };
+
+        let removed = store
+            .take_sessions_for_participant(
+                "https://sp.example.com",
+                &name_id,
+                &["_idx1".to_string()],
+            )
+            .unwrap();
+
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].session_index, "_s1");
+        assert_eq!(removed[0].principal_name_id, "internal-principal");
+        assert!(store.get_session("_s1").is_none());
+    }
+
+    #[test]
+    fn participant_take_rechecks_replaced_session_before_removal() {
+        let store = InMemorySessionStore::new();
+        let mut original = make_session("_s1");
+        original.participants = vec![make_participant("https://sp.example.com")];
+        store.create_session(original);
+        let name_id = NameId {
+            value: "user@example.com".to_string(),
+            format: None,
+            name_qualifier: None,
+            sp_name_qualifier: None,
+            sp_provided_id: None,
+        };
+
+        let stale_snapshot = store.get_sessions_for_participant(
+            "https://sp.example.com",
+            &name_id,
+            &["_idx1".to_string()],
+        );
+        assert_eq!(stale_snapshot.len(), 1);
+
+        let mut replacement = make_session("_s1");
+        replacement.principal_name_id = "replacement-principal".to_string();
+        replacement.participants = vec![make_participant("https://other-sp.example.com")];
+        store.create_session(replacement);
+
+        let removed = store
+            .take_sessions_for_participant(
+                "https://sp.example.com",
+                &name_id,
+                &["_idx1".to_string()],
+            )
+            .unwrap();
+
+        assert!(removed.is_empty());
+        assert_eq!(
+            store.get_session("_s1").unwrap().principal_name_id,
+            "replacement-principal"
+        );
+    }
+
+    struct LegacySessionStore;
+
+    impl SessionStore for LegacySessionStore {
+        fn create_session(&self, session: SamlSession) -> String {
+            session.session_index
+        }
+
+        fn get_session(&self, _session_index: &str) -> Option<SamlSession> {
+            None
+        }
+
+        fn get_sessions_by_name_id(&self, _name_id: &str) -> Vec<SamlSession> {
+            Vec::new()
+        }
+
+        fn add_participant(&self, _session_index: &str, _participant: SessionParticipant) -> bool {
+            false
+        }
+
+        fn remove_participant(&self, _session_index: &str, _entity_id: &str) -> bool {
+            false
+        }
+
+        fn destroy_session(&self, _session_index: &str) -> bool {
+            false
+        }
+
+        fn cleanup_expired(&self) {}
+    }
+
+    #[test]
+    fn legacy_session_store_fails_closed_for_atomic_participant_removal() {
+        let name_id = NameId {
+            value: "user@example.com".to_string(),
+            format: None,
+            name_qualifier: None,
+            sp_name_qualifier: None,
+            sp_provided_id: None,
+        };
+
+        let error = LegacySessionStore
+            .take_sessions_for_participant("https://sp.example.com", &name_id, &[])
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not implement atomic participant-bound removal"));
     }
 
     #[test]

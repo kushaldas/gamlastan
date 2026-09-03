@@ -12,12 +12,15 @@ where needed to correct protocol handling.
 - Added recipient-aware `ArtifactStore::store_for_recipient` and
   `resolve_and_consume_for_requester` operations. Their defaults fail closed so
   legacy stores cannot accidentally serve an artifact to the wrong SP.
-- Added participant-aware session lookup, including SP entity ID, full NameID
-  (with `SPProvidedID`), and optional SessionIndex matching.
+- Added participant-aware session lookup and atomic removal, including SP entity
+  ID, full NameID (with `SPProvidedID`), and optional SessionIndex matching.
 - Added stateful LogoutRequest freshness and replay validation, configurable
   logout replay caches and maximum request ages for the ready Actix handlers,
   and the required async, fallible Actix `SloCallback` / `SpLogoutEvent`
   integration point for invalidating local SP sessions.
+- Added the async, fallible Actix `SloInitiationCallback`, which derives the
+  federated NameID and SessionIndex values for SP-initiated logout from the
+  authenticated local application session.
 - Added `SecurityConfig::allow_unsolicited_responses`. It defaults to `false`;
   deployments that intentionally support IdP-initiated SSO must opt in.
 
@@ -38,6 +41,11 @@ where needed to correct protocol handling.
   async `SloCallback` that returns `Result<(), SamlActixError>`; a successful
   protocol response is returned only after local session invalidation succeeds.
   Replay and correlation reservations remain consumed when the callback fails.
+- **Breaking:** ready Actix SP logout initiation now requires
+  `SloInitiationCallback` and `SpSigningContext` application data. Caller-supplied
+  NameID and SessionIndex query parameters are ignored; the callback supplies
+  the authenticated local session identity and the emitted Redirect
+  LogoutRequest is signed.
 - **Breaking:** `SessionParticipant` now includes `sp_provided_id`. Custom
   `SessionStore` implementations should override `get_sessions_for_participant`
   when their principal index differs from the participant NameID.
@@ -70,7 +78,10 @@ where needed to correct protocol handling.
 - Ready IdP SLO now destroys only sessions containing the authenticated SP as an
   exact participant, with full NameID and requested SessionIndex matching.
   Omitted NameID Format and the explicit SAML `unspecified` format are treated
-  as equivalent, as required by SAML Core.
+  as equivalent, as required by SAML Core. Matching and removal now occur in one
+  store transaction or lock so a concurrent session replacement cannot be
+  deleted through a stale lookup snapshot. Legacy custom stores fail closed
+  until they implement atomic participant-bound removal.
 - Ready SP and IdP SLO handlers now reject stale, future-dated, and replayed
   LogoutRequests using issuer-scoped replay keys. Ready SP SLO also requires
   successful local-session invalidation before reporting protocol success, and
@@ -79,6 +90,9 @@ where needed to correct protocol handling.
 - Ready IdP SLO accepts a valid HTTP-Redirect query signature or enveloped XML
   signature from the resolved SP metadata key and verifies every signature
   representation present.
+- Ready SP-initiated logout obtains its target from the authenticated local
+  session callback, requires a signing context, and emits a signed
+  HTTP-Redirect LogoutRequest that the ready IdP can authenticate.
 - Unsolicited SSO responses are rejected by default at the shared response
   validation boundary. Explicitly enabled unsolicited responses must still omit
   `InResponseTo` and pass all signature, audience, recipient, time, and replay
