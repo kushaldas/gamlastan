@@ -9,7 +9,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 repository = "https://github.com/kushaldas/gamlastan"
 readme = "README.md"
@@ -18,23 +18,23 @@ rust-version = "1.88"
 
 [workspace.dependencies]
 # Internal crates
-gamlastan = { version = "0.8.0", path = "crates/gamlastan" }
-gamlastan-actix = { version = "0.8.0", path = "crates/gamlastan-actix" }
-gamlastan-mdq = { version = "0.8.0", path = "crates/gamlastan-mdq" }
+gamlastan = { version = "0.9.0", path = "crates/gamlastan" }
+gamlastan-actix = { version = "0.9.0", path = "crates/gamlastan-actix" }
+gamlastan-mdq = { version = "0.9.0", path = "crates/gamlastan-mdq" }
 
 # XML parsing
-uppsala = "0.9.0"
+uppsala = "0.10.1"
 
 # XML security
-# 0.8.0 tracks uppsala 0.9 and the kryptering 0.5 backend. Keep the stack on
+# 0.9.0 tracks uppsala 0.10.1 and the kryptering 0.5 backend. Keep the stack on
 # one bergshamra minor to avoid duplicate XML security crates in the lockfile.
-bergshamra = "0.8.0"
-bergshamra-core = "0.8.0"
-bergshamra-dsig = "0.8.0"
-bergshamra-enc = "0.8.0"
-bergshamra-c14n = "0.8.0"
-bergshamra-crypto = "0.8.0"
-bergshamra-keys = "0.8.0"
+bergshamra = "0.9.0"
+bergshamra-core = "0.9.0"
+bergshamra-dsig = "0.9.0"
+bergshamra-enc = "0.9.0"
+bergshamra-c14n = "0.9.0"
+bergshamra-crypto = "0.9.0"
+bergshamra-keys = "0.9.0"
 
 # HSM / PKCS#11 signing backend (the low-level crypto provider beneath
 # bergshamra). This direct dependency exists so gamlastan can re-export the
