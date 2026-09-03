@@ -46,21 +46,27 @@ transport peer to a claimed SAML issuer.
    logout replay caches with a five-minute default maximum age. The older
    stateless validator remains for compatibility layers that already provide
    equivalent outer controls.
-6. Require ready Actix SP users to register an infallible `SloCallback`. Invoke
-   it only after trust, freshness, replay, destination, and correlation checks,
-   and before returning protocol success. This callback is the application
-   boundary that invalidates its server-side session.
-7. Supersede ADR 0029 while retaining its solicited-response and dangling-
+6. Require ready Actix SP users to register an async, fallible `SloCallback`.
+   Invoke it only after trust, freshness, replay, destination, and correlation
+   checks, and return protocol success only after it returns `Ok(())`. Replay
+   and correlation reservations remain terminal on callback failure, preventing
+   reuse at the cost of protocol retry liveness. Applications should make
+   invalidation durable and idempotent before returning success.
+7. Bind outgoing SP LogoutRequest IDs to the same short-lived, host-only
+   browser nonce used for AuthnRequest correlation. Atomically consume a
+   LogoutResponse correlation only when the returning browser presents that
+   nonce, so one browser cannot terminate another browser's local session.
+8. Supersede ADR 0029 while retaining its solicited-response and dangling-
    correlation requirements. Reject unsolicited Web SSO by default.
    `SecurityConfig` provides an explicit
    `allow_unsolicited_responses` opt-in, and the core profile returns
    `UnsolicitedNotAllowed`.
-8. Supersede ADR 0030 while retaining its metadata trust, signature, issuer, and
+9. Supersede ADR 0030 while retaining its metadata trust, signature, issuer, and
    destination requirements. Ready destructive IdP handlers always require a
    signature bound to trusted SP metadata. A transport-only deployment must use
    a custom handler that maps the authenticated transport identity to an entity
    ID; the generic bypass is removed.
-9. The PySAML2 compatibility layer retains its public shapes and existing
+10. The PySAML2 compatibility layer retains its public shapes and existing
    logout replay controls. It reads PySAML2's `allow_unsolicited` setting and
    maps missing correlation to `UnsolicitedResponse`; deployments that
    intentionally use IdP-initiated SSO opt in with that established setting.
@@ -74,8 +80,11 @@ transport peer to a claimed SAML issuer.
 - Custom artifact stores must migrate issuance to `store_for_recipient` and
   implement requester-aware atomic consumption. Custom session stores using
   participant-specific pseudonyms should override participant lookup.
-- Ready SP SLO configuration without a local invalidation callback now fails
-  closed instead of reporting a logout it did not perform.
+- Ready SP SLO configuration without a local invalidation callback, or with a
+  callback that returns an error, now fails closed instead of reporting a
+  logout it did not perform. A failed callback does not make the authenticated
+  SLO message reusable.
+- SP-initiated logout correlation is accepted only from its initiating browser.
 - Unsolicited SSO and transport-only ready-handler operation become explicit
   compatibility decisions rather than implicit defaults.
 - The new public configuration and participant fields can require updates to
@@ -87,4 +96,6 @@ transport peer to a claimed SAML issuer.
 Regression coverage exercises wide comment-bearing metadata, replay during
 clock skew, issuer-scoped LogoutRequest replay and freshness, exact participant
 and SessionIndex matching, fail-closed legacy artifact stores, unsolicited SSO
-default denial and explicit opt-in, and PySAML2 `allow_unsolicited` behavior.
+default denial and explicit opt-in, async SLO callback success and failure,
+browser-bound LogoutResponse correlation, and PySAML2 `allow_unsolicited`
+behavior.

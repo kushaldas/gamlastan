@@ -140,17 +140,19 @@ pub struct SpConfig {
     /// Protocol binding to request for the response.
     pub protocol_binding: Option<String>,
 
-    /// Request ID tracker for InResponseTo verification.
-    /// Stores sent AuthnRequest IDs so responses can be correlated.
+    /// Request ID tracker for `InResponseTo` verification.
+    /// Stores sent AuthnRequest and LogoutRequest IDs so responses can be
+    /// correlated to both the request and its initiating browser.
     pub request_id_tracker: Arc<dyn RequestIdTracker>,
 }
 
-/// Tracks outgoing AuthnRequest IDs for InResponseTo verification.
+/// Tracks outgoing SAML request IDs for `InResponseTo` verification.
 ///
-/// When the SP sends an AuthnRequest, the request ID is stored.
-/// When a Response arrives, the InResponseTo is checked against stored IDs.
+/// When the SP sends an AuthnRequest or LogoutRequest, the request ID is
+/// stored. When a response arrives, its `InResponseTo` is checked against the
+/// stored ID and initiating-browser state.
 pub trait RequestIdTracker: Send + Sync {
-    /// Record a sent AuthnRequest ID with its creation timestamp.
+    /// Record a sent SAML request ID with its creation timestamp.
     fn store(&self, request_id: &str);
     /// Check if a request ID was sent and consume it (one-time use).
     /// Returns true if the ID was found and removed.
@@ -160,7 +162,8 @@ pub trait RequestIdTracker: Send + Sync {
     /// browser.
     ///
     /// Custom trackers must override [`consume_bound`](Self::consume_bound) to
-    /// enable the ready ACS flow; its default intentionally fails closed.
+    /// enable the ready ACS and SLO flows; its default intentionally fails
+    /// closed.
     fn store_bound(&self, request_id: &str, _browser_state: &str) {
         self.store(request_id);
     }
@@ -176,7 +179,7 @@ pub trait RequestIdTracker: Send + Sync {
 }
 
 #[derive(Debug)]
-/// One outstanding AuthnRequest and its optional initiating-browser binding.
+/// One outstanding SAML request and its optional initiating-browser binding.
 struct TrackedRequestId {
     /// Monotonic insertion time used to enforce the configured TTL.
     inserted: std::time::Instant,

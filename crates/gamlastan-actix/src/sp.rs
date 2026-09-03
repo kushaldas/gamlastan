@@ -9,6 +9,8 @@
 //
 // Register all routes at once with `configure_sp()`.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use actix_web::{web, HttpRequest, HttpResponse};
@@ -83,10 +85,16 @@ pub enum SpLogoutEvent {
     },
 }
 
-/// Callback that invalidates the application's local session after SLO
-/// protocol validation. It is intentionally infallible: protocol replay and
-/// correlation state is consumed atomically before invocation, so a fallible
-/// callback could leave a valid retry impossible while the session remained.
+/// Future returned by [`SloCallback`].
+pub type SloCallbackFuture<'a> = Pin<Box<dyn Future<Output = Result<(), SamlActixError>> + 'a>>;
+
+/// Async callback that invalidates the application's local session after SLO
+/// protocol validation.
+///
+/// Protocol replay and correlation state is consumed atomically before the
+/// callback is invoked and remains consumed if the callback fails. A failure
+/// therefore prevents protocol success without making the same authenticated
+/// SLO message reusable.
 ///
 /// Register the exact boxed callback type as Actix application data:
 ///
@@ -94,10 +102,12 @@ pub enum SpLogoutEvent {
 /// use actix_web::web;
 /// use gamlastan_actix::SloCallback;
 ///
-/// let callback: SloCallback = Box::new(|event, request| {
+/// let callback: SloCallback = Box::new(|event, request| Box::pin(async move {
 ///     let _ = (event, request);
-///     // Invalidate the matching local application session here.
-/// });
+///     // Invalidate the matching local application session here. Propagate
+///     // failures so gamlastan does not report protocol success.
+///     Ok(())
+/// }));
 /// let callback_data = web::Data::new(callback);
 /// // Register with `App::new().app_data(callback_data.clone())` before
 /// // calling `configure_sp`.
@@ -105,9 +115,11 @@ pub enum SpLogoutEvent {
 ///
 /// Actix application-data extraction is type-exact: register
 /// `web::Data<SloCallback>`, not `web::Data<Arc<SloCallback>>`.
-pub type SloCallback = Box<dyn Fn(SpLogoutEvent, &HttpRequest) + Send + Sync + 'static>;
+pub type SloCallback = Box<
+    dyn for<'a> Fn(SpLogoutEvent, &'a HttpRequest) -> SloCallbackFuture<'a> + Send + Sync + 'static,
+>;
 
-fn invalidate_local_sp_session(
+async fn invalidate_local_sp_session(
     callback: Option<&SloCallback>,
     event: SpLogoutEvent,
     request: &HttpRequest,
@@ -117,8 +129,7 @@ fn invalidate_local_sp_session(
             "SloCallback is required to invalidate the local SP session".into(),
         )
     })?;
-    callback(event, request);
-    Ok(())
+    callback(event, request).await
 }
 
 /// Register all SP routes on the given service configuration.
@@ -198,11 +209,7 @@ async fn sp_login(
         .to_xml_string()
         .map_err(|e| SamlActixError::Internal(format!("failed to serialize AuthnRequest: {e}")))?;
 
-    let browser_state = req
-        .cookie(AUTHN_STATE_COOKIE)
-        .map(|cookie| cookie.value().to_string())
-        .filter(|state| is_generated_browser_state(state))
-        .unwrap_or_else(|| gamlastan::core::identifiers::SamlId::generate().to_string());
+    let browser_state = browser_state_for_request(&req);
     config
         .request_id_tracker
         .store_bound(&authn_request.base.id, &browser_state);
@@ -341,6 +348,17 @@ fn set_authn_state_cookie(response: &mut HttpResponse, state: &str) -> Result<()
     response
         .add_cookie(&cookie)
         .map_err(|e| SamlActixError::Internal(format!("failed to set SAML state cookie: {e}")))
+}
+
+/// Reuse a valid host-only browser nonce or create one for an outgoing SAML
+/// request. The nonce is not a session identifier; it only binds correlation
+/// state to the browser that initiated the request.
+fn browser_state_for_request(request: &HttpRequest) -> String {
+    request
+        .cookie(AUTHN_STATE_COOKIE)
+        .map(|cookie| cookie.value().to_string())
+        .filter(|state| is_generated_browser_state(state))
+        .unwrap_or_else(|| gamlastan::core::identifiers::SamlId::generate().to_string())
 }
 
 /// Return whether `state` has the exact shape generated for browser binding:
@@ -610,6 +628,7 @@ fn validate_slo_logout_request(
 fn validate_slo_logout_response(
     response: &LogoutResponse,
     config: &SpConfig,
+    browser_state: Option<&str>,
 ) -> Result<(), SamlActixError> {
     validate_slo_common(
         response.issuer.as_ref().map(|issuer| issuer.value.as_str()),
@@ -634,10 +653,14 @@ fn validate_slo_logout_response(
             "LogoutResponse missing InResponseTo".into(),
         ))
     })?;
-    if !config.request_id_tracker.consume(in_response_to) {
+    if !browser_state.is_some_and(|state| {
+        config
+            .request_id_tracker
+            .consume_bound(in_response_to, state)
+    }) {
         return Err(SamlActixError::Profile(
             gamlastan::profiles::ProfileError::AssertionValidation(format!(
-                "LogoutResponse InResponseTo {in_response_to} matches no outstanding LogoutRequest"
+                "LogoutResponse InResponseTo {in_response_to} matches no outstanding LogoutRequest for this browser"
             )),
         ));
     }
@@ -731,7 +754,10 @@ async fn sp_logout(
 
     let logout_request = logout::create_sp_logout_request(&options)
         .map_err(|e| SamlActixError::Internal(format!("failed to create LogoutRequest: {e}")))?;
-    config.request_id_tracker.store(&logout_request.id);
+    let browser_state = browser_state_for_request(&req);
+    config
+        .request_id_tracker
+        .store_bound(&logout_request.id, &browser_state);
 
     let xml = logout_request
         .to_xml_string()
@@ -746,9 +772,9 @@ async fn sp_logout(
     })
     .map_err(|e| SamlActixError::Internal(format!("redirect encode failed: {e}")))?;
 
-    Ok(crate::response_adapter::redirect_binding_response(
-        &redirect_url,
-    ))
+    let mut response = crate::response_adapter::redirect_binding_response(&redirect_url);
+    set_authn_state_cookie(&mut response, &browser_state)?;
+    Ok(response)
 }
 
 /// SP Single Logout Service handler: process incoming LogoutRequest or LogoutResponse from IdP.
@@ -817,7 +843,8 @@ async fn sp_slo(
                     session_indexes: logout_req.session_indexes.clone(),
                 },
                 &req,
-            )?;
+            )
+            .await?;
 
             // Create success response
             let in_response_to = &logout_req.id;
@@ -871,7 +898,10 @@ async fn sp_slo(
                 logout_resp.has_signature,
                 &config,
             )?;
-            validate_slo_logout_response(&logout_resp, &config)?;
+            let browser_state = req
+                .cookie(AUTHN_STATE_COOKIE)
+                .map(|cookie| cookie.value().to_string());
+            validate_slo_logout_response(&logout_resp, &config, browser_state.as_deref())?;
             let in_response_to = logout_resp.in_response_to.clone().ok_or_else(|| {
                 SamlActixError::Internal(
                     "validated LogoutResponse unexpectedly lacks InResponseTo".into(),
@@ -881,7 +911,8 @@ async fn sp_slo(
                 Some(slo_callback),
                 SpLogoutEvent::SpInitiatedComplete { in_response_to },
                 &req,
-            )?;
+            )
+            .await?;
             Ok(HttpResponse::Ok().body("Logout completed"))
         }
         other => Err(SamlActixError::UnsupportedBinding(format!(
@@ -1264,14 +1295,14 @@ mod tests {
         assert!(std::mem::size_of::<SpSigningContext>() > 0);
     }
 
-    #[test]
-    fn slo_callback_is_required_and_receives_terminal_event() {
+    #[actix_web::test]
+    async fn slo_callback_is_required_and_receives_terminal_event() {
         let request = actix_web::test::TestRequest::default().to_http_request();
         let event = SpLogoutEvent::SpInitiatedComplete {
             in_response_to: "_logout".to_string(),
         };
         assert!(matches!(
-            invalidate_local_sp_session(None, event.clone(), &request),
+            invalidate_local_sp_session(None, event.clone(), &request).await,
             Err(SamlActixError::Configuration(_))
         ));
 
@@ -1282,9 +1313,81 @@ mod tests {
                 panic!("unexpected SLO event")
             };
             *callback_seen.lock().unwrap() = Some(in_response_to);
+            Box::pin(async { Ok(()) })
         });
-        invalidate_local_sp_session(Some(&callback), event, &request).unwrap();
+        invalidate_local_sp_session(Some(&callback), event, &request)
+            .await
+            .unwrap();
         assert_eq!(seen.lock().unwrap().as_deref(), Some("_logout"));
+    }
+
+    #[actix_web::test]
+    async fn slo_callback_failure_is_propagated_after_terminal_reservation() {
+        let request = actix_web::test::TestRequest::default().to_http_request();
+        let event = SpLogoutEvent::SpInitiatedComplete {
+            in_response_to: "_logout".to_string(),
+        };
+        let callback: SloCallback = Box::new(|_event, _request| {
+            Box::pin(async {
+                Err(SamlActixError::Internal(
+                    "local session invalidation failed".to_string(),
+                ))
+            })
+        });
+
+        let error = invalidate_local_sp_session(Some(&callback), event, &request)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("local session invalidation failed"));
+    }
+
+    #[actix_web::test]
+    async fn slo_callback_failure_does_not_restore_consumed_correlation() {
+        let config = test_sp_config();
+        config
+            .request_id_tracker
+            .store_bound("_logout_req", "browser-a");
+        let response = LogoutResponse {
+            id: "_logout_resp".to_string(),
+            version: gamlastan::core::identifiers::SamlVersion::V2_0,
+            issue_instant: Utc::now(),
+            destination: Some(config.slo_url.clone()),
+            consent: None,
+            issuer: Some(Issuer::entity("https://idp.example.com")),
+            has_signature: false,
+            in_response_to: Some("_logout_req".to_string()),
+            status: Status::success(),
+        };
+        validate_slo_logout_response(&response, &config, Some("browser-a")).unwrap();
+
+        let request = actix_web::test::TestRequest::default().to_http_request();
+        let callback: SloCallback = Box::new(|_event, _request| {
+            Box::pin(async {
+                Err(SamlActixError::Internal(
+                    "local session invalidation failed".to_string(),
+                ))
+            })
+        });
+        let error = invalidate_local_sp_session(
+            Some(&callback),
+            SpLogoutEvent::SpInitiatedComplete {
+                in_response_to: "_logout_req".to_string(),
+            },
+            &request,
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("local session invalidation failed"));
+
+        let replay =
+            validate_slo_logout_response(&response, &config, Some("browser-a")).unwrap_err();
+        assert!(replay
+            .to_string()
+            .contains("matches no outstanding LogoutRequest"));
     }
 
     #[test]
@@ -1641,7 +1744,9 @@ mod tests {
     #[test]
     fn test_slo_logout_response_requires_matching_in_response_to() {
         let config = test_sp_config();
-        config.request_id_tracker.store("_logout_req");
+        config
+            .request_id_tracker
+            .store_bound("_logout_req", "browser-a");
         let response = LogoutResponse {
             id: "_logout_resp".to_string(),
             version: gamlastan::core::identifiers::SamlVersion::V2_0,
@@ -1654,11 +1759,84 @@ mod tests {
             status: Status::success(),
         };
 
-        validate_slo_logout_response(&response, &config).unwrap();
+        let wrong_browser =
+            validate_slo_logout_response(&response, &config, Some("browser-b")).unwrap_err();
+        assert!(wrong_browser.to_string().contains("for this browser"));
 
-        let replay = validate_slo_logout_response(&response, &config).unwrap_err();
+        validate_slo_logout_response(&response, &config, Some("browser-a")).unwrap();
+
+        let replay =
+            validate_slo_logout_response(&response, &config, Some("browser-a")).unwrap_err();
         assert!(replay
             .to_string()
             .contains("matches no outstanding LogoutRequest"));
+    }
+
+    #[test]
+    fn browser_state_reuses_only_generated_host_cookie_values() {
+        let state = "_0123456789abcdef0123456789abcdef";
+        let valid_request = actix_web::test::TestRequest::default()
+            .cookie(actix_web::cookie::Cookie::new(AUTHN_STATE_COOKIE, state))
+            .to_http_request();
+        assert_eq!(browser_state_for_request(&valid_request), state);
+
+        let invalid_request = actix_web::test::TestRequest::default()
+            .cookie(actix_web::cookie::Cookie::new(
+                AUTHN_STATE_COOKIE,
+                "attacker-chosen",
+            ))
+            .to_http_request();
+        let generated = browser_state_for_request(&invalid_request);
+        assert_ne!(generated, "attacker-chosen");
+        assert!(is_generated_browser_state(&generated));
+    }
+
+    #[actix_web::test]
+    async fn sp_logout_binds_request_id_to_emitted_browser_cookie() {
+        let config = web::Data::new(test_sp_config());
+        let request = actix_web::test::TestRequest::get()
+            .uri("/saml/logout?NameID=user%40example.com")
+            .to_http_request();
+
+        let response = sp_logout(request, config.clone()).await.unwrap();
+        let cookie_header = response
+            .headers()
+            .get(actix_web::http::header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let cookie = actix_web::cookie::Cookie::parse(cookie_header.to_string()).unwrap();
+        assert_eq!(cookie.name(), AUTHN_STATE_COOKIE);
+        assert!(cookie.secure().unwrap_or(false));
+        assert!(cookie.http_only().unwrap_or(false));
+        assert_eq!(cookie.path(), Some("/"));
+        assert_eq!(cookie.same_site(), Some(actix_web::cookie::SameSite::None));
+        assert!(is_generated_browser_state(cookie.value()));
+
+        let location = response
+            .headers()
+            .get(actix_web::http::header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let redirected_request = actix_web::test::TestRequest::get()
+            .uri(location)
+            .to_http_request();
+        let adapter = crate::request_adapter::ActixHttpRequest::new(&redirected_request, &[]);
+        let decoded = gamlastan::bindings::redirect::redirect_decode(&adapter).unwrap();
+        let xml = std::str::from_utf8(&decoded.saml_xml).unwrap();
+        let document = gamlastan::xml::parse_secure(xml).unwrap();
+        let logout_request = gamlastan::xml::deserialize::parse_saml::<
+            gamlastan::core::protocol::logout::LogoutRequestRef<'_>,
+        >(&document)
+        .unwrap()
+        .to_owned();
+
+        assert!(config
+            .request_id_tracker
+            .consume_bound(&logout_request.id, cookie.value()));
+        assert!(!config
+            .request_id_tracker
+            .consume_bound(&logout_request.id, cookie.value()));
     }
 }

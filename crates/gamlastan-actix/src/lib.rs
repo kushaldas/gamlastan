@@ -52,4 +52,4 @@ pub use request_adapter::ActixHttpRequest;
 pub use response_adapter::{
     metadata_response, post_binding_response, redirect_binding_response, ActixResponseBuilder,
 };
-pub use sp::{SloCallback, SpLogoutEvent, SpSigningContext};
+pub use sp::{SloCallback, SloCallbackFuture, SpLogoutEvent, SpSigningContext};

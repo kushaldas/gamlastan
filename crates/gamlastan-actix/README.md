@@ -32,10 +32,12 @@ async fn main() -> std::io::Result<()> {
     .with_metadata_url("https://sp.example.com/metadata");
 
     let config = web::Data::new(sp_config);
-    let slo_callback: SloCallback = Box::new(|event, request| {
+    let slo_callback: SloCallback = Box::new(|event, request| Box::pin(async move {
         let _ = (event, request);
-        // Invalidate the matching local application session here.
-    });
+        // Await durable local-session invalidation here. Returning an error
+        // prevents gamlastan from reporting protocol success.
+        Ok(())
+    }));
     let slo_callback = web::Data::new(slo_callback);
 
     HttpServer::new(move || {
@@ -50,15 +52,22 @@ async fn main() -> std::io::Result<()> {
 }
 ```
 
-> **HTTPS is required for solicited logins.** The ready SP binds every
-> AuthnRequest to the initiating browser with a `Secure`, `HttpOnly`
+> **HTTPS is required for solicited login and logout.** The ready SP binds
+> every AuthnRequest and LogoutRequest to the initiating browser with a
+> `Secure`, `HttpOnly`
 > `__Host-gamlastan_authn_state` cookie (five-minute lifetime, matching the
 > request-tracker TTL). Browsers only store `Secure` cookies over HTTPS, so an
 > SP served over plain HTTP — including local development — never receives the
-> cookie back and every solicited response is rejected at the ACS with
-> "InResponseTo does not match". Terminate TLS in front of the SP (or serve
-> HTTPS directly) in every environment. IdP-initiated responses must be enabled
-> explicitly with `SecurityConfig::allow_unsolicited_responses`.
+> cookie back and every solicited response is rejected. Terminate TLS in front
+> of the SP (or serve HTTPS directly) in every environment. IdP-initiated SSO
+> responses must be enabled explicitly with
+> `SecurityConfig::allow_unsolicited_responses`.
+
+The SLO callback is asynchronous and fallible so applications can await an
+external session store. It should make invalidation durable and idempotent
+before returning `Ok(())`. On `Err`, gamlastan returns no SAML success, but the
+message's replay or correlation reservation remains terminal and cannot be
+retried.
 
 ## IdP Quick Start
 
