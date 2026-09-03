@@ -78,10 +78,12 @@ was found (tracker miss / expiry), instead of treating it as unsolicited.
 `IdpConfig` carries a registry of trusted SPs. The SSO handler validates the
 request-supplied `AssertionConsumerServiceURL` against SP metadata; the artifact
 and SLO handlers require a trusted, signature-bound, correctly-addressed message
-before consuming an artifact or destroying a session. The ready handlers do not
-offer a generic transport-only bypass because they cannot bind a claimed SAML
-Issuer to an mTLS principal; deployments needing that model must implement a
-custom handler with an explicit certificate-to-entity-ID mapping.
+before consuming an artifact or destroying a session. IdP SLO accepts either a
+valid HTTP-Redirect query signature or an enveloped XML signature and verifies
+both when both representations are present. The ready handlers do not offer a
+generic transport-only bypass because they cannot bind a claimed SAML Issuer to
+an mTLS principal; deployments needing that model must implement a custom
+handler with an explicit certificate-to-entity-ID mapping.
 
 Federation deployments that learn SP metadata from MDQ rather than registering
 SPs statically implement `TrustedSpResolver` (over a `gamlastan_mdq::MdqClient`)

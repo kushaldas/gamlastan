@@ -30,16 +30,18 @@ transport peer to a claimed SAML issuer.
 1. Scan metadata child lists once while preserving structural comments and
    processing instructions and rejecting either when it separates meaningful
    text.
-2. Retain assertion replay IDs until `NotOnOrAfter` plus the accepted clock
-   skew, using checked time arithmetic.
+2. Retain assertion replay IDs until the earlier of `NotOnOrAfter` plus the
+   accepted clock skew and the bounded assertion-age window, using checked time
+   arithmetic. Do not retain entries whose acceptance deadline is already due.
 3. Extend `ArtifactStore` with recipient-aware store and atomic
    requester-aware consume operations. Legacy stores remain source compatible
    but the new operations fail closed until implemented. The ready IdP uses
    only requester-aware resolution.
 4. Resolve IdP logout targets through the authenticated SP participant. Match
    the full participant NameID, including qualifiers and `SPProvidedID`, plus
-   any supplied SessionIndex. Encrypted NameIDs require a custom decrypting
-   handler rather than returning false success.
+   any supplied SessionIndex. Treat omitted NameID Format as the explicit SAML
+   `unspecified` format. Encrypted NameIDs require a custom decrypting handler
+   rather than returning false success.
 5. Add stateful LogoutRequest validation that bounds `IssueInstant`, applies a
    maximum age and clock skew, and atomically reserves an issuer-scoped replay
    key before session mutation. Ready SP and IdP configurations use dedicated
@@ -62,10 +64,11 @@ transport peer to a claimed SAML issuer.
    `allow_unsolicited_responses` opt-in, and the core profile returns
    `UnsolicitedNotAllowed`.
 9. Supersede ADR 0030 while retaining its metadata trust, signature, issuer, and
-   destination requirements. Ready destructive IdP handlers always require a
-   signature bound to trusted SP metadata. A transport-only deployment must use
-   a custom handler that maps the authenticated transport identity to an entity
-   ID; the generic bypass is removed.
+   destination requirements. Ready destructive IdP handlers always require an
+   HTTP-Redirect or enveloped XML signature bound to trusted SP metadata and
+   verify every signature representation present. A transport-only deployment
+   must use a custom handler that maps the authenticated transport identity to
+   an entity ID; the generic bypass is removed.
 10. The PySAML2 compatibility layer retains its public shapes and existing
    logout replay controls. It reads PySAML2's `allow_unsolicited` setting and
    maps missing correlation to `UnsolicitedResponse`; deployments that
@@ -97,5 +100,6 @@ Regression coverage exercises wide comment-bearing metadata, replay during
 clock skew, issuer-scoped LogoutRequest replay and freshness, exact participant
 and SessionIndex matching, fail-closed legacy artifact stores, unsolicited SSO
 default denial and explicit opt-in, async SLO callback success and failure,
-browser-bound LogoutResponse correlation, and PySAML2 `allow_unsolicited`
-behavior.
+browser-bound LogoutResponse correlation, Redirect-only and mixed-signature
+IdP SLO, omitted/explicit unspecified NameID equivalence, bounded replay-cache
+retention, and PySAML2 `allow_unsolicited` behavior.

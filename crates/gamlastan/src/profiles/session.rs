@@ -6,6 +6,7 @@
 use chrono::{DateTime, Utc};
 
 use crate::core::assertion::name_id::NameId;
+use crate::core::constants::NAMEID_UNSPECIFIED;
 
 /// A participant in a SAML session (typically an SP that received an assertion).
 #[derive(Debug, Clone)]
@@ -232,7 +233,14 @@ fn participant_matches(
 ) -> bool {
     participant.entity_id == requester_entity_id
         && participant.name_id_value == name_id.value
-        && participant.name_id_format == name_id.format
+        // SAML Core defines an omitted Format as the SAML 1.1
+        // "unspecified" URI, so those two wire representations identify the
+        // same participant.
+        && participant
+            .name_id_format
+            .as_deref()
+            .unwrap_or(NAMEID_UNSPECIFIED)
+            == name_id.format.as_deref().unwrap_or(NAMEID_UNSPECIFIED)
         && participant.name_qualifier == name_id.name_qualifier
         && participant.sp_name_qualifier == name_id.sp_name_qualifier
         && participant.sp_provided_id == name_id.sp_provided_id
@@ -338,6 +346,52 @@ mod tests {
                 &name_id,
                 &["_different".to_string()]
             )
+            .is_empty());
+    }
+
+    #[test]
+    fn participant_lookup_normalizes_omitted_unspecified_name_id_format() {
+        let store = InMemorySessionStore::new();
+        let mut session = make_session("_s1");
+        session.participants = vec![make_participant("https://sp.example.com")];
+        store.create_session(session);
+
+        let explicit_unspecified = NameId {
+            value: "user@example.com".to_string(),
+            format: Some(NAMEID_UNSPECIFIED.to_string()),
+            name_qualifier: None,
+            sp_name_qualifier: None,
+            sp_provided_id: None,
+        };
+        assert_eq!(
+            store
+                .get_sessions_for_participant("https://sp.example.com", &explicit_unspecified, &[])
+                .len(),
+            1
+        );
+
+        let mut explicit_participant = make_participant("https://sp.example.com");
+        explicit_participant.name_id_format = Some(NAMEID_UNSPECIFIED.to_string());
+        let mut reverse_session = make_session("_s2");
+        reverse_session.participants = vec![explicit_participant];
+        store.create_session(reverse_session);
+        let omitted = NameId {
+            format: None,
+            ..explicit_unspecified.clone()
+        };
+        assert_eq!(
+            store
+                .get_sessions_for_participant("https://sp.example.com", &omitted, &[])
+                .len(),
+            2
+        );
+
+        let different_format = NameId {
+            format: Some(crate::core::constants::NAMEID_EMAIL.to_string()),
+            ..omitted
+        };
+        assert!(store
+            .get_sessions_for_participant("https://sp.example.com", &different_format, &[])
             .is_empty());
     }
 

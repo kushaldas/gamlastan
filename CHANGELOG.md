@@ -59,20 +59,26 @@ where needed to correct protocol handling.
   linear scan, preventing quadratic CPU consumption before MDQ signature
   verification while preserving legitimate structural metadata comments.
 - Assertion replay entries now remain live through the complete acceptance
-  window, including clock skew and future IssueInstant fallback lifetimes.
-  Assertion IssueInstant values beyond accepted clock skew are rejected, and
-  the in-memory replay cache prunes expired distinct IDs without scanning its
-  live map on every insertion.
+  window, including clock skew and future IssueInstant fallback lifetimes,
+  while never outliving the bounded assertion-age window. Assertion
+  IssueInstant values beyond accepted clock skew are rejected, and the
+  in-memory replay cache prunes expired distinct IDs without retaining
+  already-due entries that would trigger a full-map scan on every insertion.
 - Artifact resolution now binds atomic lookup and consumption to the
   authenticated requesting SP, preventing a trusted peer from resolving or
   burning another SP's artifact.
 - Ready IdP SLO now destroys only sessions containing the authenticated SP as an
   exact participant, with full NameID and requested SessionIndex matching.
+  Omitted NameID Format and the explicit SAML `unspecified` format are treated
+  as equivalent, as required by SAML Core.
 - Ready SP and IdP SLO handlers now reject stale, future-dated, and replayed
   LogoutRequests using issuer-scoped replay keys. Ready SP SLO also requires
   successful local-session invalidation before reporting protocol success, and
   binds SP-initiated LogoutResponse correlation to the browser that issued the
   LogoutRequest to prevent logout CSRF across sessions.
+- Ready IdP SLO accepts a valid HTTP-Redirect query signature or enveloped XML
+  signature from the resolved SP metadata key and verifies every signature
+  representation present.
 - Unsolicited SSO responses are rejected by default at the shared response
   validation boundary. Explicitly enabled unsolicited responses must still omit
   `InResponseTo` and pass all signature, audience, recipient, time, and replay
