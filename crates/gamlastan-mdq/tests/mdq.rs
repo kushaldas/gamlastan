@@ -13,7 +13,7 @@ use bytes::Bytes;
 use chrono::{DateTime, TimeZone, Utc};
 
 use gamlastan::crypto::keys::loader;
-use gamlastan::crypto::{KeyUsage, KeysManager, SamlSigner};
+use gamlastan::crypto::{AlgorithmPolicy, KeyUsage, KeysManager, SamlSigner};
 use gamlastan::metadata::MetadataError;
 use gamlastan_mdq::{MdqClient, MdqError, MdqTransform, MetadataFetcher, RequiredRole};
 
@@ -201,14 +201,42 @@ fn signer() -> SamlSigner {
 }
 
 fn signature_template(reference_id: &str, cert: &str) -> String {
+    signature_template_with_algorithms(
+        reference_id,
+        cert,
+        "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
+        "http://www.w3.org/2001/04/xmlenc#sha256",
+    )
+}
+
+fn signature_template_with_algorithms(
+    reference_id: &str,
+    cert: &str,
+    signature_algorithm: &str,
+    digest_algorithm: &str,
+) -> String {
     format!(
-        r##"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#{reference_id}"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{cert}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></ds:Signature>"##
+        r##"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="{signature_algorithm}"/><ds:Reference URI="#{reference_id}"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms><ds:DigestMethod Algorithm="{digest_algorithm}"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{cert}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></ds:Signature>"##
     )
 }
 
 /// Build a signed IdP EntityDescriptor with the given ID/entityID.
 fn signed_idp(entity_id: &str, id: &str) -> String {
     let template = signature_template(id, &cert_b64());
+    let xml = format!(
+        r#"<md:EntityDescriptor xmlns:md="{MD_NS}" ID="{id}" entityID="{entity_id}">{template}<md:IDPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol"><md:SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect" Location="https://idp.example.com/sso"/></md:IDPSSODescriptor></md:EntityDescriptor>"#
+    );
+    signer().sign_enveloped(&xml).unwrap()
+}
+
+fn signed_idp_with_algorithms(
+    entity_id: &str,
+    id: &str,
+    signature_algorithm: &str,
+    digest_algorithm: &str,
+) -> String {
+    let template =
+        signature_template_with_algorithms(id, &cert_b64(), signature_algorithm, digest_algorithm);
     let xml = format!(
         r#"<md:EntityDescriptor xmlns:md="{MD_NS}" ID="{id}" entityID="{entity_id}">{template}<md:IDPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol"><md:SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect" Location="https://idp.example.com/sso"/></md:IDPSSODescriptor></md:EntityDescriptor>"#
     );
@@ -493,6 +521,138 @@ async fn signed_metadata_verifies_with_cert() {
         .unwrap();
     let ed = client.get("https://idp.example.com/idp").await.unwrap();
     assert_eq!(ed.entity_id, "https://idp.example.com/idp");
+}
+
+fn equivalent_algorithm_policies() -> (AlgorithmPolicy, AlgorithmPolicy) {
+    const RSA_SHA256: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
+    const RSA_SHA384: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384";
+    const SHA256: &str = "http://www.w3.org/2001/04/xmlenc#sha256";
+    const SHA384: &str = "http://www.w3.org/2001/04/xmldsig-more#sha384";
+
+    (
+        AlgorithmPolicy::allow_only([RSA_SHA256, RSA_SHA384], [SHA256, SHA384]),
+        AlgorithmPolicy::allow_only(
+            [RSA_SHA384, RSA_SHA256, RSA_SHA256],
+            [SHA384, SHA256, SHA256],
+        ),
+    )
+}
+
+#[tokio::test]
+async fn equivalent_policy_does_not_invalidate_dynamic_cache() {
+    let body = signed_idp("https://idp.example.com/equivalent", "_entity_equivalent");
+    let fetcher = MockFetcher::serving(&body);
+    let (first_policy, equivalent_policy) = equivalent_algorithm_policies();
+    let client = MdqClient::with_fetcher("https://mdq.example.org/", fetcher.clone())
+        .with_algorithm_policy(first_policy)
+        .add_signing_cert_pem(SIGN_CERT_PEM.as_bytes())
+        .unwrap();
+
+    client
+        .get("https://idp.example.com/equivalent")
+        .await
+        .expect("initial metadata verifies");
+    assert_eq!(client.cache_len(), 1);
+
+    let client = client.with_algorithm_policy(equivalent_policy);
+    assert_eq!(client.cache_len(), 1, "equivalent policy keeps the cache");
+    client
+        .get("https://idp.example.com/equivalent")
+        .await
+        .expect("cached metadata remains available");
+    assert_eq!(fetcher.calls(), 1, "equivalent policy must not refetch");
+}
+
+#[tokio::test]
+async fn equivalent_policy_is_a_no_op_for_static_client() {
+    let body = signed_idp(
+        "https://idp.example.com/static",
+        "_entity_static_equivalent",
+    );
+    let (first_policy, equivalent_policy) = equivalent_algorithm_policies();
+    let client = MdqClient::with_fetcher("https://unused/", MockFetcher::serving(&body))
+        .with_algorithm_policy(first_policy)
+        .add_signing_cert_pem(SIGN_CERT_PEM.as_bytes())
+        .unwrap()
+        .into_static_url(
+            "https://idp.example.com/metadata",
+            "https://idp.example.com/static",
+        )
+        .await;
+
+    let client = client.with_algorithm_policy(equivalent_policy);
+    let entity = client
+        .get("https://idp.example.com/static")
+        .await
+        .expect("equivalent policy must not invalidate static metadata");
+    assert_eq!(entity.entity_id, "https://idp.example.com/static");
+}
+
+#[tokio::test]
+async fn legacy_signed_metadata_requires_explicit_permissive_policy() {
+    const RSA_SHA1: &str = "http://www.w3.org/2000/09/xmldsig#rsa-sha1";
+    const SHA1: &str = "http://www.w3.org/2000/09/xmldsig#sha1";
+
+    let body = signed_idp_with_algorithms(
+        "https://idp.example.com/legacy",
+        "_entity_legacy",
+        RSA_SHA1,
+        SHA1,
+    );
+    let default_client =
+        MdqClient::with_fetcher("https://mdq.example.org/", MockFetcher::serving(&body))
+            .add_signing_cert_pem(SIGN_CERT_PEM.as_bytes())
+            .unwrap();
+    let error = default_client
+        .get("https://idp.example.com/legacy")
+        .await
+        .expect_err("the default policy must reject SHA-1 metadata");
+    assert!(
+        matches!(&error, MdqError::SignatureInvalid(reason) if reason.contains("not allowed by SAML algorithm policy")),
+        "unexpected error: {error:?}"
+    );
+
+    let permissive_fetcher = MockFetcher::serving(&body);
+    let permissive_client =
+        MdqClient::with_fetcher("https://mdq.example.org/", permissive_fetcher.clone())
+            .with_algorithm_policy(AlgorithmPolicy::permissive())
+            .add_signing_cert_pem(SIGN_CERT_PEM.as_bytes())
+            .unwrap();
+    let entity = permissive_client
+        .get("https://idp.example.com/legacy")
+        .await
+        .expect("explicit compatibility policy should preserve legacy verification");
+    assert_eq!(entity.entity_id, "https://idp.example.com/legacy");
+
+    let tightened_client = permissive_client.with_algorithm_policy(AlgorithmPolicy::default());
+    let error = tightened_client
+        .get("https://idp.example.com/legacy")
+        .await
+        .expect_err("tightening policy must invalidate permissively cached metadata");
+    assert!(matches!(error, MdqError::SignatureInvalid(_)));
+    assert_eq!(
+        permissive_fetcher.calls(),
+        2,
+        "metadata must be refetched and reverified after a policy change"
+    );
+}
+
+#[tokio::test]
+#[should_panic(
+    expected = "algorithm policy must be configured before converting an MDQ client to static mode"
+)]
+async fn static_client_policy_cannot_change_after_metadata_is_accepted() {
+    let body = signed_idp("https://idp.example.com/static", "_entity_static_policy");
+    let client = MdqClient::with_fetcher("https://unused/", MockFetcher::serving(&body))
+        .add_signing_cert_pem(SIGN_CERT_PEM.as_bytes())
+        .unwrap()
+        .into_static_url(
+            "https://idp.example.com/metadata",
+            "https://idp.example.com/static",
+        )
+        .await;
+
+    let _ = client.with_algorithm_policy(AlgorithmPolicy::permissive());
 }
 
 #[tokio::test]

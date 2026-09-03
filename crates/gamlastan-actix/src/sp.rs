@@ -459,7 +459,8 @@ fn trusted_idp_verifier(config: &SpConfig) -> Result<SamlVerifier, SamlActixErro
     Ok(SamlVerifier::with_ds_object_rejection(
         keys,
         config.security.reject_signatures_with_ds_object,
-    ))
+    )
+    .with_algorithm_policy(config.algorithm_policy.clone()))
 }
 
 /// Verify an incoming SLO message signature and bind it to the parsed message ID.
@@ -901,7 +902,7 @@ mod tests {
     use gamlastan::core::identifiers::SamlVersion;
     use gamlastan::core::protocol::status::Status;
     use gamlastan::core::protocol::{response::Response, response::ResponseBase};
-    use gamlastan::crypto::KeyUsage;
+    use gamlastan::crypto::{AlgorithmPolicy, KeyUsage};
     use gamlastan::metadata::types::endpoint::Endpoint;
     use gamlastan::metadata::types::entity_descriptor::{EntityDescriptor, EntityRoles};
     use gamlastan::metadata::types::idp::IdpSsoDescriptor;
@@ -1191,6 +1192,16 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.to_string().contains("cannot be used for verification"));
+    }
+
+    #[test]
+    fn trusted_idp_verifier_inherits_algorithm_policy() {
+        let policy = AlgorithmPolicy::allow_only(Vec::<String>::new(), Vec::<String>::new());
+        let config = test_sp_config_with_signing_cert(&cert_b64(SIGN_CERT_PEM))
+            .with_algorithm_policy(policy.clone());
+
+        let verifier = trusted_idp_verifier(&config).expect("fixture certificate is usable");
+        assert_eq!(verifier.algorithm_policy(), &policy);
     }
 
     #[test]

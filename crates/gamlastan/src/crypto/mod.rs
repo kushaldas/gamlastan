@@ -6,7 +6,7 @@
 //! operations including:
 //!
 //! - **Signing** - Enveloped XML-DSig signatures for assertions, responses, and metadata
-//! - **Verification** - XML-DSig signature verification with E91 ds:Object rejection
+//! - **Verification** - XML-DSig verification with algorithm policy and E91 ds:Object rejection
 //! - **Encryption** - XML Encryption for EncryptedAssertion, EncryptedID, EncryptedAttribute
 //! - **Decryption** - XML Decryption of encrypted SAML elements
 //! - **Digest** - Hash computation for artifact SourceID and reference digests
@@ -49,7 +49,8 @@
 //!
 //! ## Errata Compliance
 //!
-//! - **E81**: Any algorithm supported by bergshamra is allowed
+//! - **E81**: bergshamra provides extensible algorithm support; gamlastan applies
+//!   a configurable, secure-by-default SAML verification allowlist
 //! - **E91**: Reject signatures containing `<ds:Object>` elements
 //! - **E93**: Prefer GCM modes over CBC for built-in integrity protection
 
@@ -63,7 +64,7 @@ pub mod signer;
 pub mod verifier;
 
 // Re-export the primary types for convenience.
-pub use config::CryptoConfig;
+pub use config::{AlgorithmPolicy, CryptoConfig};
 pub use decryptor::SamlDecryptor;
 pub use encryptor::SamlEncryptor;
 pub use error::CryptoError;

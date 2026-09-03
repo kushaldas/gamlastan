@@ -8,7 +8,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 
 use gamlastan::crypto::keys::loader;
-use gamlastan::crypto::{Key, KeysManager};
+use gamlastan::crypto::{AlgorithmPolicy, Key, KeysManager};
 use gamlastan::metadata::{
     CachedMetadata, EntityDescriptor, MetadataCache, MetadataError, MetadataStore,
 };
@@ -44,6 +44,7 @@ pub enum RequiredRole {
 pub(crate) struct Trust {
     certs: KeysManager,
     has_certs: bool,
+    algorithm_policy: AlgorithmPolicy,
 }
 
 impl Trust {
@@ -51,6 +52,7 @@ impl Trust {
         Self {
             certs: KeysManager::new(),
             has_certs: false,
+            algorithm_policy: AlgorithmPolicy::default(),
         }
     }
 
@@ -60,6 +62,10 @@ impl Trust {
 
     pub(crate) fn keys(&self) -> &KeysManager {
         &self.certs
+    }
+
+    pub(crate) fn algorithm_policy(&self) -> &AlgorithmPolicy {
+        &self.algorithm_policy
     }
 
     fn add_key(&mut self, key: Key) {
@@ -212,6 +218,34 @@ impl<F: MetadataFetcher> MdqClient<F> {
     /// verified.
     pub fn allow_unverified(mut self) -> Self {
         self.allow_unverified = true;
+        self
+    }
+
+    /// Set the signature and reference-digest algorithms accepted on metadata.
+    ///
+    /// The secure SAML allowlist is used by default. Use
+    /// [`AlgorithmPolicy::permissive`] only for a federation that deliberately
+    /// retains legacy XML-DSig algorithms. Changing the policy clears dynamic
+    /// metadata cached under the previous policy.
+    ///
+    /// Configure this before [`into_static_file`](Self::into_static_file) or
+    /// [`into_static_url`](Self::into_static_url), because a static client has
+    /// already accepted its one metadata document under the existing policy.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a different policy is assigned after conversion to static
+    /// mode. Reusing the current policy is a no-op.
+    pub fn with_algorithm_policy(mut self, policy: AlgorithmPolicy) -> Self {
+        if self.trust.algorithm_policy == policy {
+            return self;
+        }
+        assert!(
+            self.static_state.is_none(),
+            "algorithm policy must be configured before converting an MDQ client to static mode"
+        );
+        self.clear_cache();
+        self.trust.algorithm_policy = policy;
         self
     }
 

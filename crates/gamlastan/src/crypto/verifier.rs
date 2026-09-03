@@ -6,9 +6,130 @@ use bergshamra_dsig::{
 };
 use bergshamra_keys::{KeyUsage, KeysManager};
 
+use crate::crypto::config::AlgorithmPolicy;
 use crate::crypto::error::CryptoError;
+use crate::xml::uppsala::{Document, NodeId};
 
 const DEFAULT_HMAC_MIN_OUT_LEN_BITS: usize = 160;
+const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
+
+#[derive(Clone, Copy)]
+enum SignatureSelection {
+    First,
+    All,
+}
+
+fn is_dsig_element(doc: &Document<'_>, node: NodeId, local_name: &str) -> bool {
+    doc.element(node).is_some_and(|element| {
+        element.name.local_name == local_name
+            && element.name.namespace_uri.as_deref() == Some(XMLDSIG_NS)
+    })
+}
+
+fn exactly_one_direct_dsig_child(
+    doc: &Document<'_>,
+    parent: NodeId,
+    local_name: &str,
+) -> Result<NodeId, CryptoError> {
+    let mut matches = doc
+        .children_iter(parent)
+        .filter(|child| is_dsig_element(doc, *child, local_name));
+    let first = matches.next().ok_or_else(|| {
+        CryptoError::VerificationFailed(format!(
+            "algorithm policy check requires exactly one direct ds:{local_name} child; found none"
+        ))
+    })?;
+    if matches.next().is_some() {
+        return Err(CryptoError::VerificationFailed(format!(
+            "algorithm policy check requires exactly one direct ds:{local_name} child; found multiple"
+        )));
+    }
+    Ok(first)
+}
+
+fn algorithm_attribute<'a>(
+    doc: &'a Document<'a>,
+    node: NodeId,
+    element_name: &str,
+) -> Result<&'a str, CryptoError> {
+    doc.element(node)
+        .and_then(|element| element.get_attribute("Algorithm"))
+        .ok_or_else(|| {
+            CryptoError::VerificationFailed(format!(
+                "ds:{element_name} is missing its Algorithm attribute"
+            ))
+        })
+}
+
+fn validate_signature_algorithms(
+    doc: &Document<'_>,
+    signature: NodeId,
+    policy: &AlgorithmPolicy,
+    reject_hmac_signatures: bool,
+) -> Result<(), CryptoError> {
+    let signed_info = exactly_one_direct_dsig_child(doc, signature, "SignedInfo")?;
+    let signature_method = exactly_one_direct_dsig_child(doc, signed_info, "SignatureMethod")?;
+    let signature_algorithm = algorithm_attribute(doc, signature_method, "SignatureMethod")?;
+
+    if reject_hmac_signatures && crate::security::signature::is_hmac_algorithm(signature_algorithm)
+    {
+        return Err(CryptoError::VerificationFailed(
+            "HMAC-based SignatureMethod is not allowed for SAML signatures".to_string(),
+        ));
+    }
+    if !policy.allows_signature_algorithm(signature_algorithm) {
+        return Err(CryptoError::DisallowedSignatureAlgorithm(
+            signature_algorithm.to_string(),
+        ));
+    }
+
+    for reference in doc
+        .children_iter(signed_info)
+        .filter(|child| is_dsig_element(doc, *child, "Reference"))
+    {
+        let digest_method = exactly_one_direct_dsig_child(doc, reference, "DigestMethod")?;
+        let digest_algorithm = algorithm_attribute(doc, digest_method, "DigestMethod")?;
+        if !policy.allows_digest_algorithm(digest_algorithm) {
+            return Err(CryptoError::DisallowedDigestAlgorithm(
+                digest_algorithm.to_string(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_enveloped_algorithm_policy(
+    signed_xml: &str,
+    policy: &AlgorithmPolicy,
+    reject_hmac_signatures: bool,
+    selection: SignatureSelection,
+) -> Result<(), CryptoError> {
+    if policy.is_permissive() && !reject_hmac_signatures {
+        return Ok(());
+    }
+
+    let doc = crate::xml::parse_secure_metadata(signed_xml).map_err(|error| {
+        CryptoError::VerificationFailed(format!(
+            "could not parse XML for algorithm policy check: {error}"
+        ))
+    })?;
+    let Some(root) = doc.document_element() else {
+        return Ok(());
+    };
+
+    for signature in std::iter::once(root)
+        .chain(doc.descendants(root))
+        .filter(|node| is_dsig_element(&doc, *node, "Signature"))
+    {
+        validate_signature_algorithms(&doc, signature, policy, reject_hmac_signatures)?;
+        if matches!(selection, SignatureSelection::First) {
+            break;
+        }
+    }
+
+    Ok(())
+}
 
 /// SAML-specific signature verifier that wraps bergshamra's XML-DSig verification.
 ///
@@ -17,6 +138,10 @@ const DEFAULT_HMAC_MIN_OUT_LEN_BITS: usize = 160;
 /// - Redirect query signature: detached signature for HTTP Redirect binding
 ///
 /// Per E91: optionally rejects signatures containing `<ds:Object>` elements.
+/// Before any cryptographic operation, [`AlgorithmPolicy`] restricts signature
+/// and Reference-digest methods to modern SAML defaults. Applications that must
+/// verify legacy XML security fixtures can opt into an exact custom policy or
+/// [`AlgorithmPolicy::permissive`].
 ///
 /// **Security**: By default, uses `trusted_keys_only` mode which only uses
 /// pre-configured keys from the KeysManager for signature verification.
@@ -29,6 +154,8 @@ const DEFAULT_HMAC_MIN_OUT_LEN_BITS: usize = 160;
 /// Wrapping attacks where signed content is moved to an unexpected position.
 pub struct SamlVerifier {
     keys_manager: KeysManager,
+    /// Signature and reference-digest algorithms accepted before crypto dispatch.
+    algorithm_policy: AlgorithmPolicy,
     /// Per E91: reject signatures containing ds:Object elements.
     reject_ds_object: bool,
     /// When true (default), only use keys from the KeysManager, never inline.
@@ -63,6 +190,7 @@ impl SamlVerifier {
     pub fn new(keys_manager: KeysManager) -> Self {
         Self {
             keys_manager,
+            algorithm_policy: AlgorithmPolicy::default(),
             reject_ds_object: true,
             trusted_keys_only: true,
             strict_verification: true,
@@ -78,6 +206,7 @@ impl SamlVerifier {
     pub fn with_ds_object_rejection(keys_manager: KeysManager, reject_ds_object: bool) -> Self {
         Self {
             keys_manager,
+            algorithm_policy: AlgorithmPolicy::default(),
             reject_ds_object,
             trusted_keys_only: true,
             strict_verification: true,
@@ -92,6 +221,17 @@ impl SamlVerifier {
     /// Set whether to skip X.509 time checks (NotBefore/NotAfter).
     pub fn set_skip_time_checks(&mut self, skip: bool) {
         self.skip_time_checks = skip;
+    }
+
+    /// Set the signature and reference-digest algorithm policy.
+    pub fn set_algorithm_policy(&mut self, policy: AlgorithmPolicy) {
+        self.algorithm_policy = policy;
+    }
+
+    /// Set the algorithm policy using builder style.
+    pub fn with_algorithm_policy(mut self, policy: AlgorithmPolicy) -> Self {
+        self.set_algorithm_policy(policy);
+        self
     }
 
     /// Set whether to only use trusted keys from the KeysManager.
@@ -154,28 +294,10 @@ impl SamlVerifier {
     ///
     /// Keep this enabled for SAML: IdPs sign with asymmetric keys, so a
     /// legitimate response never uses HMAC. Disable only for non-SAML interop
-    /// suites that deliberately exercise symmetric-key signatures.
+    /// suites that deliberately exercise symmetric-key signatures. The
+    /// configured [`AlgorithmPolicy`] must independently allow HMAC as well.
     pub fn set_reject_hmac_signatures(&mut self, reject: bool) {
         self.reject_hmac_signatures = reject;
-    }
-
-    /// Fail closed if HMAC rejection is enabled and the document carries an
-    /// HMAC `<ds:SignatureMethod>`. Shared by both enveloped verify paths and
-    /// run before any cryptographic verification. A parse failure is treated as
-    /// a rejection (CWE-693), consistent with the E91 ds:Object guard.
-    fn reject_hmac_if_configured(&self, signed_xml: &str) -> Result<(), CryptoError> {
-        if !self.reject_hmac_signatures {
-            return Ok(());
-        }
-        match crate::security::signature::contains_hmac_signature_method(signed_xml) {
-            Ok(true) => Err(CryptoError::VerificationFailed(
-                "HMAC-based SignatureMethod is not allowed for SAML signatures".to_string(),
-            )),
-            Ok(false) => Ok(()),
-            Err(e) => Err(CryptoError::VerificationFailed(format!(
-                "could not parse XML for HMAC SignatureMethod check: {e}"
-            ))),
-        }
     }
 
     /// Verify a signed SAML message (assertion, response, metadata).
@@ -200,8 +322,12 @@ impl SamlVerifier {
             }
         }
 
-        // Reject HMAC SignatureMethod before cryptographic verification.
-        self.reject_hmac_if_configured(signed_xml)?;
+        validate_enveloped_algorithm_policy(
+            signed_xml,
+            &self.algorithm_policy,
+            self.reject_hmac_signatures,
+            SignatureSelection::First,
+        )?;
 
         let ctx = self.dsig_context();
         let result = verify(&ctx, signed_xml)?;
@@ -236,8 +362,12 @@ impl SamlVerifier {
             }
         }
 
-        // Reject HMAC SignatureMethod before cryptographic verification.
-        self.reject_hmac_if_configured(signed_xml)?;
+        validate_enveloped_algorithm_policy(
+            signed_xml,
+            &self.algorithm_policy,
+            self.reject_hmac_signatures,
+            SignatureSelection::All,
+        )?;
 
         let ctx = self.dsig_context();
         let results = verify_all(&ctx, signed_xml)?;
@@ -286,6 +416,14 @@ impl SamlVerifier {
                 "HMAC-based SignatureMethod is not allowed for SAML signatures".to_string(),
             ));
         }
+        if !self
+            .algorithm_policy
+            .allows_signature_algorithm(algorithm_uri)
+        {
+            return Err(CryptoError::DisallowedSignatureAlgorithm(
+                algorithm_uri.to_string(),
+            ));
+        }
         let sig_alg = bergshamra_crypto::sign::from_uri(algorithm_uri)
             .map_err(CryptoError::BergshamraError)?;
         let key = self
@@ -308,11 +446,158 @@ impl SamlVerifier {
     pub fn keys_manager(&self) -> &KeysManager {
         &self.keys_manager
     }
+
+    /// Get the active signature and Reference-digest algorithm policy.
+    pub fn algorithm_policy(&self) -> &AlgorithmPolicy {
+        &self.algorithm_policy
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const RSA_SHA1: &str = "http://www.w3.org/2000/09/xmldsig#rsa-sha1";
+    const RSA_SHA256: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
+    const SHA1: &str = "http://www.w3.org/2000/09/xmldsig#sha1";
+    const SHA256: &str = "http://www.w3.org/2001/04/xmlenc#sha256";
+
+    fn signature(signature_algorithm: &str, digest_algorithm: &str) -> String {
+        format!(
+            r#"<ds:Signature xmlns:ds="{XMLDSIG_NS}">
+<ds:SignedInfo>
+<ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+<ds:SignatureMethod Algorithm="{signature_algorithm}"/>
+<ds:Reference URI="">
+<ds:DigestMethod Algorithm="{digest_algorithm}"/>
+<ds:DigestValue>AA==</ds:DigestValue>
+</ds:Reference>
+</ds:SignedInfo>
+<ds:SignatureValue>AA==</ds:SignatureValue>
+</ds:Signature>"#
+        )
+    }
+
+    fn validate(xml: &str, policy: &AlgorithmPolicy) -> Result<(), CryptoError> {
+        validate_enveloped_algorithm_policy(xml, policy, true, SignatureSelection::All)
+    }
+
+    #[test]
+    fn default_policy_accepts_sha2_and_rejects_sha1() {
+        let policy = AlgorithmPolicy::default();
+        validate(&signature(RSA_SHA256, SHA256), &policy).expect("SHA-256 is allowed");
+
+        let signature_error =
+            validate(&signature(RSA_SHA1, SHA256), &policy).expect_err("RSA-SHA1 must be rejected");
+        assert!(
+            matches!(&signature_error, CryptoError::DisallowedSignatureAlgorithm(uri) if uri == RSA_SHA1),
+            "unexpected error: {signature_error}"
+        );
+        let digest_error =
+            validate(&signature(RSA_SHA256, SHA1), &policy).expect_err("SHA-1 must be rejected");
+        assert!(
+            matches!(&digest_error, CryptoError::DisallowedDigestAlgorithm(uri) if uri == SHA1),
+            "unexpected error: {digest_error}"
+        );
+    }
+
+    #[test]
+    fn custom_and_permissive_policies_support_explicit_legacy_interop() {
+        let custom = AlgorithmPolicy::allow_only([RSA_SHA1], [SHA1]);
+        validate_enveloped_algorithm_policy(
+            &signature(RSA_SHA1, SHA1),
+            &custom,
+            false,
+            SignatureSelection::All,
+        )
+        .expect("an explicitly allowlisted legacy pair is accepted");
+
+        validate_enveloped_algorithm_policy(
+            &signature(RSA_SHA1, SHA1),
+            &AlgorithmPolicy::permissive(),
+            false,
+            SignatureSelection::All,
+        )
+        .expect("permissive policy preserves backend compatibility");
+    }
+
+    #[test]
+    fn empty_allowlists_deny_all_algorithms() {
+        let policy = AlgorithmPolicy::allow_only(Vec::<String>::new(), Vec::<String>::new());
+        let error = validate(&signature(RSA_SHA256, SHA256), &policy)
+            .expect_err("an empty allowlist must deny all signatures");
+        assert!(
+            matches!(&error, CryptoError::DisallowedSignatureAlgorithm(_)),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn single_and_all_verification_inspect_the_same_signatures_as_backend() {
+        let xml = format!(
+            "<root>{}{}</root>",
+            signature(RSA_SHA256, SHA256),
+            signature(RSA_SHA1, SHA1)
+        );
+        validate_enveloped_algorithm_policy(
+            &xml,
+            &AlgorithmPolicy::default(),
+            true,
+            SignatureSelection::First,
+        )
+        .expect("single verification only selects the first signature");
+        assert!(matches!(
+            validate_enveloped_algorithm_policy(
+                &xml,
+                &AlgorithmPolicy::default(),
+                true,
+                SignatureSelection::All,
+            ),
+            Err(CryptoError::DisallowedSignatureAlgorithm(uri)) if uri == RSA_SHA1
+        ));
+    }
+
+    #[test]
+    fn policy_is_namespace_aware_and_ignores_non_reference_digests() {
+        let prefixed = signature(RSA_SHA256, SHA256)
+            .replace("ds:", "sig:")
+            .replace("xmlns:ds", "xmlns:sig");
+        validate(&prefixed, &AlgorithmPolicy::default())
+            .expect("the XMLDSig prefix is not security-significant");
+
+        let xml = format!(
+            r#"<root xmlns:ds="{XMLDSIG_NS}" xmlns:xenc="http://www.w3.org/2001/04/xmlenc#">
+<xenc:EncryptedKey><xenc:EncryptionMethod><ds:DigestMethod Algorithm="{SHA1}"/></xenc:EncryptionMethod></xenc:EncryptedKey>
+{}
+</root>"#,
+            signature(RSA_SHA256, SHA256)
+        );
+        validate(&xml, &AlgorithmPolicy::default())
+            .expect("an XML Encryption OAEP digest is not a Signature Reference digest");
+    }
+
+    #[test]
+    fn malformed_algorithm_structure_fails_closed() {
+        let missing_algorithm =
+            signature(RSA_SHA256, SHA256).replace(&format!("Algorithm=\"{SHA256}\""), "");
+        let error = validate(&missing_algorithm, &AlgorithmPolicy::default())
+            .expect_err("missing Algorithm must fail closed");
+        assert!(
+            matches!(&error, CryptoError::VerificationFailed(reason) if reason.contains("missing its Algorithm")),
+            "unexpected error: {error}"
+        );
+
+        let duplicate = signature(RSA_SHA256, SHA256).replace(
+            &format!("<ds:SignatureMethod Algorithm=\"{RSA_SHA256}\"/>"),
+            &format!(
+                "<ds:SignatureMethod Algorithm=\"{RSA_SHA256}\"/><ds:SignatureMethod Algorithm=\"{RSA_SHA256}\"/>"
+            ),
+        );
+        assert!(matches!(
+            validate(&duplicate, &AlgorithmPolicy::default()),
+            Err(CryptoError::VerificationFailed(reason)) if reason.contains("found multiple")
+        ));
+    }
 
     /// Verifies that HMAC Redirect signatures fail before verification-key lookup.
     #[test]
@@ -326,5 +611,24 @@ mod tests {
             )
             .expect_err("SAML redirect HMAC must be rejected by policy");
         assert!(err.to_string().contains("HMAC-based SignatureMethod"));
+    }
+
+    /// Reproduces issue #24: a backend-supported SHA-1 signature method must
+    /// be rejected by the SAML policy before verification-key lookup.
+    #[test]
+    fn redirect_verification_rejects_sha1_before_key_lookup() {
+        let verifier = SamlVerifier::new(KeysManager::new());
+        let err = verifier
+            .verify_redirect_query(
+                b"SAMLRequest=x&SigAlg=rsa-sha1",
+                b"signature",
+                "http://www.w3.org/2000/09/xmldsig#rsa-sha1",
+            )
+            .expect_err("SAML redirect RSA-SHA1 must be rejected by policy");
+        assert!(
+            err.to_string()
+                .contains("not allowed by SAML algorithm policy"),
+            "unexpected error: {err}"
+        );
     }
 }
