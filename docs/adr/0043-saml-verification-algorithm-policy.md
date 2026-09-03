@@ -35,8 +35,10 @@ signature, while all-signature verification consumes each one.
    for XMLDSig Reference digests.
 3. Provide custom allowlists and an explicitly named `permissive` policy for
    legacy interoperability. An empty allowlist denies all algorithms; it never
-   disables policy. HMAC rejection remains a separate control and must also be
-   explicitly disabled before HMAC can be used.
+   disables policy. Allowlists are sorted and deduplicated so policy equality
+   represents the accepted set, independent of input order. HMAC rejection
+   remains a separate control and must also be explicitly disabled before HMAC
+   can be used.
 4. Inspect expanded XML names, require exactly one direct `SignedInfo` and
    `SignatureMethod` per selected `Signature`, and exactly one direct
    `DigestMethod` per direct `Reference`. Missing `Algorithm` attributes,

@@ -66,6 +66,17 @@ pub struct AlgorithmPolicy {
     allowed_digest_algorithms: Option<Vec<String>>,
 }
 
+fn normalized_algorithms<I, T>(algorithms: I) -> Vec<String>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<String>,
+{
+    let mut algorithms: Vec<String> = algorithms.into_iter().map(Into::into).collect();
+    algorithms.sort_unstable();
+    algorithms.dedup();
+    algorithms
+}
+
 impl Default for AlgorithmPolicy {
     fn default() -> Self {
         use bergshamra_core::algorithm;
@@ -103,7 +114,8 @@ impl AlgorithmPolicy {
 
     /// Construct a policy containing exactly the supplied allowlists.
     ///
-    /// Empty iterators deny all algorithms of the corresponding kind.
+    /// Empty iterators deny all algorithms of the corresponding kind. Order and
+    /// duplicate entries are ignored when policies are compared.
     pub fn allow_only<S, D, SI, DI>(signature_algorithms: S, digest_algorithms: D) -> Self
     where
         S: IntoIterator<Item = SI>,
@@ -112,12 +124,8 @@ impl AlgorithmPolicy {
         DI: Into<String>,
     {
         Self {
-            allowed_signature_algorithms: Some(
-                signature_algorithms.into_iter().map(Into::into).collect(),
-            ),
-            allowed_digest_algorithms: Some(
-                digest_algorithms.into_iter().map(Into::into).collect(),
-            ),
+            allowed_signature_algorithms: Some(normalized_algorithms(signature_algorithms)),
+            allowed_digest_algorithms: Some(normalized_algorithms(digest_algorithms)),
         }
     }
 
@@ -129,7 +137,7 @@ impl AlgorithmPolicy {
         I: IntoIterator<Item = T>,
         T: Into<String>,
     {
-        self.allowed_signature_algorithms = Some(algorithms.into_iter().map(Into::into).collect());
+        self.allowed_signature_algorithms = Some(normalized_algorithms(algorithms));
         self
     }
 
@@ -141,7 +149,7 @@ impl AlgorithmPolicy {
         I: IntoIterator<Item = T>,
         T: Into<String>,
     {
-        self.allowed_digest_algorithms = Some(algorithms.into_iter().map(Into::into).collect());
+        self.allowed_digest_algorithms = Some(normalized_algorithms(algorithms));
         self
     }
 
@@ -210,5 +218,45 @@ impl CryptoConfig {
                 .to_string(),
             ..Self::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AlgorithmPolicy;
+
+    #[test]
+    fn algorithm_policy_equality_ignores_order_and_duplicates() {
+        let left = AlgorithmPolicy::allow_only(
+            ["urn:signature:b", "urn:signature:a", "urn:signature:a"],
+            ["urn:digest:b", "urn:digest:a", "urn:digest:a"],
+        );
+        let right = AlgorithmPolicy::allow_only(
+            ["urn:signature:a", "urn:signature:b"],
+            ["urn:digest:a", "urn:digest:b"],
+        );
+
+        assert_eq!(left, right);
+        assert_eq!(
+            left.allowed_signature_algorithms(),
+            Some(["urn:signature:a".to_string(), "urn:signature:b".to_string()].as_slice())
+        );
+        assert_eq!(
+            left.allowed_digest_algorithms(),
+            Some(["urn:digest:a".to_string(), "urn:digest:b".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn algorithm_policy_builders_normalize_replacement_lists() {
+        let left = AlgorithmPolicy::permissive()
+            .with_signature_algorithms(["urn:signature:b", "urn:signature:a", "urn:signature:a"])
+            .with_digest_algorithms(["urn:digest:b", "urn:digest:a", "urn:digest:a"]);
+        let right = AlgorithmPolicy::allow_only(
+            ["urn:signature:a", "urn:signature:b"],
+            ["urn:digest:a", "urn:digest:b"],
+        );
+
+        assert_eq!(left, right);
     }
 }

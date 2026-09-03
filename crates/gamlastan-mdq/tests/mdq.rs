@@ -523,6 +523,71 @@ async fn signed_metadata_verifies_with_cert() {
     assert_eq!(ed.entity_id, "https://idp.example.com/idp");
 }
 
+fn equivalent_algorithm_policies() -> (AlgorithmPolicy, AlgorithmPolicy) {
+    const RSA_SHA256: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
+    const RSA_SHA384: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384";
+    const SHA256: &str = "http://www.w3.org/2001/04/xmlenc#sha256";
+    const SHA384: &str = "http://www.w3.org/2001/04/xmldsig-more#sha384";
+
+    (
+        AlgorithmPolicy::allow_only([RSA_SHA256, RSA_SHA384], [SHA256, SHA384]),
+        AlgorithmPolicy::allow_only(
+            [RSA_SHA384, RSA_SHA256, RSA_SHA256],
+            [SHA384, SHA256, SHA256],
+        ),
+    )
+}
+
+#[tokio::test]
+async fn equivalent_policy_does_not_invalidate_dynamic_cache() {
+    let body = signed_idp("https://idp.example.com/equivalent", "_entity_equivalent");
+    let fetcher = MockFetcher::serving(&body);
+    let (first_policy, equivalent_policy) = equivalent_algorithm_policies();
+    let client = MdqClient::with_fetcher("https://mdq.example.org/", fetcher.clone())
+        .with_algorithm_policy(first_policy)
+        .add_signing_cert_pem(SIGN_CERT_PEM.as_bytes())
+        .unwrap();
+
+    client
+        .get("https://idp.example.com/equivalent")
+        .await
+        .expect("initial metadata verifies");
+    assert_eq!(client.cache_len(), 1);
+
+    let client = client.with_algorithm_policy(equivalent_policy);
+    assert_eq!(client.cache_len(), 1, "equivalent policy keeps the cache");
+    client
+        .get("https://idp.example.com/equivalent")
+        .await
+        .expect("cached metadata remains available");
+    assert_eq!(fetcher.calls(), 1, "equivalent policy must not refetch");
+}
+
+#[tokio::test]
+async fn equivalent_policy_is_a_no_op_for_static_client() {
+    let body = signed_idp(
+        "https://idp.example.com/static",
+        "_entity_static_equivalent",
+    );
+    let (first_policy, equivalent_policy) = equivalent_algorithm_policies();
+    let client = MdqClient::with_fetcher("https://unused/", MockFetcher::serving(&body))
+        .with_algorithm_policy(first_policy)
+        .add_signing_cert_pem(SIGN_CERT_PEM.as_bytes())
+        .unwrap()
+        .into_static_url(
+            "https://idp.example.com/metadata",
+            "https://idp.example.com/static",
+        )
+        .await;
+
+    let client = client.with_algorithm_policy(equivalent_policy);
+    let entity = client
+        .get("https://idp.example.com/static")
+        .await
+        .expect("equivalent policy must not invalidate static metadata");
+    assert_eq!(entity.entity_id, "https://idp.example.com/static");
+}
+
 #[tokio::test]
 async fn legacy_signed_metadata_requires_explicit_permissive_policy() {
     const RSA_SHA1: &str = "http://www.w3.org/2000/09/xmldsig#rsa-sha1";
