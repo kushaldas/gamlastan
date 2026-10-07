@@ -53,3 +53,4 @@ rewriting history (mark the old one `Superseded by NNNN`).
 | [0042](0042-complete-inbound-protocol-validation.md) | Complete inbound protocol validation | Accepted |
 | [0043](0043-saml-verification-algorithm-policy.md) | Enforce algorithms at the SAML verification boundary | Accepted |
 | [0044](0044-bind-security-state-to-acceptance-context.md) | Bind security state to its acceptance context | Accepted |
+| [0045](0045-idp-response-orchestration.md) | IdP response orchestration as a crate-level engine | Accepted |

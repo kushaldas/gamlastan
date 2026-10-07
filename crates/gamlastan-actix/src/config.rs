@@ -25,14 +25,17 @@ use gamlastan::security::replay::{InMemoryReplayCache, ReplayCache};
 /// front-channel LogoutRequest messages before any state is mutated.
 #[derive(Clone)]
 pub struct TrustedSp {
-    /// The SP `entityID` (matched against the message `Issuer`).
-    pub entity_id: String,
-    /// The SP's SSO descriptor (ACS endpoints, signing certificates).
-    pub sp_sso: SpSsoDescriptor,
+    /// The SP's full entity descriptor (SSO descriptor plus entity
+    /// extensions such as `mdattr:EntityAttributes` entity categories). Its
+    /// own `entity_id` field is the registration key (matched against the
+    /// message `Issuer`) — kept as the single source of truth so a
+    /// registration key can never disagree with the descriptor's own
+    /// identity.
+    pub entity: EntityDescriptor,
 }
 
 /// Future returned by [`TrustedSpResolver::resolve_sp`].
-pub type ResolveSpFuture<'a> = Pin<Box<dyn Future<Output = Option<SpSsoDescriptor>> + Send + 'a>>;
+pub type ResolveSpFuture<'a> = Pin<Box<dyn Future<Output = Option<EntityDescriptor>> + Send + 'a>>;
 
 /// Resolves trusted SP metadata by `entityID` at request time.
 ///
@@ -67,13 +70,7 @@ pub type ResolveSpFuture<'a> = Pin<Box<dyn Future<Output = Option<SpSsoDescripto
 ///
 /// impl TrustedSpResolver for MdqSpResolver {
 ///     fn resolve_sp<'a>(&'a self, entity_id: &'a str) -> ResolveSpFuture<'a> {
-///         Box::pin(async move {
-///             self.0
-///                 .get(entity_id)
-///                 .await
-///                 .ok()
-///                 .and_then(|ed| ed.sp_sso_descriptors().first().cloned())
-///         })
+///         Box::pin(async move { self.0.get(entity_id).await.ok() })
 ///     }
 /// }
 ///
@@ -82,7 +79,11 @@ pub type ResolveSpFuture<'a> = Pin<Box<dyn Future<Output = Option<SpSsoDescripto
 ///     .with_sp_resolver(resolver);
 /// ```
 pub trait TrustedSpResolver: Send + Sync {
-    /// Resolve the SP metadata for `entity_id`, or `None` if it is not trusted.
+    /// Resolve the SP's full entity descriptor for `entity_id`, or `None` if
+    /// it is not trusted. The full descriptor (not just the SSO role) is
+    /// needed so entity-category attribute-release policy
+    /// (`ReleasePolicy`/`EntityCategoryPolicy`) can be applied through
+    /// `idp::orchestrator`.
     fn resolve_sp<'a>(&'a self, entity_id: &'a str) -> ResolveSpFuture<'a>;
 }
 
@@ -557,28 +558,42 @@ impl IdpConfig {
     ///   signing certificates before mutating session state or consuming an
     ///   artifact.
     ///
-    /// `entity_id` is matched against the message `Issuer`; `sp_sso` is the SP's
-    /// SSO descriptor (typically parsed from the SP's metadata document).
+    /// `entity` is the SP's full entity descriptor (typically parsed from the
+    /// SP's metadata document); its own `entity_id` field is matched against
+    /// the message `Issuer` — there is deliberately no separate registration
+    /// key, so a mismatched call site cannot bind one issuer's authorization
+    /// to a different entity's ACS endpoints and release policy. Entity
+    /// categories and other entity-level extensions carry through to
+    /// `idp::orchestrator`'s attribute-release policy. Use
+    /// [`EntityDescriptor::for_sp`](gamlastan::metadata::types::entity_descriptor::EntityDescriptor::for_sp)
+    /// to wrap a bare `SpSsoDescriptor` when those aren't needed.
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// ```
     /// # use gamlastan_actix::IdpConfig;
+    /// # use gamlastan::metadata::types::entity_descriptor::EntityDescriptor;
+    /// # use gamlastan::metadata::types::role_descriptor::{RoleDescriptorBase, SsoDescriptorBase};
     /// # use gamlastan::metadata::types::sp::SpSsoDescriptor;
-    /// # let sp_sso: SpSsoDescriptor = unimplemented!("parsed from SP metadata");
+    /// # let sp_sso = SpSsoDescriptor {
+    /// #     sso_base: SsoDescriptorBase {
+    /// #         base: RoleDescriptorBase::new(vec!["urn:oasis:names:tc:SAML:2.0:protocol".to_string()]),
+    /// #         artifact_resolution_services: vec![],
+    /// #         single_logout_services: vec![],
+    /// #         manage_name_id_services: vec![],
+    /// #         name_id_formats: vec![],
+    /// #     },
+    /// #     authn_requests_signed: None,
+    /// #     want_assertions_signed: None,
+    /// #     assertion_consumer_services: vec![],
+    /// #     attribute_consuming_services: vec![],
+    /// # };
     /// let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
-    ///     .with_trusted_sp("https://sp.example.com", sp_sso);
+    ///     .with_trusted_sp(EntityDescriptor::for_sp("https://sp.example.com", sp_sso));
     /// assert!(config.trusted_sp("https://sp.example.com").is_some());
     /// ```
-    pub fn with_trusted_sp(
-        mut self,
-        entity_id: impl Into<String>,
-        sp_sso: SpSsoDescriptor,
-    ) -> Self {
-        self.trusted_sps.push(TrustedSp {
-            entity_id: entity_id.into(),
-            sp_sso,
-        });
+    pub fn with_trusted_sp(mut self, entity: EntityDescriptor) -> Self {
+        self.trusted_sps.push(TrustedSp { entity });
         self
     }
 
@@ -607,10 +622,20 @@ impl IdpConfig {
     /// assert!(config.trusted_sp("https://sp.example.com").is_none());
     /// ```
     pub fn trusted_sp(&self, entity_id: &str) -> Option<&SpSsoDescriptor> {
+        self.trusted_sp_entity(entity_id)
+            .and_then(|entity| entity.saml2_sp_sso_descriptor())
+    }
+
+    /// Look up a registered trusted SP's full entity descriptor by `entityID`.
+    ///
+    /// Unlike [`trusted_sp`](Self::trusted_sp), this carries entity-level
+    /// extensions (entity categories, `subject-id:req`, etc.) needed for
+    /// `idp::orchestrator`'s attribute-release policy.
+    pub fn trusted_sp_entity(&self, entity_id: &str) -> Option<&EntityDescriptor> {
         self.trusted_sps
             .iter()
-            .find(|sp| sp.entity_id == entity_id)
-            .map(|sp| &sp.sp_sso)
+            .find(|sp| sp.entity.entity_id == entity_id)
+            .map(|sp| &sp.entity)
     }
 
     /// Build an XML-DSig verifier from the signing certificates of every
@@ -638,7 +663,20 @@ impl IdpConfig {
     pub fn trusted_sp_verifier(&self) -> Option<SamlVerifier> {
         let mut keys = KeysManager::new();
         for sp in &self.trusted_sps {
-            self.add_sp_keys(&mut keys, &sp.sp_sso);
+            for sp_sso in sp.entity.sp_sso_descriptors() {
+                // A key published only for a non-SAML-2.0 role (e.g. a
+                // legacy SAML 1.1 SPSSODescriptor) must not become trusted
+                // for SAML 2.0 messages - the same protocol scoping
+                // trusted_sp/resolve_trusted_sp already apply when selecting
+                // a single SP's descriptor.
+                if sp_sso
+                    .sso_base
+                    .base
+                    .supports_protocol(gamlastan::core::constants::PROTOCOL_SAML2)
+                {
+                    self.add_sp_keys(&mut keys, sp_sso);
+                }
+            }
         }
         self.finish_verifier(keys)
     }
@@ -888,5 +926,66 @@ mod tests {
         config.request_id_tracker.store("_test_id");
         assert!(config.request_id_tracker.consume("_test_id"));
         assert!(!config.request_id_tracker.consume("_test_id"));
+    }
+
+    #[test]
+    fn trusted_sp_verifier_excludes_certs_from_non_saml2_roles() {
+        // Regression: trusted_sp_verifier aggregated signing certificates
+        // from *every* SPSSODescriptor an entity has, including a role
+        // scoped to a different protocol. A key published only for a SAML
+        // 1.1 role must not become trusted for verifying SAML 2.0 messages.
+        use gamlastan::metadata::types::key_descriptor::KeyDescriptor;
+        use gamlastan::metadata::types::role_descriptor::{RoleDescriptorBase, SsoDescriptorBase};
+        use gamlastan::metadata::types::sp::SpSsoDescriptor;
+
+        const SIGN_CERT_PEM: &str =
+            include_str!("../../gamlastan-mdq/tests/fixtures/sign-cert.pem");
+        fn cert_b64(pem: &str) -> String {
+            pem.lines()
+                .filter(|line| !line.contains("CERTIFICATE"))
+                .collect::<String>()
+        }
+        fn sp_sso_for(protocol: &str, with_cert: bool) -> SpSsoDescriptor {
+            let mut base = RoleDescriptorBase::new(vec![protocol.to_string()]);
+            if with_cert {
+                let key_info = format!(
+                    r#"<ds:KeyInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:X509Data><ds:X509Certificate>{}</ds:X509Certificate></ds:X509Data></ds:KeyInfo>"#,
+                    cert_b64(SIGN_CERT_PEM)
+                );
+                base.key_descriptors.push(KeyDescriptor::signing(key_info));
+            }
+            SpSsoDescriptor {
+                sso_base: SsoDescriptorBase {
+                    base,
+                    artifact_resolution_services: vec![],
+                    single_logout_services: vec![],
+                    manage_name_id_services: vec![],
+                    name_id_formats: vec![],
+                },
+                authn_requests_signed: None,
+                want_assertions_signed: Some(true),
+                assertion_consumer_services: vec![],
+                attribute_consuming_services: vec![],
+            }
+        }
+
+        let mut entity = make_dummy_entity_descriptor();
+        entity.entity_id = "https://sp.example.com".to_string();
+        entity.roles = EntityRoles::Roles {
+            idp_sso: vec![],
+            sp_sso: vec![
+                sp_sso_for("urn:oasis:names:tc:SAML:1.1:protocol", true),
+                sp_sso_for("urn:oasis:names:tc:SAML:2.0:protocol", false),
+            ],
+            authn_authority: vec![],
+            attr_authority: vec![],
+            pdp: vec![],
+        };
+        let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso")
+            .with_trusted_sp(entity);
+        assert!(
+            config.trusted_sp_verifier().is_none(),
+            "a cert published only for a non-SAML-2.0 role must not be trusted"
+        );
     }
 }

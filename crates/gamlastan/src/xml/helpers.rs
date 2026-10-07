@@ -18,6 +18,29 @@ pub fn find_child_element<'a>(
     doc.first_child_element_by_name_ns(parent, namespace_uri, local_name)
 }
 
+/// Find the direct child element matching the given namespace URI and local
+/// name, for an element the schema allows at most once.
+///
+/// Errors if it occurs more than once. Reading only the first of several would
+/// silently ignore the rest, so a later duplicate could carry a constraint
+/// (a `RequestedAuthnContext`, a `Subject`) that is never seen.
+pub fn find_unique_child_element<'a>(
+    doc: &'a Document<'a>,
+    parent: NodeId,
+    namespace_uri: &str,
+    local_name: &str,
+) -> Result<Option<NodeId>, XmlError> {
+    let found = find_child_elements(doc, parent, namespace_uri, local_name);
+    match found.as_slice() {
+        [] => Ok(None),
+        [only] => Ok(Some(*only)),
+        _ => Err(XmlError::UnexpectedElement(format!(
+            "{local_name} must occur at most once, found {}",
+            found.len()
+        ))),
+    }
+}
+
 /// Find all direct child elements matching the given namespace URI and local name.
 pub fn find_child_elements<'a>(
     doc: &'a Document<'a>,

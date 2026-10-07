@@ -54,6 +54,7 @@
 //! - **E91**: Reject signatures containing `<ds:Object>` elements
 //! - **E93**: Prefer GCM modes over CBC for built-in integrity protection
 
+pub mod algorithms;
 pub mod config;
 pub mod decryptor;
 pub mod digest;
@@ -64,6 +65,7 @@ pub mod signer;
 pub mod verifier;
 
 // Re-export the primary types for convenience.
+pub use algorithms::{DigestMethod, SignatureMethod, SigningAlgorithms, SigningPreference};
 pub use config::{AlgorithmPolicy, CryptoConfig};
 pub use decryptor::SamlDecryptor;
 pub use encryptor::SamlEncryptor;

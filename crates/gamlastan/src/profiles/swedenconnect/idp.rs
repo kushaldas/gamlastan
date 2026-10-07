@@ -160,6 +160,7 @@ mod tests {
             authn_context_class_ref: None,
             client_address: None,
             attributes: vec![],
+            authenticating_authorities: vec![],
         }
     }
 

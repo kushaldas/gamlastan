@@ -15,7 +15,10 @@
 //! - [`authn_broker`] - matching `RequestedAuthnContext` against available
 //!   authentication methods;
 //! - [`assertion_store`] - storing issued assertions so back-channel
-//!   AssertionIDRequest and AuthnQuery messages can be answered.
+//!   AssertionIDRequest and AuthnQuery messages can be answered;
+//! - [`orchestrator`] - composes the primitives above into the SAML Web
+//!   Browser SSO response-assembly flow (the one tested place the bridge
+//!   between policy and a signed `Response` lives).
 //!
 //! # Deployment Model
 //!
@@ -76,12 +79,13 @@
 //!     "https://idp.example.org/metadata",
 //!     "https://sp.example.org/metadata",
 //!     "alice",
-//! );
+//! )?;
 //!
 //! assert_eq!(
 //!     name_id.sp_name_qualifier.as_deref(),
 //!     Some("https://sp.example.org/metadata")
 //! );
+//! # Ok::<(), gamlastan::idp::StoreError>(())
 //! ```
 
 pub mod assertion_store;
@@ -89,10 +93,20 @@ pub mod authn_broker;
 pub mod entity_category;
 pub mod eptid;
 pub mod ident;
+pub mod orchestrator;
 pub mod policy;
 
 pub use assertion_store::{AssertionStore, InMemoryAssertionStore};
 pub use authn_broker::{AuthnBroker, AuthnMethod};
 pub use eptid::Eptid;
-pub use ident::{IdentDb, IdentError, IdentityStore, InMemoryIdentityStore};
+pub use ident::{
+    IdentDb, IdentError, IdentityStore, InMemoryIdentityStore, InMemoryKeyValueStore, InsertError,
+    KeyValueStore, NameIdConstructor, NameIdFilter, StoreError,
+};
+pub use orchestrator::{
+    check_request, create_authn_response, create_denial_response, AttributeRelease,
+    AuthenticatedSubject, AuthnMethodRef, ChainedRelease, Denial, DeniedResponse, Disposition,
+    EstablishedSession, IssuedResponse, PassThroughRelease, ResponseEngine, ResponseOutcome,
+    ResponseParams,
+};
 pub use policy::{PolicyEntry, PolicyError, ReleasePolicy, SignTargets};

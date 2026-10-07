@@ -4,13 +4,17 @@
 // Methods are registered with an AuthnContext class ref, an opaque
 // method identifier (URL, handler name, ...) and a numeric security
 // level. `pick()` honors the request's Comparison attribute:
-// - exact:   methods at exactly the level of the requested class
+// - exact:   methods whose class ref is literally one of the requested
+//            ones (saml-core-2.0-os 3.3.2.2.1), unless
+//            `AuthnBroker::allow_exact_level_matching` restores pysaml2's looser,
+//            level-based "exact" (see that method's docs)
 // - minimum: methods at that level or higher
 // - maximum: methods at that level or lower
 // - better:  methods at a strictly higher level
 //
-// Matching is level-based across *all* registered methods, seeded by the
-// level registered for the requested class ref — pysaml2 semantics.
+// Minimum/maximum/better matching is level-based across *all* registered
+// methods, seeded by the level registered for the requested class ref —
+// pysaml2 semantics.
 
 use crate::core::constants;
 use crate::core::protocol::request::{AuthnContextComparison, RequestedAuthnContext};
@@ -36,12 +40,36 @@ pub struct AuthnMethod {
 pub struct AuthnBroker {
     methods: Vec<AuthnMethod>,
     next: usize,
+    /// pysaml2-compatibility switch for `exact` matching. Default `false`
+    /// (the secure, spec-compliant default): per saml-core-2.0-os
+    /// 3.3.2.2.1, `Comparison="exact"` requires the resulting AuthnContext
+    /// to be a literal match of one of the requested class refs, not just
+    /// registered at the same security level. pysaml2's own `AuthnBroker`
+    /// (and gamlastan's, before this switch) instead broadens "exact" to
+    /// every method at the same level as the requested class, which can
+    /// hand back — and let the orchestrator accept — a class ref the SP
+    /// never listed. Set `true` to restore that looser pysaml2 behaviour.
+    allow_exact_level_matching: bool,
 }
 
 impl AuthnBroker {
     /// Create an empty broker.
     pub fn new() -> Self {
         AuthnBroker::default()
+    }
+
+    /// Whether no method is registered.
+    pub fn is_empty(&self) -> bool {
+        self.methods.is_empty()
+    }
+
+    /// Restore pysaml2's looser `exact` semantics (matching by security
+    /// level rather than literal class-ref membership). See
+    /// [`AuthnBroker`]'s field docs for why the default (`false`) differs
+    /// from pysaml2.
+    pub fn allow_exact_level_matching(mut self, enable: bool) -> Self {
+        self.allow_exact_level_matching = enable;
+        self
     }
 
     /// Register an authentication method; returns its unique reference.
@@ -122,6 +150,15 @@ impl AuthnBroker {
             return vec![];
         }
 
+        // Per saml-core-2.0-os 3.3.2.2.1, "exact" requires a literal match
+        // of one of the requested class refs - not "same security level as
+        // some method registered under that class ref", which is what the
+        // level-threshold walk below computes. Skip it entirely unless
+        // pysaml2 compat is requested.
+        if comparison == AuthnContextComparison::Exact && !self.allow_exact_level_matching {
+            return same_class;
+        }
+
         // Seed level: the strongest level satisfying the comparison among
         // the methods registered for the requested class.
         let mut base = same_class[0].level;
@@ -148,38 +185,48 @@ impl AuthnBroker {
     }
 
     /// Find the authentication methods satisfying a request
-    /// (pysaml2 `pick()`), strongest preference first.
+    /// (pysaml2 `pick()`), in the request's class-ref order and, within one
+    /// ref, registration order. This is **not** sorted by strength: a weaker
+    /// method registered first is returned first. [`check_request`](crate::idp::orchestrator::check_request)
+    /// sorts its `Authenticate` methods strongest first, so use that if the
+    /// first entry should be the strongest.
     ///
     /// With no RequestedAuthnContext the `unspecified` class is matched
-    /// with `minimum` comparison.
+    /// with `minimum` comparison. If no `unspecified` method is registered
+    /// there is no baseline to compare against, and since nothing was
+    /// requested every registered method qualifies, so all are returned (in
+    /// registration order).
     pub fn pick(&self, requested: Option<&RequestedAuthnContext>) -> Vec<&AuthnMethod> {
         let Some(req) = requested else {
-            return self.pick_by_class_ref(
+            let picked = self.pick_by_class_ref(
                 constants::AUTHN_CONTEXT_UNSPECIFIED,
                 AuthnContextComparison::Minimum,
             );
+            if picked.is_empty() {
+                return self.methods.iter().collect();
+            }
+            return picked;
         };
 
+        // The listed refs are alternatives (saml-core-2.0-os 3.3.2.2.1:
+        // "one of the authentication contexts specified"), for every
+        // comparison: a method qualifies if it satisfies any of them. The
+        // result keeps the request's order, so earlier refs are preferred.
         let comparison = req.comparison;
-        if !req.authn_context_class_refs.is_empty() {
-            if comparison == AuthnContextComparison::Exact {
-                let mut result: Vec<&AuthnMethod> = Vec::new();
-                for class_ref in &req.authn_context_class_refs {
-                    for m in self.pick_by_class_ref(class_ref, comparison) {
-                        if !result.contains(&m) {
-                            result.push(m);
-                        }
-                    }
-                }
-                result
-            } else {
-                self.pick_by_class_ref(&req.authn_context_class_refs[0], comparison)
-            }
-        } else if !req.authn_context_decl_refs.is_empty() {
-            self.pick_by_class_ref(&req.authn_context_decl_refs[0], comparison)
+        let refs = if !req.authn_context_class_refs.is_empty() {
+            &req.authn_context_class_refs
         } else {
-            vec![]
+            &req.authn_context_decl_refs
+        };
+        let mut result: Vec<&AuthnMethod> = Vec::new();
+        for class_ref in refs {
+            for m in self.pick_by_class_ref(class_ref, comparison) {
+                if !result.contains(&m) {
+                    result.push(m);
+                }
+            }
         }
+        result
     }
 }
 
@@ -226,8 +273,24 @@ mod tests {
     }
 
     #[test]
-    fn test_exact_includes_same_level_other_class() {
+    fn test_exact_excludes_same_level_other_class_by_default() {
+        // Per saml-core-2.0-os 3.3.2.2.1, "exact" must be a literal match of
+        // a requested class ref: a method at the same security level but a
+        // different, unrequested class ref must not be offered.
         let mut b = broker();
+        b.add("urn:example:otp", "/login/otp", 2, None);
+        let picked = b.pick(Some(&requested(
+            &[constants::AUTHN_CONTEXT_PASSWORD_PROTECTED_TRANSPORT],
+            AuthnContextComparison::Exact,
+        )));
+        let methods: Vec<_> = picked.iter().map(|m| m.method.as_str()).collect();
+        assert_eq!(methods, vec!["/login/ppt"]);
+    }
+
+    #[test]
+    fn test_exact_includes_same_level_other_class_with_pysaml2_compat() {
+        // The opt-in restores pysaml2's own (spec-noncompliant) broadening.
+        let mut b = broker().allow_exact_level_matching(true);
         b.add("urn:example:otp", "/login/otp", 2, None);
         let picked = b.pick(Some(&requested(
             &[constants::AUTHN_CONTEXT_PASSWORD_PROTECTED_TRANSPORT],
@@ -274,12 +337,70 @@ mod tests {
     }
 
     #[test]
+    fn every_listed_class_ref_is_an_alternative_for_every_comparison() {
+        let b = broker();
+        let unknown = "urn:example:unknown";
+        for comparison in [
+            AuthnContextComparison::Exact,
+            AuthnContextComparison::Minimum,
+            AuthnContextComparison::Maximum,
+            AuthnContextComparison::Better,
+        ] {
+            // An unknown first ref must not hide a satisfiable second one.
+            let single = b.pick(Some(&requested(
+                &[constants::AUTHN_CONTEXT_PASSWORD],
+                comparison,
+            )));
+            let listed = b.pick(Some(&requested(
+                &[unknown, constants::AUTHN_CONTEXT_PASSWORD],
+                comparison,
+            )));
+            assert_eq!(listed, single, "{comparison:?}");
+        }
+        // The union is deduplicated and keeps the request's order.
+        let picked = b.pick(Some(&requested(
+            &[
+                constants::AUTHN_CONTEXT_X509,
+                constants::AUTHN_CONTEXT_PASSWORD,
+            ],
+            AuthnContextComparison::Minimum,
+        )));
+        let methods: Vec<&str> = picked.iter().map(|m| m.method.as_str()).collect();
+        assert_eq!(methods.first(), Some(&"/login/cert"));
+        assert!(methods.contains(&"/login/password"));
+        assert_eq!(
+            methods.len(),
+            methods
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+        );
+    }
+
+    #[test]
     fn test_no_request_defaults_to_unspecified_minimum() {
         let b = broker();
         let picked = b.pick(None);
         // unspecified at level 0, minimum: everything qualifies
         assert_eq!(picked.len(), 4);
         assert_eq!(picked[0].method, "/login/any");
+    }
+
+    #[test]
+    fn no_request_without_an_unspecified_baseline_offers_every_method() {
+        let mut b = AuthnBroker::new();
+        b.add(
+            constants::AUTHN_CONTEXT_PASSWORD,
+            "/login/password",
+            1,
+            None,
+        );
+        b.add(constants::AUTHN_CONTEXT_X509, "/login/cert", 3, None);
+        let picked = b.pick(None);
+        let methods: Vec<&str> = picked.iter().map(|m| m.method.as_str()).collect();
+        assert_eq!(methods, ["/login/password", "/login/cert"]);
+        // Nothing registered stays empty.
+        assert!(AuthnBroker::new().pick(None).is_empty());
     }
 
     #[test]

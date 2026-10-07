@@ -138,12 +138,33 @@ impl AttributeConverter {
 
     /// Build a converter from a shipped static map.
     pub fn from_static(map: &StaticAttributeMap) -> Self {
-        let mut conv = AttributeConverter::new(map.identifier);
-        for (wire, local) in map.fro {
-            conv.fro.insert(wire.to_lowercase(), (*local).to_string());
+        AttributeConverter::from_directions(map.identifier, map.fro, map.to)
+    }
+
+    /// Build a converter from independent inbound and outbound maps: `fro`
+    /// holds (wire name, local name) pairs, `to` holds (local name, wire name)
+    /// pairs. This is the shape of a pysaml2 attribute map (`MAP["fro"]` and
+    /// `MAP["to"]`).
+    ///
+    /// Use this, not [`from_entries`](Self::from_entries), for a map whose two
+    /// directions differ. Real maps do: eduID's deployed `saml_uri` has 83
+    /// inbound and 99 outbound entries, with 13 local names that can be sent
+    /// but are not recognised on the way in. Mirroring such a map into both
+    /// directions would make an SP-supplied attribute name resolve to a local
+    /// attribute it did not before, and for a map where several wire names
+    /// share a local name it would make the outbound name depend on insertion
+    /// order. If a key repeats within one direction, the later entry wins.
+    pub fn from_directions(
+        name_format: impl Into<String>,
+        fro: &[(&str, &str)],
+        to: &[(&str, &str)],
+    ) -> Self {
+        let mut conv = AttributeConverter::new(name_format);
+        for (wire, local) in fro {
+            conv.add_wire_to_local(wire, local);
         }
-        for (local, wire) in map.to {
-            conv.to.insert(local.to_lowercase(), (*wire).to_string());
+        for (local, wire) in to {
+            conv.add_local_to_wire(local, wire);
         }
         conv
     }
@@ -159,8 +180,27 @@ impl AttributeConverter {
     }
 
     /// Add a single wire <-> local mapping (both directions).
+    ///
+    /// Only for a map that really is symmetric. A map with separate inbound and
+    /// outbound entries needs [`add_wire_to_local`](Self::add_wire_to_local) and
+    /// [`add_local_to_wire`](Self::add_local_to_wire), or
+    /// [`from_directions`](Self::from_directions).
     pub fn add_mapping(&mut self, wire: &str, local: &str) {
+        self.add_wire_to_local(wire, local);
+        self.add_local_to_wire(local, wire);
+    }
+
+    /// Add one inbound entry: a received `wire` name resolves to `local`. Does
+    /// not add the reverse, so `local` is not sent as `wire` unless an outbound
+    /// entry says so.
+    pub fn add_wire_to_local(&mut self, wire: &str, local: &str) {
         self.fro.insert(wire.to_lowercase(), local.to_string());
+    }
+
+    /// Add one outbound entry: `local` is sent as `wire`. Does not add the
+    /// reverse, so a received `wire` is not recognised as `local` unless an
+    /// inbound entry says so.
+    pub fn add_local_to_wire(&mut self, local: &str, wire: &str) {
         self.to.insert(local.to_lowercase(), wire.to_string());
     }
 
@@ -407,6 +447,98 @@ pub fn eptid_name_ids(attribute: &Attribute) -> Vec<&NameId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The (wire, local) and (local, wire) lookups a converter answers for every
+    /// name a static map mentions, in either role.
+    fn lookups(
+        conv: &AttributeConverter,
+        map: &StaticAttributeMap,
+    ) -> Vec<(String, Option<String>)> {
+        let mut out = Vec::new();
+        for (wire, local) in map
+            .fro
+            .iter()
+            .map(|(w, l)| (*w, *l))
+            .chain(map.to.iter().map(|(l, w)| (w.to_owned(), l.to_owned())))
+        {
+            out.push((
+                format!("fro:{wire}"),
+                conv.to_local_name(wire).map(str::to_string),
+            ));
+            out.push((
+                format!("to:{local}"),
+                conv.to_wire_name(local).map(str::to_string),
+            ));
+        }
+        out
+    }
+
+    #[test]
+    fn rebuilding_every_shipped_map_through_the_directional_api_is_identical() {
+        for map in DEFAULT_MAPS {
+            let shipped = AttributeConverter::from_static(map);
+            let rebuilt = AttributeConverter::from_directions(map.identifier, map.fro, map.to);
+            assert_eq!(rebuilt.name_format(), shipped.name_format());
+            assert_eq!(
+                lookups(&rebuilt, map),
+                lookups(&shipped, map),
+                "{} must rebuild identically",
+                map.identifier
+            );
+        }
+    }
+
+    #[test]
+    fn the_shipped_maps_are_asymmetric_so_add_mapping_cannot_rebuild_them() {
+        // The reason the directional API exists: mirroring a shipped map's
+        // inbound entries into both directions (what `add_mapping` does) gives
+        // a converter that answers differently from the map itself, so a map
+        // with separate `fro` and `to` cannot be loaded that way.
+        let differs = DEFAULT_MAPS.iter().any(|map| {
+            let mirrored = AttributeConverter::from_entries(map.identifier, map.fro);
+            let shipped = AttributeConverter::from_static(map);
+            lookups(&mirrored, map) != lookups(&shipped, map)
+        });
+        assert!(
+            differs,
+            "expected at least one shipped map whose directions differ"
+        );
+    }
+
+    #[test]
+    fn directional_methods_do_not_invent_the_other_direction() {
+        let mut conv = AttributeConverter::new("fmt");
+        conv.add_wire_to_local("urn:in-only", "InOnly");
+        conv.add_local_to_wire("OutOnly", "urn:out-only");
+        // Inbound only: recognised on the way in, never sent.
+        assert_eq!(conv.to_local_name("urn:in-only"), Some("InOnly"));
+        assert_eq!(conv.to_wire_name("InOnly"), None);
+        // Outbound only: sent, but not recognised when received.
+        assert_eq!(conv.to_wire_name("OutOnly"), Some("urn:out-only"));
+        assert_eq!(conv.to_local_name("urn:out-only"), None);
+        // Lookups stay case-insensitive.
+        assert_eq!(conv.to_local_name("URN:IN-ONLY"), Some("InOnly"));
+        assert_eq!(conv.to_wire_name("outonly"), Some("urn:out-only"));
+    }
+
+    #[test]
+    fn many_wire_names_to_one_local_keep_the_chosen_outbound_name() {
+        // Several wire aliases resolve to one local name inbound, while the
+        // outbound entry fixes the canonical one, whatever the insertion order.
+        let conv = AttributeConverter::from_directions(
+            "fmt",
+            &[
+                ("urn:alias-a", "Mail"),
+                ("urn:canonical", "Mail"),
+                ("urn:alias-b", "Mail"),
+            ],
+            &[("Mail", "urn:canonical")],
+        );
+        for alias in ["urn:alias-a", "urn:canonical", "urn:alias-b"] {
+            assert_eq!(conv.to_local_name(alias), Some("Mail"));
+        }
+        assert_eq!(conv.to_wire_name("Mail"), Some("urn:canonical"));
+    }
 
     #[test]
     fn test_static_maps_loaded() {

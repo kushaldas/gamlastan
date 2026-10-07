@@ -57,7 +57,8 @@
 //!     "https://idp.example.com",
 //!     "https://sp.example.com",
 //!     "alice",
-//! );
+//! )
+//! .unwrap();
 //!
 //! assert_eq!(
 //!     value,
@@ -72,7 +73,7 @@ use crate::core::assertion::attribute::Attribute;
 use crate::core::assertion::name_id::NameId;
 use crate::core::constants;
 use crate::crypto::digest::sha256;
-use crate::idp::ident::{to_hex, IdentityStore, InMemoryIdentityStore};
+use crate::idp::ident::{to_hex, InMemoryKeyValueStore, KeyValueStore, StoreError};
 
 use md5::{Digest, Md5};
 
@@ -134,16 +135,16 @@ pub enum EptidConfigError {
 }
 
 /// eduPersonTargetedID generator (pysaml2 `Eptid`).
-pub struct Eptid<S: IdentityStore = InMemoryIdentityStore> {
+pub struct Eptid<S: KeyValueStore = InMemoryKeyValueStore> {
     secret: String,
     store: S,
     options: EptidOptions,
 }
 
-impl Eptid<InMemoryIdentityStore> {
+impl Eptid<InMemoryKeyValueStore> {
     /// Create a generator with an in-memory cache.
     pub fn new(secret: impl Into<String>) -> Self {
-        Eptid::with_store(InMemoryIdentityStore::new(), secret)
+        Eptid::with_store(InMemoryKeyValueStore::new(), secret)
     }
 
     /// Create a generator with explicit options and an in-memory cache.
@@ -151,11 +152,11 @@ impl Eptid<InMemoryIdentityStore> {
         secret: impl Into<String>,
         options: EptidOptions,
     ) -> Result<Self, EptidConfigError> {
-        Eptid::try_with_store_options(InMemoryIdentityStore::new(), secret, options)
+        Eptid::try_with_store_options(InMemoryKeyValueStore::new(), secret, options)
     }
 }
 
-impl<S: IdentityStore> Eptid<S> {
+impl<S: KeyValueStore> Eptid<S> {
     /// Create a generator over a custom store (pysaml2 `EptidShelve`
     /// analogue — back it with Redis/SQL for persistence).
     pub fn with_store(store: S, secret: impl Into<String>) -> Self {
@@ -205,31 +206,55 @@ impl<S: IdentityStore> Eptid<S> {
 
     /// Get (or create and remember) the eduPersonTargetedID value for a
     /// subject at an SP (pysaml2 `Eptid.get()`).
-    pub fn get(&self, idp_entity_id: &str, sp_entity_id: &str, user_id: &str) -> String {
+    ///
+    /// A cache failure is an error, not a miss: recomputing on a failed read
+    /// could return a different value than the one already issued (for
+    /// example after the secret or digest options changed), which is exactly
+    /// what the cache exists to prevent.
+    pub fn get(
+        &self,
+        idp_entity_id: &str,
+        sp_entity_id: &str,
+        user_id: &str,
+    ) -> Result<String, StoreError> {
         let key = Self::cache_key(idp_entity_id, sp_entity_id, user_id);
-        if let Some(cached) = self.store.get(&key) {
-            return cached;
+        if let Some(cached) = self.store.get(&key)? {
+            return Ok(cached);
         }
         let value = self.make(idp_entity_id, sp_entity_id, user_id);
-        self.store.set(&key, value.clone());
-        value
+        self.store.set(&key, value.clone())?;
+        Ok(value)
     }
 
     /// The EPTID as a persistent NameID (the canonical wire form:
     /// NameQualifier = IdP, SPNameQualifier = SP).
-    pub fn name_id(&self, idp_entity_id: &str, sp_entity_id: &str, user_id: &str) -> NameId {
-        NameId {
-            value: self.get(idp_entity_id, sp_entity_id, user_id),
+    pub fn name_id(
+        &self,
+        idp_entity_id: &str,
+        sp_entity_id: &str,
+        user_id: &str,
+    ) -> Result<NameId, StoreError> {
+        Ok(NameId {
+            value: self.get(idp_entity_id, sp_entity_id, user_id)?,
             format: Some(constants::NAMEID_PERSISTENT.to_string()),
             name_qualifier: Some(idp_entity_id.to_string()),
             sp_name_qualifier: Some(sp_entity_id.to_string()),
             sp_provided_id: None,
-        }
+        })
     }
 
     /// The EPTID as a complete NameID-valued `saml:Attribute`.
-    pub fn attribute(&self, idp_entity_id: &str, sp_entity_id: &str, user_id: &str) -> Attribute {
-        eptid_attribute(vec![self.name_id(idp_entity_id, sp_entity_id, user_id)])
+    pub fn attribute(
+        &self,
+        idp_entity_id: &str,
+        sp_entity_id: &str,
+        user_id: &str,
+    ) -> Result<Attribute, StoreError> {
+        Ok(eptid_attribute(vec![self.name_id(
+            idp_entity_id,
+            sp_entity_id,
+            user_id,
+        )?]))
     }
 }
 
@@ -254,25 +279,53 @@ mod tests {
         map: Arc<Mutex<HashMap<String, String>>>,
     }
 
-    impl IdentityStore for SharedStore {
-        fn get(&self, key: &str) -> Option<String> {
-            self.map.lock().unwrap().get(key).cloned()
+    impl KeyValueStore for SharedStore {
+        fn get(&self, key: &str) -> Result<Option<String>, StoreError> {
+            Ok(self.map.lock().unwrap().get(key).cloned())
         }
 
-        fn set(&self, key: &str, value: String) {
+        fn set(&self, key: &str, value: String) -> Result<(), StoreError> {
             self.map.lock().unwrap().insert(key.to_string(), value);
+            Ok(())
         }
 
-        fn remove(&self, key: &str) {
+        fn remove(&self, key: &str) -> Result<(), StoreError> {
             self.map.lock().unwrap().remove(key);
+            Ok(())
         }
+    }
+
+    /// A cache whose reads fail: models an outage of the backing store.
+    struct DownStore;
+
+    impl KeyValueStore for DownStore {
+        fn get(&self, _: &str) -> Result<Option<String>, StoreError> {
+            Err(StoreError::new("backend unreachable"))
+        }
+        fn set(&self, _: &str, _: String) -> Result<(), StoreError> {
+            Err(StoreError::new("backend unreachable"))
+        }
+        fn remove(&self, _: &str) -> Result<(), StoreError> {
+            Err(StoreError::new("backend unreachable"))
+        }
+    }
+
+    #[test]
+    fn a_cache_outage_is_an_error_not_a_recompute() {
+        // Recomputing on a failed read could return a value different from
+        // the one already issued (after a secret or digest change), which is
+        // what the cache exists to prevent.
+        let eptid = Eptid::with_store(DownStore, "s3cr3t");
+        assert!(eptid.get(IDP, SP, "alice").is_err());
+        assert!(eptid.name_id(IDP, SP, "alice").is_err());
+        assert!(eptid.attribute(IDP, SP, "alice").is_err());
     }
 
     #[test]
     fn test_deterministic_and_cached() {
         let eptid = Eptid::new("s3cr3t");
-        let a = eptid.get(IDP, SP, "alice");
-        let b = eptid.get(IDP, SP, "alice");
+        let a = eptid.get(IDP, SP, "alice").unwrap();
+        let b = eptid.get(IDP, SP, "alice").unwrap();
         assert_eq!(a, b);
         assert!(a.starts_with(&format!("{IDP}!{SP}!")));
     }
@@ -280,17 +333,19 @@ mod tests {
     #[test]
     fn test_differs_per_sp_and_user() {
         let eptid = Eptid::new("s3cr3t");
-        let a = eptid.get(IDP, SP, "alice");
-        let other_sp = eptid.get(IDP, "https://other.example.com", "alice");
-        let bob = eptid.get(IDP, SP, "bob");
+        let a = eptid.get(IDP, SP, "alice").unwrap();
+        let other_sp = eptid
+            .get(IDP, "https://other.example.com", "alice")
+            .unwrap();
+        let bob = eptid.get(IDP, SP, "bob").unwrap();
         assert_ne!(a, other_sp);
         assert_ne!(a, bob);
     }
 
     #[test]
     fn test_differs_per_secret() {
-        let one = Eptid::new("one").get(IDP, SP, "alice");
-        let two = Eptid::new("two").get(IDP, SP, "alice");
+        let one = Eptid::new("one").get(IDP, SP, "alice").unwrap();
+        let two = Eptid::new("two").get(IDP, SP, "alice").unwrap();
         assert_ne!(one, two);
     }
 
@@ -309,7 +364,7 @@ mod tests {
         let eptid =
             Eptid::try_new_with_options("s3cr3t", EptidOptions::pysaml2_md5_legacy(true)).unwrap();
         assert_eq!(
-            eptid.get(IDP, SP, "alice"),
+            eptid.get(IDP, SP, "alice").unwrap(),
             "https://idp.example.com!https://sp.example.com!f6ecff9c9e19881f47d0078989d14d59"
         );
     }
@@ -320,8 +375,8 @@ mod tests {
         let first = Eptid::with_store(store.clone(), "s3cr3t");
         let second = Eptid::with_store(store, "s3cr3t");
 
-        let a = first.get(IDP, SP, "alice");
-        let b = second.get("https://idp2.example.com", SP, "alice");
+        let a = first.get(IDP, SP, "alice").unwrap();
+        let b = second.get("https://idp2.example.com", SP, "alice").unwrap();
 
         assert_ne!(a, b);
         assert!(a.starts_with(&format!("{IDP}!{SP}!")));
@@ -331,12 +386,12 @@ mod tests {
     #[test]
     fn test_name_id_and_attribute_form() {
         let eptid = Eptid::new("s3cr3t");
-        let nid = eptid.name_id(IDP, SP, "alice");
+        let nid = eptid.name_id(IDP, SP, "alice").unwrap();
         assert_eq!(nid.format.as_deref(), Some(constants::NAMEID_PERSISTENT));
         assert_eq!(nid.name_qualifier.as_deref(), Some(IDP));
         assert_eq!(nid.sp_name_qualifier.as_deref(), Some(SP));
 
-        let attr = eptid.attribute(IDP, SP, "alice");
+        let attr = eptid.attribute(IDP, SP, "alice").unwrap();
         assert_eq!(attr.name, crate::attribute_map::EPTID_OID);
         assert_eq!(attr.values.len(), 1);
     }

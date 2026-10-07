@@ -3,6 +3,9 @@
 // Binding URIs, profile URIs, status codes, NameID formats, confirmation methods.
 // Corrected per saml-v2.0-errata05.
 
+/// SAML 2.0 protocol URI, as it appears in `protocolSupportEnumeration`.
+pub const PROTOCOL_SAML2: &str = "urn:oasis:names:tc:SAML:2.0:protocol";
+
 // ============================================================================
 // Binding URIs (saml-bindings-2.0-os Section 3)
 // ============================================================================

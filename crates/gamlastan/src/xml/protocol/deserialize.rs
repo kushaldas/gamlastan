@@ -32,9 +32,9 @@ use crate::core::protocol::status::{StatusCodeRef, StatusRef};
 use crate::xml::deserialize::SamlDeserialize;
 use crate::xml::error::XmlError;
 use crate::xml::helpers::{
-    find_child_element, find_child_elements, optional_attribute, parse_datetime_attr,
-    parse_optional_bool_attr, parse_optional_datetime_attr, parse_optional_u16_attr,
-    parse_optional_u32_attr, required_attribute, verify_element,
+    find_child_element, find_child_elements, find_unique_child_element, optional_attribute,
+    parse_datetime_attr, parse_optional_bool_attr, parse_optional_datetime_attr,
+    parse_optional_u16_attr, parse_optional_u32_attr, required_attribute, verify_element,
 };
 
 // ── StatusCode ─────────────────────────────────────────────────────────────
@@ -218,12 +218,15 @@ impl<'a> SamlDeserialize<'a> for ScopingRef<'a> {
 
         // IDPList -> IDPEntry elements
         let mut idp_list = Vec::new();
-        if let Some(idp_list_node) = find_child_element(doc, node, SAML_PROTOCOL_NS, "IDPList") {
+        if let Some(idp_list_node) =
+            find_unique_child_element(doc, node, SAML_PROTOCOL_NS, "IDPList")?
+        {
             let entry_nodes = find_child_elements(doc, idp_list_node, SAML_PROTOCOL_NS, "IDPEntry");
             for entry_node in entry_nodes {
-                if let Some(provider_id) = optional_attribute(doc, entry_node, "ProviderID") {
-                    idp_list.push(provider_id);
-                }
+                // ProviderID is required. Dropping an entry that lacks it would
+                // quietly turn a restrictive list into a shorter, or empty,
+                // one, and an empty list reads as "no restriction".
+                idp_list.push(required_attribute(doc, entry_node, "ProviderID")?);
             }
         }
 
@@ -261,28 +264,29 @@ impl<'a> SamlDeserialize<'a> for AuthnRequestRef<'a> {
         let provider_name = optional_attribute(doc, node, "ProviderName");
 
         // Optional Subject
-        let subject = find_child_element(doc, node, SAML_ASSERTION_NS, "Subject")
+        let subject = find_unique_child_element(doc, node, SAML_ASSERTION_NS, "Subject")?
             .map(|n| SubjectRef::from_xml(doc, n))
             .transpose()?;
 
         // Optional NameIDPolicy
-        let name_id_policy = find_child_element(doc, node, SAML_PROTOCOL_NS, "NameIDPolicy")
-            .map(|n| NameIdPolicyRef::from_xml(doc, n))
-            .transpose()?;
+        let name_id_policy =
+            find_unique_child_element(doc, node, SAML_PROTOCOL_NS, "NameIDPolicy")?
+                .map(|n| NameIdPolicyRef::from_xml(doc, n))
+                .transpose()?;
 
         // Optional Conditions
-        let conditions = find_child_element(doc, node, SAML_ASSERTION_NS, "Conditions")
+        let conditions = find_unique_child_element(doc, node, SAML_ASSERTION_NS, "Conditions")?
             .map(|n| ConditionsRef::from_xml(doc, n))
             .transpose()?;
 
         // Optional RequestedAuthnContext
         let requested_authn_context =
-            find_child_element(doc, node, SAML_PROTOCOL_NS, "RequestedAuthnContext")
+            find_unique_child_element(doc, node, SAML_PROTOCOL_NS, "RequestedAuthnContext")?
                 .map(|n| RequestedAuthnContextRef::from_xml(doc, n))
                 .transpose()?;
 
         // Optional Scoping
-        let scoping = find_child_element(doc, node, SAML_PROTOCOL_NS, "Scoping")
+        let scoping = find_unique_child_element(doc, node, SAML_PROTOCOL_NS, "Scoping")?
             .map(|n| ScopingRef::from_xml(doc, n))
             .transpose()?;
 
@@ -845,5 +849,95 @@ impl<'a> SamlDeserialize<'a> for AuthzDecisionQueryRef<'a> {
             actions,
             evidence,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NS: &str = r#"xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion""#;
+
+    fn authn_request(children: &str) -> String {
+        format!(
+            r#"<samlp:AuthnRequest {NS} ID="_a1" Version="2.0" IssueInstant="2026-10-01T00:00:00Z"><saml:Issuer>https://sp.example.org</saml:Issuer>{children}</samlp:AuthnRequest>"#
+        )
+    }
+
+    fn parse(xml: &str) -> Result<(), XmlError> {
+        let doc = uppsala::parse(xml).unwrap();
+        let root = doc.document_element().unwrap();
+        AuthnRequestRef::from_xml(&doc, root).map(|_| ())
+    }
+
+    const SUBJECT: &str = "<saml:Subject><saml:NameID>alice</saml:NameID></saml:Subject>";
+    const POLICY: &str = r#"<samlp:NameIDPolicy AllowCreate="true"/>"#;
+    const CLASS_CONTEXT: &str = "<samlp:RequestedAuthnContext><saml:AuthnContextClassRef>urn:c</saml:AuthnContextClassRef></samlp:RequestedAuthnContext>";
+    const DECL_CONTEXT: &str = "<samlp:RequestedAuthnContext><saml:AuthnContextDeclRef>urn:d</saml:AuthnContextDeclRef></samlp:RequestedAuthnContext>";
+    const SCOPING: &str = r#"<samlp:Scoping ProxyCount="1"><samlp:IDPList><samlp:IDPEntry ProviderID="https://idp.example.org"/></samlp:IDPList></samlp:Scoping>"#;
+
+    #[test]
+    fn each_singleton_child_may_appear_once() {
+        let xml = authn_request(&format!(
+            "{SUBJECT}{POLICY}<saml:Conditions/>{CLASS_CONTEXT}{SCOPING}"
+        ));
+        parse(&xml).expect("a request with each element once is well formed");
+    }
+
+    #[test]
+    fn a_duplicated_singleton_child_is_rejected_not_silently_read_once() {
+        // Reading only the first of two would ignore the second, so a later
+        // RequestedAuthnContext carrying a declaration would never be seen.
+        for (name, doubled) in [
+            ("Subject", format!("{SUBJECT}{SUBJECT}")),
+            ("NameIDPolicy", format!("{POLICY}{POLICY}")),
+            (
+                "Conditions",
+                "<saml:Conditions/><saml:Conditions/>".to_string(),
+            ),
+            (
+                "RequestedAuthnContext",
+                format!("{CLASS_CONTEXT}{DECL_CONTEXT}"),
+            ),
+            ("Scoping", format!("{SCOPING}{SCOPING}")),
+        ] {
+            let err = parse(&authn_request(&doubled)).expect_err(name);
+            assert!(
+                matches!(&err, XmlError::UnexpectedElement(m) if m.contains(name)),
+                "{name}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_idp_entry_without_a_provider_id_is_rejected() {
+        // ProviderID is required. Dropping the entry would shrink a restrictive
+        // list, possibly to an empty one, which reads as "no restriction".
+        let xml = authn_request(
+            r#"<samlp:Scoping><samlp:IDPList><samlp:IDPEntry ProviderID="https://a.example.org"/><samlp:IDPEntry/></samlp:IDPList></samlp:Scoping>"#,
+        );
+        assert!(matches!(
+            parse(&xml),
+            Err(XmlError::MissingAttribute { ref attribute, .. }) if attribute == "ProviderID"
+        ));
+    }
+
+    #[test]
+    fn a_duplicated_idp_list_is_rejected() {
+        let xml = authn_request(
+            r#"<samlp:Scoping><samlp:IDPList><samlp:IDPEntry ProviderID="https://a.example.org"/></samlp:IDPList><samlp:IDPList/></samlp:Scoping>"#,
+        );
+        assert!(matches!(parse(&xml), Err(XmlError::UnexpectedElement(_))));
+    }
+
+    #[test]
+    fn scoping_entries_are_read_when_well_formed() {
+        let xml = authn_request(SCOPING);
+        let doc = uppsala::parse(&xml).unwrap();
+        let root = doc.document_element().unwrap();
+        let request = AuthnRequestRef::from_xml(&doc, root).unwrap();
+        let scoping = request.scoping.expect("scoping");
+        assert_eq!(scoping.proxy_count, Some(1));
+        assert_eq!(scoping.idp_list, vec!["https://idp.example.org"]);
     }
 }

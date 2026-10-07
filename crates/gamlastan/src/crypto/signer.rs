@@ -6,6 +6,7 @@ use bergshamra_dsig::{sign::sign, DsigContext};
 use bergshamra_keys::{KeyUsage, KeysManager};
 use kryptering::{SignatureAlgorithm, Signer};
 
+use crate::crypto::algorithms::SignatureMethod;
 use crate::crypto::error::CryptoError;
 
 const DEFAULT_SIGNATURE_METHOD_URI: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
@@ -127,6 +128,31 @@ impl SamlSigner {
         Ok(DEFAULT_SIGNATURE_METHOD_URI)
     }
 
+    /// The `SignatureMethod` URI to use when `requested` asks for a particular
+    /// algorithm (`None` keeps [`signature_method_uri`](Self::signature_method_uri)).
+    ///
+    /// A key-backed signer can sign with any [`SignatureMethod`]; whether the
+    /// key suits it (an RSA key for `rsa-*`, an EC key for `ecdsa-*`) is
+    /// checked when signing. An HSM-backed signer can only sign with the
+    /// algorithm its token is configured for, so a different request is
+    /// refused here instead of failing later with a mismatched template.
+    pub fn signature_method_uri_for(
+        &self,
+        requested: Option<SignatureMethod>,
+    ) -> Result<&'static str, CryptoError> {
+        let default = self.signature_method_uri()?;
+        match requested {
+            None => Ok(default),
+            Some(method) if self.hsm_signer.is_some() && method.uri() != default => {
+                Err(CryptoError::UnsupportedAlgorithm(format!(
+                    "signature method {} was requested, but the HSM signer is configured for {default}",
+                    method.uri()
+                )))
+            }
+            Some(method) => Ok(method.uri()),
+        }
+    }
+
     /// Sign a SAML message with an enveloped signature.
     ///
     /// The input XML must contain an empty `<ds:Signature>` template element
@@ -200,5 +226,63 @@ impl SamlSigner {
     /// Get a reference to the underlying keys manager.
     pub fn keys_manager(&self) -> &KeysManager {
         &self.keys_manager
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An HSM signer that never actually signs; only its algorithm matters.
+    struct TokenSigner(SignatureAlgorithm);
+
+    impl Signer for TokenSigner {
+        fn algorithm(&self) -> SignatureAlgorithm {
+            self.0
+        }
+        fn sign(&self, _data: &[u8]) -> kryptering::Result<Vec<u8>> {
+            unreachable!("not used by these tests")
+        }
+    }
+
+    fn hsm(algorithm: SignatureAlgorithm) -> SamlSigner {
+        SamlSigner::with_hsm_signer(KeysManager::new(), Arc::new(TokenSigner(algorithm)))
+    }
+
+    #[test]
+    fn a_key_backed_signer_accepts_any_requested_method() {
+        let signer = SamlSigner::new(KeysManager::new());
+        assert_eq!(
+            signer.signature_method_uri_for(None).unwrap(),
+            DEFAULT_SIGNATURE_METHOD_URI
+        );
+        assert_eq!(
+            signer
+                .signature_method_uri_for(Some(SignatureMethod::RsaSha512))
+                .unwrap(),
+            SignatureMethod::RsaSha512.uri()
+        );
+    }
+
+    #[test]
+    fn an_hsm_signer_refuses_a_method_its_token_is_not_configured_for() {
+        let signer = hsm(SignatureAlgorithm::RsaPkcs1v15(
+            kryptering::HashAlgorithm::Sha256,
+        ));
+        assert_eq!(
+            signer
+                .signature_method_uri_for(Some(SignatureMethod::RsaSha256))
+                .unwrap(),
+            SignatureMethod::RsaSha256.uri(),
+            "asking for exactly the token's own algorithm is fine"
+        );
+        assert!(matches!(
+            signer.signature_method_uri_for(Some(SignatureMethod::RsaSha512)),
+            Err(CryptoError::UnsupportedAlgorithm(_))
+        ));
+        assert_eq!(
+            signer.signature_method_uri_for(None).unwrap(),
+            SignatureMethod::RsaSha256.uri()
+        );
     }
 }

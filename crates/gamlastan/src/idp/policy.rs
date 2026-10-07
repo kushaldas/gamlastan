@@ -23,6 +23,7 @@ use regex::Regex;
 use crate::attribute_map::AttributeConverterSet;
 use crate::core::assertion::attribute::{Attribute, AttributeValue};
 use crate::core::constants;
+use crate::crypto::SigningPreference;
 use crate::idp::entity_category::{
     releasable_attributes_owned, EntityCategoryPolicy, OwnedEntityCategoryPolicy, SubjectIdReq,
 };
@@ -53,6 +54,28 @@ pub enum PolicyError {
     },
 }
 
+/// The longest NameID format, in bytes, this IdP will issue. Formats are short
+/// URIs (the longest standard one is about 60 bytes); the requested format comes
+/// from the SP and is stored with each durable record, so it is bounded. A longer
+/// one is refused whatever is configured.
+pub const MAX_NAMEID_FORMAT_LEN: usize = 256;
+
+/// The NameID formats [`IdentDb`](crate::idp::ident::IdentDb) issues
+/// meaningfully: a reasonable set to hand to
+/// [`PolicyEntry::with_supported_nameid_formats`] when an IdP wants to refuse
+/// the rest. It is **not** applied by default (see there).
+///
+/// It leaves out `urn:oasis:names:tc:SAML:2.0:nameid-format:encrypted` (a request
+/// to encrypt the NameID, which is not supported) and formats such as Kerberos
+/// or X509SubjectName, which need a source of identifiers this crate does not
+/// have.
+pub const ISSUABLE_NAMEID_FORMATS: &[&str] = &[
+    constants::NAMEID_TRANSIENT,
+    constants::NAMEID_PERSISTENT,
+    constants::NAMEID_EMAIL,
+    constants::NAMEID_UNSPECIFIED,
+];
+
 /// Which messages the IdP signs for an SP (`"sign"` in pysaml2 policy).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SignTargets {
@@ -67,10 +90,19 @@ pub struct SignTargets {
 
 impl SignTargets {
     /// Resolve the on-demand part against the SP's metadata flag.
+    ///
+    /// Never resolves to "sign nothing": the Web Browser SSO profile
+    /// (SAML Profiles 4.1.4.5) requires the Response or the Assertion carrying
+    /// the `AuthnStatement` to be signed, and an unsigned one is forgeable. If
+    /// the response is not signed the assertion is, so the default (nothing
+    /// configured) signs the assertion. This is stricter than pysaml2, whose
+    /// default signs nothing.
     pub fn resolve(self, sp_wants_assertions_signed: bool) -> ResolvedSignTargets {
         ResolvedSignTargets {
             sign_response: self.response,
-            sign_assertion: self.assertion || (self.on_demand && sp_wants_assertions_signed),
+            sign_assertion: self.assertion
+                || (self.on_demand && sp_wants_assertions_signed)
+                || !self.response,
         }
     }
 }
@@ -94,10 +126,14 @@ type ValueRestriction = Option<Vec<Regex>>;
 pub struct PolicyEntry {
     attribute_restrictions: Option<HashMap<String, ValueRestriction>>,
     lifetime: Option<TimeDelta>,
+    session_lifetime: Option<TimeDelta>,
     nameid_format: Option<String>,
+    supported_nameid_formats: Option<Vec<String>>,
     name_form: Option<String>,
     sign: Option<SignTargets>,
+    signing_preference: Option<SigningPreference>,
     fail_on_missing_requested: Option<bool>,
+    deny_unconfigured_release: Option<bool>,
     entity_categories: Option<Vec<OwnedEntityCategoryPolicy>>,
 }
 
@@ -139,15 +175,61 @@ impl PolicyEntry {
         Ok(self)
     }
 
-    /// Set the assertion lifetime.
+    /// Set the assertion lifetime (`Conditions`/`SubjectConfirmationData`
+    /// `NotOnOrAfter`).
     pub fn with_lifetime(mut self, lifetime: TimeDelta) -> Self {
         self.lifetime = Some(lifetime);
+        self
+    }
+
+    /// Set the SSO session lifetime (`AuthnStatement/@SessionNotOnOrAfter`),
+    /// independent of the assertion lifetime. When unset, falls back to the
+    /// assertion lifetime (see [`ReleasePolicy::session_lifetime`]) rather
+    /// than requiring every deployment to configure both.
+    pub fn with_session_lifetime(mut self, lifetime: TimeDelta) -> Self {
+        self.session_lifetime = Some(lifetime);
         self
     }
 
     /// Set the NameID format issued to this SP.
     pub fn with_nameid_format(mut self, format: impl Into<String>) -> Self {
         self.nameid_format = Some(format.into());
+        self
+    }
+
+    /// Opt in to refusing NameID formats: set the formats this IdP will issue to
+    /// this SP when the request's `NameIDPolicy/@Format` asks for one. A
+    /// requested format outside the set is refused with `InvalidNameIDPolicy`
+    /// (SAML Core 3.4.1.1) before anything is minted. The SP's own default
+    /// format ([`with_nameid_format`](Self::with_nameid_format)) is always
+    /// allowed, so it need not be listed.
+    /// [`ISSUABLE_NAMEID_FORMATS`] is a reasonable starting set.
+    ///
+    /// **Without this, any requested format is accepted**, as in pysaml2, which
+    /// never validates it: an identifier is issued in whatever format was asked
+    /// for, so an SP that sends invented format strings gets one stored record
+    /// per string. Set this to refuse them.
+    pub fn with_supported_nameid_formats(mut self, formats: Vec<String>) -> Self {
+        self.supported_nameid_formats = Some(formats);
+        self
+    }
+
+    /// Release **nothing** to an SP that no attribute rule covers.
+    ///
+    /// By default (as in pysaml2) a policy with no rule for an SP releases every
+    /// attribute the application hands the engine: the application is then the
+    /// only filter. Set this on the `default` entry, or on one SP's entry, to
+    /// fail closed instead. An SP is covered when any of these applies to it:
+    /// entity categories are configured, its metadata requests attributes
+    /// (`RequestedAttribute`), or attribute restrictions are configured. A
+    /// covered SP is filtered by those rules exactly as before; an uncovered one
+    /// gets an assertion without an attribute statement.
+    ///
+    /// Passing `false` on an SP entry overrides a `true` on the default.
+    /// [`PassThroughRelease`](crate::idp::orchestrator::PassThroughRelease) is
+    /// unaffected: it is the explicit "already filtered" choice.
+    pub fn with_deny_unconfigured_release(mut self, deny: bool) -> Self {
+        self.deny_unconfigured_release = Some(deny);
         self
     }
 
@@ -160,6 +242,19 @@ impl PolicyEntry {
     /// Set the signing targets.
     pub fn with_sign(mut self, sign: SignTargets) -> Self {
         self.sign = Some(sign);
+        self
+    }
+
+    /// Set the signature and digest algorithms to prefer when signing for this
+    /// SP, most preferred first. The orchestrator picks, per response, the
+    /// first the SP also advertises in its metadata, else the first listed
+    /// (see [`SigningPreference`]). Without it the signer's defaults apply.
+    ///
+    /// With an HSM-backed signer, list only the token's own signature method (or
+    /// none): any other makes the response fail for the SPs that resolve to it,
+    /// at signing time. See [`SigningPreference`].
+    pub fn with_signing_preference(mut self, preference: SigningPreference) -> Self {
+        self.signing_preference = Some(preference);
         self
     }
 
@@ -193,6 +288,17 @@ impl PolicyEntry {
 }
 
 /// The IdP-side attribute release policy (pysaml2 `Policy`).
+///
+/// # Default release
+///
+/// **With nothing configured for an SP, every attribute the application hands
+/// the engine is released.** As in pysaml2, the policy only narrows: entity
+/// categories, the attributes the SP requests in its metadata, and attribute
+/// restrictions each reduce the set, and with none of them there is nothing to
+/// reduce it. The application is then the first and only filter. To fail closed
+/// instead, set [`PolicyEntry::with_deny_unconfigured_release`]; to release
+/// nothing but what an SP is entitled to, configure entity categories or
+/// restrictions.
 ///
 /// Entry resolution per knob: the SP-specific entry first; if the SP has no
 /// entry of its own, the entry keyed on its registration authority (when one is
@@ -360,6 +466,38 @@ impl ReleasePolicy {
             .unwrap_or_else(|| constants::NAMEID_TRANSIENT.to_string())
     }
 
+    /// Whether this IdP will issue a NameID of `format` to the SP.
+    ///
+    /// With no supported set configured
+    /// ([`PolicyEntry::with_supported_nameid_formats`]) every format is
+    /// accepted, as in pysaml2, except `nameid-format:encrypted`, which is
+    /// always refused because the response path cannot encrypt a NameID. With
+    /// one, the SP's own default format ([`nameid_format`](Self::nameid_format))
+    /// is always allowed and any other format must be in the set. A format longer
+    /// than [`MAX_NAMEID_FORMAT_LEN`] is refused in every case.
+    ///
+    /// An accepted format other than transient is stored: with no supported set,
+    /// an SP that sends invented format strings gets one durable record per
+    /// string. Configure a set in production.
+    pub fn supports_nameid_format(&self, sp_entity_id: &str, format: &str) -> bool {
+        if format.len() > MAX_NAMEID_FORMAT_LEN {
+            return false;
+        }
+        // `nameid-format:encrypted` asks for an `EncryptedID`, not an opaque
+        // identifier. The response path cannot encrypt, so issuing a plain
+        // NameID under that label would break the requester's
+        // confidentiality requirement: never supported, whatever is configured.
+        if format == constants::NAMEID_ENCRYPTED {
+            return false;
+        }
+        match self.get_ref(sp_entity_id, |e| e.supported_nameid_formats.as_ref()) {
+            None => true,
+            Some(formats) => {
+                format == self.nameid_format(sp_entity_id) || formats.iter().any(|f| f == format)
+            }
+        }
+    }
+
     /// Attribute NameFormat for the SP (default: URI).
     pub fn name_form(&self, sp_entity_id: &str) -> String {
         self.get(sp_entity_id, |e| e.name_form.clone())
@@ -372,14 +510,43 @@ impl ReleasePolicy {
             .unwrap_or_else(|| TimeDelta::hours(1))
     }
 
+    /// SSO session lifetime for the SP (`AuthnStatement/@SessionNotOnOrAfter`).
+    ///
+    /// Distinct from [`lifetime`](Self::lifetime): the assertion's own
+    /// validity window is typically short-lived, while the SSO session it
+    /// establishes is usually meant to outlive any one assertion (E79).
+    /// Falls back to [`lifetime`](Self::lifetime) when no session lifetime is
+    /// configured, so a deployment that hasn't set one keeps today's
+    /// behaviour rather than getting an unexpectedly short session.
+    pub fn session_lifetime(&self, sp_entity_id: &str) -> TimeDelta {
+        self.get(sp_entity_id, |e| e.session_lifetime)
+            .unwrap_or_else(|| self.lifetime(sp_entity_id))
+    }
+
     /// Assertion NotOnOrAfter for the SP (pysaml2 `not_on_or_after`).
     pub fn not_on_or_after(&self, sp_entity_id: &str, now: DateTime<Utc>) -> DateTime<Utc> {
         now + self.lifetime(sp_entity_id)
     }
 
-    /// Signing targets for the SP (default: nothing).
+    /// Signing targets for the SP (default: none configured, which
+    /// [`SignTargets::resolve`] turns into signing the assertion).
     pub fn sign(&self, sp_entity_id: &str) -> SignTargets {
         self.get(sp_entity_id, |e| e.sign).unwrap_or_default()
+    }
+
+    /// Signing algorithm preference for the SP (default: none, so the signer's
+    /// own defaults apply).
+    pub fn signing_preference(&self, sp_entity_id: &str) -> SigningPreference {
+        self.get(sp_entity_id, |e| e.signing_preference.clone())
+            .unwrap_or_default()
+    }
+
+    /// Whether an SP that no attribute rule covers is released nothing
+    /// (default: false, which releases everything the application supplied; see
+    /// [`PolicyEntry::with_deny_unconfigured_release`]).
+    pub fn deny_unconfigured_release(&self, sp_entity_id: &str) -> bool {
+        self.get(sp_entity_id, |e| e.deny_unconfigured_release)
+            .unwrap_or(false)
     }
 
     /// Whether a missing required attribute is an error (default: true).
@@ -469,7 +636,15 @@ impl ReleasePolicy {
         Some(released)
     }
 
-    fn validate_required_attributes(
+    /// Verify that every required attribute (and, when the request specified
+    /// values, at least one matching value) survived release.
+    ///
+    /// `pub(crate)` so `idp::orchestrator` can apply the same matching
+    /// semantics as a release-implementation-independent check, regardless of
+    /// which [`AttributeRelease`](crate::idp::orchestrator::release::AttributeRelease)
+    /// produced `attributes` — a pass-through or custom release may not
+    /// itself validate this.
+    pub(crate) fn validate_required_attributes(
         &self,
         attributes: &[Attribute],
         required: &[RequestedAttribute],
@@ -528,6 +703,21 @@ impl ReleasePolicy {
     ) -> Result<Vec<Attribute>, PolicyError> {
         let mut result = attributes;
         let fail_on_missing_requested = self.fail_on_missing_requested(sp_entity_id);
+
+        // Fail closed, when asked to, for an SP that no attribute rule covers.
+        // Without this an empty policy releases everything (pysaml2's default).
+        if self.deny_unconfigured_release(sp_entity_id)
+            && self
+                .get_ref(sp_entity_id, |e| e.entity_categories.as_deref())
+                .is_none()
+            && self
+                .get_ref(sp_entity_id, |e| e.attribute_restrictions.as_ref())
+                .is_none()
+            && required.is_empty()
+            && optional.is_empty()
+        {
+            result.clear();
+        }
 
         // Step 1: entity-category release rules take precedence over
         // per-attribute requested/optional matching when configured. Borrow the
@@ -835,6 +1025,94 @@ fn dedup_values(values: &mut Vec<AttributeValue>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn without_a_configured_set_every_requested_nameid_format_is_accepted() {
+        // Opt-in, as pysaml2 never validates the requested format.
+        let policy = ReleasePolicy::new();
+        for format in [
+            constants::NAMEID_TRANSIENT,
+            "urn:oasis:names:tc:SAML:1.1:nameid-format:X509SubjectName",
+            "urn:evil:made-up",
+        ] {
+            assert!(policy.supports_nameid_format("https://sp.example.org", format));
+        }
+    }
+
+    #[test]
+    fn an_overlong_format_is_never_supported() {
+        let sp = "https://sp.example.org";
+        let long = format!("urn:example:{}", "a".repeat(MAX_NAMEID_FORMAT_LEN));
+        assert!(long.len() > MAX_NAMEID_FORMAT_LEN);
+        assert!(!ReleasePolicy::new().supports_nameid_format(sp, &long));
+        // Not even when listed or set as the SP default.
+        let listed = ReleasePolicy::with_default(
+            PolicyEntry::new().with_supported_nameid_formats(vec![long.clone()]),
+        );
+        assert!(!listed.supports_nameid_format(sp, &long));
+        // The limit itself is allowed.
+        let at_limit = "x".repeat(MAX_NAMEID_FORMAT_LEN);
+        assert!(ReleasePolicy::new().supports_nameid_format(sp, &at_limit));
+    }
+
+    #[test]
+    fn the_encrypted_format_is_never_supported() {
+        // It asks for an EncryptedID, which the response path cannot produce:
+        // refused with no set configured, and even when listed or SP-default.
+        let sp = "https://sp.example.org";
+        assert!(!ReleasePolicy::new().supports_nameid_format(sp, constants::NAMEID_ENCRYPTED));
+        let listed = ReleasePolicy::with_default(
+            PolicyEntry::new()
+                .with_supported_nameid_formats(vec![constants::NAMEID_ENCRYPTED.to_string()]),
+        );
+        assert!(!listed.supports_nameid_format(sp, constants::NAMEID_ENCRYPTED));
+        let as_default = ReleasePolicy::with_default(
+            PolicyEntry::new().with_nameid_format(constants::NAMEID_ENCRYPTED),
+        );
+        assert!(!as_default.supports_nameid_format(sp, constants::NAMEID_ENCRYPTED));
+    }
+
+    #[test]
+    fn the_issuable_set_refuses_the_rest_when_opted_into() {
+        let policy = ReleasePolicy::with_default(
+            PolicyEntry::new().with_supported_nameid_formats(
+                ISSUABLE_NAMEID_FORMATS
+                    .iter()
+                    .map(|f| f.to_string())
+                    .collect(),
+            ),
+        );
+        for format in ISSUABLE_NAMEID_FORMATS {
+            assert!(policy.supports_nameid_format("https://sp.example.org", format));
+        }
+        for format in [
+            "urn:oasis:names:tc:SAML:2.0:nameid-format:encrypted",
+            "urn:oasis:names:tc:SAML:1.1:nameid-format:X509SubjectName",
+            "urn:evil:made-up",
+        ] {
+            assert!(!policy.supports_nameid_format("https://sp.example.org", format));
+        }
+    }
+
+    #[test]
+    fn a_configured_set_replaces_the_default_but_the_sp_default_stays_allowed() {
+        let mut policy = ReleasePolicy::with_default(PolicyEntry::new());
+        policy.insert(
+            "https://sp.example.org",
+            PolicyEntry::new()
+                .with_supported_nameid_formats(vec![constants::NAMEID_PERSISTENT.to_string()])
+                .with_nameid_format(constants::NAMEID_EMAIL),
+        );
+        let sp = "https://sp.example.org";
+        assert!(policy.supports_nameid_format(sp, constants::NAMEID_PERSISTENT));
+        assert!(
+            policy.supports_nameid_format(sp, constants::NAMEID_EMAIL),
+            "the SP default"
+        );
+        assert!(!policy.supports_nameid_format(sp, constants::NAMEID_TRANSIENT));
+        // Another SP has no set configured, so it is unrestricted.
+        assert!(policy.supports_nameid_format("https://other.example.org", "urn:evil:made-up"));
+    }
+
     use super::*;
     use crate::idp::entity_category::{COCO_V1, EDUGAIN, REFEDS, REFEDS_RESEARCH_AND_SCHOLARSHIP};
     use crate::profiles::attribute::x500::{eppn_attribute, mail_attribute};
@@ -946,10 +1224,32 @@ mod tests {
             policy.lifetime("https://sp.example.com"),
             TimeDelta::hours(1)
         );
+        // Unset session lifetime falls back to the assertion lifetime.
+        assert_eq!(
+            policy.session_lifetime("https://sp.example.com"),
+            TimeDelta::hours(1)
+        );
         assert!(policy.fail_on_missing_requested("https://sp.example.com"));
         assert_eq!(
             policy.sign("https://sp.example.com"),
             SignTargets::default()
+        );
+    }
+
+    #[test]
+    fn test_session_lifetime_independent_of_assertion_lifetime() {
+        let policy = ReleasePolicy::with_default(
+            PolicyEntry::new()
+                .with_lifetime(TimeDelta::minutes(5))
+                .with_session_lifetime(TimeDelta::hours(8)),
+        );
+        assert_eq!(
+            policy.lifetime("https://sp.example.com"),
+            TimeDelta::minutes(5)
+        );
+        assert_eq!(
+            policy.session_lifetime("https://sp.example.com"),
+            TimeDelta::hours(8)
         );
     }
 
@@ -1477,6 +1777,31 @@ mod tests {
     }
 
     #[test]
+    fn a_response_is_never_left_entirely_unsigned() {
+        // Nothing configured, or on-demand an SP that does not ask: the
+        // assertion is signed, since the response is not.
+        for targets in [
+            SignTargets::default(),
+            SignTargets {
+                on_demand: true,
+                ..SignTargets::default()
+            },
+        ] {
+            for wants in [true, false] {
+                let r = targets.resolve(wants);
+                assert!(r.sign_assertion, "{targets:?} wants={wants}");
+            }
+        }
+        // A signed response alone is enough, as configured.
+        let r = SignTargets {
+            response: true,
+            ..SignTargets::default()
+        }
+        .resolve(false);
+        assert!(r.sign_response && !r.sign_assertion);
+    }
+
+    #[test]
     fn test_filter_on_demands() {
         let policy = ReleasePolicy::new();
         let mut required = HashMap::new();
@@ -1495,6 +1820,69 @@ mod tests {
         let mut bad = HashMap::new();
         bad.insert("mail".to_string(), vec!["other@example.com".to_string()]);
         assert!(policy.filter_on_demands(attrs, &bad, &optional).is_err());
+    }
+
+    fn filter_for(policy: &ReleasePolicy, required: &[RequestedAttribute]) -> Vec<Attribute> {
+        policy
+            .filter(
+                vec![
+                    mail_attribute(&["alice@example.com"]),
+                    eppn_attribute("alice@example.org"),
+                ],
+                "https://sp.example.com",
+                &[],
+                required,
+                &[],
+                SubjectIdReq::None,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn with_nothing_configured_everything_supplied_is_released() {
+        // pysaml2's default, pinned: the policy only narrows.
+        assert_eq!(filter_for(&ReleasePolicy::new(), &[]).len(), 2);
+    }
+
+    #[test]
+    fn deny_unconfigured_release_releases_nothing_without_a_rule() {
+        let deny =
+            ReleasePolicy::with_default(PolicyEntry::new().with_deny_unconfigured_release(true));
+        assert!(filter_for(&deny, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_rule_covers_the_sp_under_deny_unconfigured_release() {
+        // SP-requested attributes.
+        let deny =
+            ReleasePolicy::with_default(PolicyEntry::new().with_deny_unconfigured_release(true));
+        let mail = requested(&mail_attribute(&[]).name, Some("mail"), false);
+        let out = filter_for(&deny, std::slice::from_ref(&mail));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].friendly_name.as_deref(), Some("mail"));
+
+        // Attribute restrictions.
+        let restricted = ReleasePolicy::with_default(
+            PolicyEntry::new()
+                .with_deny_unconfigured_release(true)
+                .with_attribute_restrictions(&[("mail", None)])
+                .unwrap(),
+        );
+        let out = filter_for(&restricted, &[]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].friendly_name.as_deref(), Some("mail"));
+    }
+
+    #[test]
+    fn deny_unconfigured_release_can_be_overridden_per_sp() {
+        let mut policy =
+            ReleasePolicy::with_default(PolicyEntry::new().with_deny_unconfigured_release(true));
+        policy.insert(
+            "https://sp.example.com",
+            PolicyEntry::new().with_deny_unconfigured_release(false),
+        );
+        assert_eq!(filter_for(&policy, &[]).len(), 2);
+        assert!(policy.deny_unconfigured_release("https://other.example.com"));
     }
 
     #[test]

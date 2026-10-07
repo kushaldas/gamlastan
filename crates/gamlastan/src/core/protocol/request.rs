@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 
 use crate::core::assertion::conditions::{Conditions, ConditionsRef};
 use crate::core::assertion::issuer::{Issuer, IssuerRef};
-use crate::core::assertion::name_id::{NameIdPolicy, NameIdPolicyRef};
+use crate::core::assertion::name_id::{NameId, NameIdOrEncryptedId, NameIdPolicy, NameIdPolicyRef};
 use crate::core::assertion::subject::{Subject, SubjectRef};
 use crate::core::identifiers::SamlVersion;
 
@@ -254,6 +254,40 @@ pub struct AuthnRequest {
     /// When set, it is emitted verbatim; the content must be namespace
     /// self-contained (declare its own prefixes).
     pub extensions: Option<String>,
+}
+
+impl AuthnRequest {
+    /// The principal the requester names in `Subject`, if it names one (pysaml2
+    /// `Request.subject_id()`).
+    ///
+    /// `None` means the request names no principal: there is no `Subject`, or
+    /// it carries no identifier. An [`EncryptedID`](NameIdOrEncryptedId::EncryptedId)
+    /// is returned as such, since it has to be decrypted before it can be read;
+    /// do not treat it as "no subject".
+    ///
+    /// The response orchestrator does not compare this with the authenticated
+    /// principal: mapping a NameID to a local user is deployment-specific (eduID
+    /// uses an `unspecified`-format NameID holding the eppn). A deployment that
+    /// supports a requested subject, such as a "log in again as the same user"
+    /// or MFA step-up flow, must compare it itself before issuing an assertion,
+    /// and should honor it only for SPs it trusts to ask. One that cannot honor a
+    /// requested subject should refuse the request, because issuing an assertion
+    /// for a different principal than the one requested is not allowed.
+    pub fn requested_subject(&self) -> Option<&NameIdOrEncryptedId> {
+        self.subject.as_ref()?.name_id.as_ref()
+    }
+
+    /// [`requested_subject`](Self::requested_subject) as a plaintext NameID.
+    ///
+    /// `None` when the request names no principal **or** names one in an
+    /// `EncryptedID`; call [`requested_subject`](Self::requested_subject) to tell
+    /// those apart.
+    pub fn requested_subject_name_id(&self) -> Option<&NameId> {
+        match self.requested_subject()? {
+            NameIdOrEncryptedId::NameId(name_id) => Some(name_id),
+            NameIdOrEncryptedId::EncryptedId(_) => None,
+        }
+    }
 }
 
 #[cfg(test)]

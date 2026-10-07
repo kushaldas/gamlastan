@@ -22,27 +22,50 @@ use crate::core::identifiers::{SamlId, SamlVersion};
 use crate::core::protocol::query::{AssertionIdRequest, AuthnQuery};
 use crate::core::protocol::response::{Response, ResponseBase};
 use crate::core::protocol::status::{Status, StatusCode};
+use crate::idp::ident::StoreError;
 
 /// Store of issued assertions, queryable by assertion ID and by subject.
 ///
 /// Implement over Redis/SQL for multi-instance IdPs; the in-memory
 /// implementation suits single instances and tests.
+///
+/// Every method is fallible: a backend that cannot answer must return
+/// [`StoreError`], not an empty result, so an outage is not mistaken for
+/// "no such assertion".
 pub trait AssertionStore: Send + Sync {
     /// Record an issued assertion.
-    fn store_assertion(&self, assertion: Assertion);
+    fn store_assertion(&self, assertion: Assertion) -> Result<(), StoreError>;
     /// Fetch an assertion by its ID.
-    fn get_assertion(&self, assertion_id: &str) -> Option<Assertion>;
+    fn get_assertion(&self, assertion_id: &str) -> Result<Option<Assertion>, StoreError>;
     /// All assertions issued for a subject NameID value.
-    fn assertions_for_subject(&self, name_id_value: &str) -> Vec<Assertion>;
+    fn assertions_for_subject(&self, name_id_value: &str) -> Result<Vec<Assertion>, StoreError>;
     /// Remove an assertion (e.g. after expiry).
-    fn remove_assertion(&self, assertion_id: &str);
+    fn remove_assertion(&self, assertion_id: &str) -> Result<(), StoreError>;
 }
 
 /// In-memory assertion store.
 #[derive(Debug, Default)]
 pub struct InMemoryAssertionStore {
-    by_id: Mutex<HashMap<String, Assertion>>,
-    by_subject: Mutex<HashMap<String, Vec<String>>>,
+    state: Mutex<State>,
+}
+
+/// Both indexes behind one lock, so they cannot disagree.
+#[derive(Debug, Default)]
+struct State {
+    by_id: HashMap<String, Assertion>,
+    by_subject: HashMap<String, Vec<String>>,
+}
+
+impl State {
+    /// Drop `assertion_id` from the subject index entry for `subject`.
+    fn unindex(&mut self, subject: &str, assertion_id: &str) {
+        if let Some(ids) = self.by_subject.get_mut(subject) {
+            ids.retain(|id| id != assertion_id);
+            if ids.is_empty() {
+                self.by_subject.remove(subject);
+            }
+        }
+    }
 }
 
 impl InMemoryAssertionStore {
@@ -60,63 +83,51 @@ fn subject_value(assertion: &Assertion) -> Option<String> {
 }
 
 impl AssertionStore for InMemoryAssertionStore {
-    fn store_assertion(&self, assertion: Assertion) {
+    fn store_assertion(&self, assertion: Assertion) -> Result<(), StoreError> {
         let assertion_id = assertion.id.clone();
         let subject = subject_value(&assertion);
 
-        self.by_id
-            .lock()
-            .unwrap()
-            .insert(assertion_id.clone(), assertion);
-
+        let mut state = self.state.lock().unwrap();
+        // Re-storing an ID replaces the assertion, so it must leave the index of
+        // whatever subject the old one named: otherwise a lookup for that
+        // subject would return an assertion issued to someone else.
+        if let Some(previous) = state.by_id.insert(assertion_id.clone(), assertion) {
+            if let Some(old_subject) = subject_value(&previous) {
+                state.unindex(&old_subject, &assertion_id);
+            }
+        }
         if let Some(subject) = subject {
-            let mut by_subject = self.by_subject.lock().unwrap();
-            let ids = by_subject.entry(subject).or_default();
-            // Re-storing the same assertion ID (overwriting in `by_id`) must
-            // not duplicate it in the subject index, or `assertions_for_subject`
-            // would return the assertion more than once.
+            let ids = state.by_subject.entry(subject).or_default();
             if !ids.contains(&assertion_id) {
                 ids.push(assertion_id);
             }
         }
+        Ok(())
     }
 
-    fn get_assertion(&self, assertion_id: &str) -> Option<Assertion> {
-        self.by_id.lock().unwrap().get(assertion_id).cloned()
+    fn get_assertion(&self, assertion_id: &str) -> Result<Option<Assertion>, StoreError> {
+        Ok(self.state.lock().unwrap().by_id.get(assertion_id).cloned())
     }
 
-    fn assertions_for_subject(&self, name_id_value: &str) -> Vec<Assertion> {
-        let ids = self
+    fn assertions_for_subject(&self, name_id_value: &str) -> Result<Vec<Assertion>, StoreError> {
+        let state = self.state.lock().unwrap();
+        Ok(state
             .by_subject
-            .lock()
-            .unwrap()
             .get(name_id_value)
-            .cloned()
-            .unwrap_or_default();
-
-        if ids.is_empty() {
-            return vec![];
-        }
-
-        let by_id = self.by_id.lock().unwrap();
-        ids.into_iter()
-            .filter_map(|id| by_id.get(&id).cloned())
-            .collect()
+            .into_iter()
+            .flatten()
+            .filter_map(|id| state.by_id.get(id).cloned())
+            .collect())
     }
 
-    fn remove_assertion(&self, assertion_id: &str) {
-        let removed = self.by_id.lock().unwrap().remove(assertion_id);
-        if let Some(subject) = removed.as_ref().and_then(subject_value) {
-            let mut by_subject = self.by_subject.lock().unwrap();
-            let mut remove_subject_entry = false;
-            if let Some(ids) = by_subject.get_mut(&subject) {
-                ids.retain(|id| id != assertion_id);
-                remove_subject_entry = ids.is_empty();
-            }
-            if remove_subject_entry {
-                by_subject.remove(&subject);
+    fn remove_assertion(&self, assertion_id: &str) -> Result<(), StoreError> {
+        let mut state = self.state.lock().unwrap();
+        if let Some(removed) = state.by_id.remove(assertion_id) {
+            if let Some(subject) = subject_value(&removed) {
+                state.unindex(&subject, assertion_id);
             }
         }
+        Ok(())
     }
 }
 
@@ -132,9 +143,9 @@ pub fn get_authn_statements(
     session_index: Option<&str>,
     requested_context_class_refs: &[String],
     now: DateTime<Utc>,
-) -> Vec<AuthnStatement> {
-    store
-        .assertions_for_subject(name_id_value)
+) -> Result<Vec<AuthnStatement>, StoreError> {
+    Ok(store
+        .assertions_for_subject(name_id_value)?
         .into_iter()
         .filter(|assertion| {
             assertion.conditions.as_ref().is_some_and(|conditions| {
@@ -168,7 +179,7 @@ pub fn get_authn_statements(
             }
             true
         })
-        .collect()
+        .collect())
 }
 
 fn success_response(
@@ -236,13 +247,13 @@ pub fn create_assertion_id_request_response(
     request: &AssertionIdRequest,
     idp_entity_id: &str,
     now: DateTime<Utc>,
-) -> Response {
+) -> Result<Response, StoreError> {
     let mut assertions = Vec::with_capacity(request.assertion_id_refs.len());
     for id_ref in &request.assertion_id_refs {
-        match store.get_assertion(id_ref) {
+        match store.get_assertion(id_ref)? {
             Some(a) => assertions.push(a),
             None => {
-                return Response {
+                return Ok(Response {
                     base: ResponseBase {
                         id: SamlId::generate().as_str().to_string(),
                         version: SamlVersion::V2_0,
@@ -263,11 +274,16 @@ pub fn create_assertion_id_request_response(
                     },
                     assertions: vec![],
                     encrypted_assertions: vec![],
-                };
+                });
             }
         }
     }
-    success_response(idp_entity_id, &request.id, assertions, now)
+    Ok(success_response(
+        idp_entity_id,
+        &request.id,
+        assertions,
+        now,
+    ))
 }
 
 /// Answer an AuthnQuery from the store (pysaml2
@@ -281,9 +297,9 @@ pub fn create_authn_query_response(
     query: &AuthnQuery,
     idp_entity_id: &str,
     now: DateTime<Utc>,
-) -> Response {
+) -> Result<Response, StoreError> {
     let Some(NameIdOrEncryptedId::NameId(name_id)) = &query.subject.name_id else {
-        return no_authn_context_response(idp_entity_id, &query.id, now);
+        return Ok(no_authn_context_response(idp_entity_id, &query.id, now));
     };
 
     let class_refs: Vec<String> = query
@@ -300,10 +316,10 @@ pub fn create_authn_query_response(
         query.session_index.as_deref(),
         &class_refs,
         now,
-    );
+    )?;
 
     if statements.is_empty() {
-        return no_authn_context_response(idp_entity_id, &query.id, now);
+        return Ok(no_authn_context_response(idp_entity_id, &query.id, now));
     }
 
     let assertion = Assertion {
@@ -323,7 +339,12 @@ pub fn create_authn_query_response(
         attribute_statements: vec![],
     };
 
-    success_response(idp_entity_id, &query.id, vec![assertion], now)
+    Ok(success_response(
+        idp_entity_id,
+        &query.id,
+        vec![assertion],
+        now,
+    ))
 }
 
 #[cfg(test)]
@@ -383,44 +404,71 @@ mod tests {
     #[test]
     fn test_store_and_get() {
         let store = InMemoryAssertionStore::new();
-        store.store_assertion(assertion(
-            "_a1",
-            "alice",
-            "_s1",
-            constants::AUTHN_CONTEXT_PASSWORD,
-        ));
-        assert!(store.get_assertion("_a1").is_some());
-        assert_eq!(store.assertions_for_subject("alice").len(), 1);
+        store
+            .store_assertion(assertion(
+                "_a1",
+                "alice",
+                "_s1",
+                constants::AUTHN_CONTEXT_PASSWORD,
+            ))
+            .unwrap();
+        assert!(store.get_assertion("_a1").unwrap().is_some());
+        assert_eq!(store.assertions_for_subject("alice").unwrap().len(), 1);
 
-        store.remove_assertion("_a1");
-        assert!(store.get_assertion("_a1").is_none());
-        assert!(store.assertions_for_subject("alice").is_empty());
+        store.remove_assertion("_a1").unwrap();
+        assert!(store.get_assertion("_a1").unwrap().is_none());
+        assert!(store.assertions_for_subject("alice").unwrap().is_empty());
+    }
+
+    #[test]
+    fn restoring_an_id_for_another_subject_leaves_the_old_subjects_index() {
+        let store = InMemoryAssertionStore::new();
+        let class = constants::AUTHN_CONTEXT_PASSWORD;
+        store
+            .store_assertion(assertion("_a1", "alice", "_s1", class))
+            .unwrap();
+        // Same ID, now naming bob: alice must no longer see it.
+        store
+            .store_assertion(assertion("_a1", "bob", "_s2", class))
+            .unwrap();
+        assert!(store.assertions_for_subject("alice").unwrap().is_empty());
+        assert_eq!(store.assertions_for_subject("bob").unwrap().len(), 1);
+        assert_eq!(
+            subject_value(&store.get_assertion("_a1").unwrap().unwrap()).as_deref(),
+            Some("bob")
+        );
+        // Removing it leaves nothing behind in either index.
+        store.remove_assertion("_a1").unwrap();
+        assert!(store.assertions_for_subject("bob").unwrap().is_empty());
     }
 
     #[test]
     fn test_store_same_id_twice_does_not_duplicate_subject_index() {
         let store = InMemoryAssertionStore::new();
         let a = assertion("_a1", "alice", "_s1", constants::AUTHN_CONTEXT_PASSWORD);
-        store.store_assertion(a.clone());
+        store.store_assertion(a.clone()).unwrap();
         // Re-storing the same assertion ID (e.g. an update) must not make
         // `assertions_for_subject` return it twice.
-        store.store_assertion(a);
-        assert_eq!(store.assertions_for_subject("alice").len(), 1);
+        store.store_assertion(a).unwrap();
+        assert_eq!(store.assertions_for_subject("alice").unwrap().len(), 1);
     }
 
     #[test]
     fn test_assertion_id_request_response() {
         let store = InMemoryAssertionStore::new();
-        store.store_assertion(assertion(
-            "_a1",
-            "alice",
-            "_s1",
-            constants::AUTHN_CONTEXT_PASSWORD,
-        ));
+        store
+            .store_assertion(assertion(
+                "_a1",
+                "alice",
+                "_s1",
+                constants::AUTHN_CONTEXT_PASSWORD,
+            ))
+            .unwrap();
 
         let request =
             create_assertion_id_request("https://sp.example.com", vec!["_a1".to_string()], None);
-        let response = create_assertion_id_request_response(&store, &request, IDP, Utc::now());
+        let response =
+            create_assertion_id_request_response(&store, &request, IDP, Utc::now()).unwrap();
         assert!(response.base.status.is_success());
         assert_eq!(response.assertions.len(), 1);
         assert_eq!(response.assertions[0].id, "_a1");
@@ -438,7 +486,8 @@ mod tests {
             vec!["_missing".to_string()],
             None,
         );
-        let response = create_assertion_id_request_response(&store, &request, IDP, Utc::now());
+        let response =
+            create_assertion_id_request_response(&store, &request, IDP, Utc::now()).unwrap();
         assert!(!response.base.status.is_success());
         assert_eq!(
             response.base.status.status_code.value,
@@ -449,18 +498,22 @@ mod tests {
     #[test]
     fn test_authn_query_response_filters() {
         let store = InMemoryAssertionStore::new();
-        store.store_assertion(assertion(
-            "_a1",
-            "alice",
-            "_s1",
-            constants::AUTHN_CONTEXT_PASSWORD,
-        ));
-        store.store_assertion(assertion(
-            "_a2",
-            "alice",
-            "_s2",
-            constants::AUTHN_CONTEXT_PASSWORD_PROTECTED_TRANSPORT,
-        ));
+        store
+            .store_assertion(assertion(
+                "_a1",
+                "alice",
+                "_s1",
+                constants::AUTHN_CONTEXT_PASSWORD,
+            ))
+            .unwrap();
+        store
+            .store_assertion(assertion(
+                "_a2",
+                "alice",
+                "_s2",
+                constants::AUTHN_CONTEXT_PASSWORD_PROTECTED_TRANSPORT,
+            ))
+            .unwrap();
 
         // No filters: both statements
         let query = create_authn_query(
@@ -470,7 +523,7 @@ mod tests {
             None,
             None,
         );
-        let response = create_authn_query_response(&store, &query, IDP, Utc::now());
+        let response = create_authn_query_response(&store, &query, IDP, Utc::now()).unwrap();
         assert!(response.base.status.is_success());
         assert_eq!(response.assertions[0].authn_statements.len(), 2);
 
@@ -482,7 +535,7 @@ mod tests {
             None,
             None,
         );
-        let response = create_authn_query_response(&store, &query, IDP, Utc::now());
+        let response = create_authn_query_response(&store, &query, IDP, Utc::now()).unwrap();
         let stmts = &response.assertions[0].authn_statements;
         assert_eq!(stmts.len(), 1);
         assert_eq!(
@@ -495,7 +548,7 @@ mod tests {
     fn test_authn_query_no_match_is_no_authn_context() {
         let store = InMemoryAssertionStore::new();
         let query = create_authn_query("https://sp.example.com", &name_id("bob"), None, None, None);
-        let response = create_authn_query_response(&store, &query, IDP, Utc::now());
+        let response = create_authn_query_response(&store, &query, IDP, Utc::now()).unwrap();
         assert!(!response.base.status.is_success());
         let sub = response
             .base
@@ -519,7 +572,7 @@ mod tests {
         );
         expired.conditions.as_mut().unwrap().not_on_or_after =
             Some(Utc::now() - chrono::TimeDelta::seconds(1));
-        store.store_assertion(expired);
+        store.store_assertion(expired).unwrap();
         let query = create_authn_query(
             "https://sp.example.com",
             &name_id("alice"),
@@ -527,7 +580,7 @@ mod tests {
             None,
             None,
         );
-        let response = create_authn_query_response(&store, &query, IDP, Utc::now());
+        let response = create_authn_query_response(&store, &query, IDP, Utc::now()).unwrap();
         assert!(!response.base.status.is_success());
         assert!(response.assertions.is_empty());
     }

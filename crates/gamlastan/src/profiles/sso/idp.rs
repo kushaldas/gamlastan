@@ -37,12 +37,36 @@ use crate::crypto::encryptor::{
 };
 use crate::metadata::types::sp::SpSsoDescriptor;
 
-use crate::crypto::SamlSigner;
+use crate::crypto::{DigestMethod, SamlSigner, SigningAlgorithms};
 use crate::profiles::error::ProfileError;
 use crate::profiles::sso::web_browser::{ResponseOptions, ResponseTimes};
 use crate::xml::serialize::SamlSerialize;
 
 /// Result of processing an AuthnRequest on the IdP side.
+///
+/// # What this does not carry
+///
+/// Parts of the original [`AuthnRequest`] are deliberately not surfaced here,
+/// and the response orchestrator does not act on them:
+///
+/// - **`Scoping`** (`IDPList`, `ProxyCount`, `RequesterID`). An originating IdP
+///   can ignore it. A **proxying** IdP cannot: SAML Core 3.4.1.2 makes
+///   `ProxyCount` and `IDPList` constraints on whether and where the request
+///   may be forwarded, and a proxy that never reads them forwards requests it
+///   was told not to. Such a deployment must read `request.scoping` from the
+///   original `AuthnRequest` itself and enforce it (the `gamlastan-actix`
+///   `AuthnSubjectCallback` receives the parsed `AuthnRequest` for this). The request parser rejects a
+///   malformed `Scoping` (an `IDPEntry` without `ProviderID`, a repeated
+///   `IDPList`) instead of repairing it, so what a proxy reads is what the SP
+///   sent.
+/// - **`Subject`**. It is checked only for the forbidden `SubjectConfirmation`
+///   (see [`ProfileError::SubjectConfirmationInAuthnRequest`]); the principal it
+///   names is not compared with the authenticated subject, so an assertion is
+///   issued for whoever authenticated. Read it with
+///   [`AuthnRequest::requested_subject`] and compare it yourself if you support
+///   a requested subject (a re-login as the same user, MFA step-up); pysaml2
+///   leaves this to the application too.
+/// - **`Conditions`**, which the responder may modify or supplement.
 #[derive(Debug, Clone)]
 pub struct ProcessedAuthnRequest {
     /// The request ID (for InResponseTo).
@@ -54,7 +78,10 @@ pub struct ProcessedAuthnRequest {
     /// The ACS URL where the response should be sent.
     pub acs_url: String,
 
-    /// The ACS binding to use for the response.
+    /// The ACS binding to use for the response. It is the binding the resolved
+    /// endpoint is registered under, so it may be HTTP-Artifact or HTTP-Redirect,
+    /// not only HTTP-POST; deliver the response with it. The ready Actix handlers
+    /// and `example-idp` deliver by HTTP-POST only and refuse any other.
     pub acs_binding: String,
 
     /// Whether to force re-authentication.
@@ -66,14 +93,38 @@ pub struct ProcessedAuthnRequest {
     /// Requested NameID format (from NameIDPolicy).
     pub requested_name_id_format: Option<String>,
 
+    /// The SP name qualifier requested in NameIDPolicy (E14). When present it
+    /// overrides the SP entity ID as the NameID's `SPNameQualifier`.
+    pub requested_sp_name_qualifier: Option<String>,
+
     /// Whether creation of new identifiers is allowed (E14).
     pub allow_create: bool,
+
+    /// Whether the request carried a `NameIDPolicy` element at all. Needed to
+    /// distinguish "no NameIDPolicy" (fall back to the IdP's default format)
+    /// from "NameIDPolicy with AllowCreate=false" (E14: no new *persistent*
+    /// identifier may be created). Per SAML V2.0 Errata E14, `AllowCreate`
+    /// "MUST NOT be used and SHOULD be ignored" for the transient format, and
+    /// its behavior for any other format is explicitly left to the IdP's own
+    /// implementation ("these are details left to implementations or
+    /// deployments") — the spec does not mandate enforcing it universally.
+    /// `IdentDb::construct_nameid` (matching pysaml2's own
+    /// `construct_nameid`/`persistent_nameid` split) only consults
+    /// `allow_create` for the persistent format; transient, email,
+    /// unspecified, and custom formats are minted fresh regardless.
+    pub has_name_id_policy: bool,
 
     /// Requested authentication context class refs.
     pub requested_authn_context_class_refs: Vec<String>,
 
     /// Authentication context comparison type.
     pub authn_context_comparison: Option<crate::core::protocol::request::AuthnContextComparison>,
+
+    /// Requested authentication context *declaration* refs
+    /// (`AuthnContextDeclRef`). An `AuthnMethod` carries a class ref only, so
+    /// the orchestrator cannot match a declaration; a request that names any is
+    /// denied with `NoAuthnContext` rather than treated as unconstrained.
+    pub requested_authn_context_decl_refs: Vec<String>,
 
     /// AttributeConsumingServiceIndex.
     pub attribute_consuming_service_index: Option<u16>,
@@ -115,6 +166,16 @@ pub fn process_authn_request(
         .value
         .clone();
 
+    // The profile does not allow SubjectConfirmation in an AuthnRequest's
+    // Subject; the error variant existed but nothing raised it.
+    if request
+        .subject
+        .as_ref()
+        .is_some_and(|subject| !subject.subject_confirmations.is_empty())
+    {
+        return Err(ProfileError::SubjectConfirmationInAuthnRequest);
+    }
+
     // Determine ACS URL and binding
     if (request.base.has_signature || sp_metadata.authn_requests_signed == Some(true))
         && !request_signature_verified
@@ -129,17 +190,39 @@ pub fn process_authn_request(
     let is_passive = request.is_passive.unwrap_or(false);
 
     // Extract NameIDPolicy
-    let (requested_name_id_format, allow_create) = match &request.name_id_policy {
-        Some(policy) => (policy.format.clone(), policy.allow_create),
-        None => (None, false),
-    };
+    let (requested_name_id_format, requested_sp_name_qualifier, allow_create, has_name_id_policy) =
+        match &request.name_id_policy {
+            Some(policy) => (
+                policy.format.clone(),
+                policy.sp_name_qualifier.clone(),
+                policy.allow_create,
+                true,
+            ),
+            None => (None, None, false, false),
+        };
 
     // Extract RequestedAuthnContext
-    let (requested_authn_context_class_refs, authn_context_comparison) =
-        match &request.requested_authn_context {
-            Some(ctx) => (ctx.authn_context_class_refs.clone(), Some(ctx.comparison)),
-            None => (vec![], None),
-        };
+    let (
+        requested_authn_context_class_refs,
+        requested_authn_context_decl_refs,
+        authn_context_comparison,
+    ) = match &request.requested_authn_context {
+        // The schema requires at least one class or declaration ref. An empty
+        // element is malformed, not "no constraint": collapsing it into the
+        // same state as an absent element would let it reuse any session.
+        Some(ctx)
+            if ctx.authn_context_class_refs.is_empty()
+                && ctx.authn_context_decl_refs.is_empty() =>
+        {
+            return Err(ProfileError::EmptyRequestedAuthnContext);
+        }
+        Some(ctx) => (
+            ctx.authn_context_class_refs.clone(),
+            ctx.authn_context_decl_refs.clone(),
+            Some(ctx.comparison),
+        ),
+        None => (vec![], vec![], None),
+    };
 
     Ok(ProcessedAuthnRequest {
         request_id: request.base.id.clone(),
@@ -149,9 +232,12 @@ pub fn process_authn_request(
         force_authn,
         is_passive,
         requested_name_id_format,
+        requested_sp_name_qualifier,
         allow_create,
+        has_name_id_policy,
         requested_authn_context_class_refs,
         authn_context_comparison,
+        requested_authn_context_decl_refs,
         attribute_consuming_service_index: request.attribute_consuming_service_index,
         extensions: request.extensions.clone(),
     })
@@ -159,61 +245,78 @@ pub fn process_authn_request(
 
 /// Resolve the ACS endpoint URL and binding from the AuthnRequest and SP metadata.
 ///
-/// Priority:
-/// 1. AssertionConsumerServiceURL + ProtocolBinding from request (must be verified against metadata)
-/// 2. AssertionConsumerServiceIndex from request
-/// 3. Default ACS from SP metadata
+/// The response only ever goes to an endpoint registered in the SP's metadata:
+///
+/// - **`AssertionConsumerServiceURL`**: the URL must be a registered location.
+///   With a `ProtocolBinding` the (URL, binding) pair must be registered
+///   together. Without one, the binding is the one the URL is registered under
+///   (the first, in metadata order, if it is registered under several), as in
+///   pysaml2; it is not assumed to be HTTP-POST.
+/// - **`AssertionConsumerServiceIndex`**: the endpoint with that index. A
+///   `ProtocolBinding` given as well must agree with that endpoint's binding.
+/// - **Neither**: the SP's default endpoint, chosen among the endpoints
+///   registered with the requested `ProtocolBinding` when one was given (an
+///   error if there are none), as pysaml2 does, and among all of them otherwise.
+///
+/// If a URL and an index are both present the URL wins and the index is ignored,
+/// as in pysaml2; the URL must still be registered, so this is not exploitable.
 fn resolve_acs_endpoint(
     request: &AuthnRequest,
     sp_metadata: &SpSsoDescriptor,
 ) -> Result<(String, String), ProfileError> {
+    let endpoints = &sp_metadata.assertion_consumer_services;
+    let requested_binding = request.protocol_binding.as_deref();
+
     // Option 1: URL directly specified in request
     if let Some(url) = &request.assertion_consumer_service_url {
-        let binding = request
-            .protocol_binding
-            .as_deref()
-            .unwrap_or("urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST");
-
         // Location and binding are one registered endpoint. Verifying only the
         // URL and then returning the request-controlled binding creates a
         // protocol-confusion gap.
-        let found = sp_metadata
-            .assertion_consumer_services
-            .iter()
-            .any(|ep| ep.endpoint.location == *url && ep.endpoint.binding == binding);
-        if !found {
-            return Err(ProfileError::AcsUrlMismatch);
-        }
-
-        return Ok((url.clone(), binding.to_string()));
+        let mut at_url = endpoints.iter().filter(|ep| ep.endpoint.location == *url);
+        let found = match requested_binding {
+            Some(binding) => at_url.find(|ep| ep.endpoint.binding == binding),
+            None => at_url.next(),
+        };
+        return found
+            .map(|ep| (ep.endpoint.location.clone(), ep.endpoint.binding.clone()))
+            .ok_or(ProfileError::AcsUrlMismatch);
     }
 
     // Option 2: Index specified in request
     if let Some(index) = request.assertion_consumer_service_index {
-        if let Some(ep) = sp_metadata
-            .assertion_consumer_services
-            .iter()
-            .find(|e| e.index == index)
-        {
-            return Ok((ep.endpoint.location.clone(), ep.endpoint.binding.clone()));
+        let Some(ep) = endpoints.iter().find(|e| e.index == index) else {
+            return Err(ProfileError::NoAcsEndpoint(format!(
+                "index {} not found in SP metadata",
+                index
+            )));
+        };
+        if requested_binding.is_some_and(|binding| ep.endpoint.binding != binding) {
+            return Err(ProfileError::AcsUrlMismatch);
         }
-        return Err(ProfileError::NoAcsEndpoint(format!(
-            "index {} not found in SP metadata",
-            index
-        )));
-    }
-
-    // Option 3: Default from SP metadata
-    let default = crate::profiles::sso::sp::find_default_acs_endpoint(
-        &sp_metadata.assertion_consumer_services,
-    );
-    if let Some(ep) = default {
         return Ok((ep.endpoint.location.clone(), ep.endpoint.binding.clone()));
     }
 
-    Err(ProfileError::NoAcsEndpoint(
-        "no ACS endpoint could be resolved".to_string(),
-    ))
+    // Option 3: Default from SP metadata, among the endpoints of the requested
+    // binding if the request named one.
+    let default = match requested_binding {
+        Some(binding) => {
+            let of_binding: Vec<_> = endpoints
+                .iter()
+                .filter(|ep| ep.endpoint.binding == binding)
+                .cloned()
+                .collect();
+            crate::profiles::sso::sp::find_default_acs_endpoint(&of_binding).cloned()
+        }
+        None => crate::profiles::sso::sp::find_default_acs_endpoint(endpoints).cloned(),
+    };
+    if let Some(ep) = default {
+        return Ok((ep.endpoint.location, ep.endpoint.binding));
+    }
+
+    Err(ProfileError::NoAcsEndpoint(match requested_binding {
+        Some(binding) => format!("no ACS endpoint is registered for binding {binding}"),
+        None => "no ACS endpoint could be resolved".to_string(),
+    }))
 }
 
 /// Create a SAML Response for SP-initiated SSO.
@@ -277,7 +380,7 @@ pub fn create_response(
         authn_context: AuthnContext {
             authn_context_class_ref: options.authn_context_class_ref.clone(),
             authn_context_decl_ref: None,
-            authenticating_authorities: vec![],
+            authenticating_authorities: options.authenticating_authorities.clone(),
         },
     };
 
@@ -477,6 +580,7 @@ pub fn create_unsolicited_response(
         authn_context_class_ref: authn_context_class_ref.map(|s| s.to_string()),
         client_address: client_address.map(|s| s.to_string()),
         attributes: attributes.to_vec(),
+        authenticating_authorities: vec![],
     };
 
     create_response(&options, principal_name_id, times)
@@ -523,6 +627,23 @@ pub fn signature_template(
     cert_der_b64: &str,
     signature_method_uri: &str,
 ) -> String {
+    signature_template_with_digest(
+        reference_id,
+        cert_der_b64,
+        signature_method_uri,
+        DIGEST_METHOD_SHA256,
+    )
+}
+
+/// [`signature_template`] with an explicit `<ds:DigestMethod>` algorithm
+/// instead of SHA-256. `digest_method_uri` is escaped like the other caller
+/// supplied values; prefer [`DigestMethod::uri`] over a free-form string.
+pub fn signature_template_with_digest(
+    reference_id: &str,
+    cert_der_b64: &str,
+    signature_method_uri: &str,
+    digest_method_uri: &str,
+) -> String {
     use bergshamra_c14n::escape::escape_attr;
     let key_info = crate::crypto::build_x509_key_info(&[cert_der_b64]);
     format!(
@@ -530,7 +651,7 @@ pub fn signature_template(
         id = escape_attr(reference_id),
         key_info = key_info,
         sig_alg = escape_attr(signature_method_uri),
-        digest = DIGEST_METHOD_SHA256,
+        digest = escape_attr(digest_method_uri),
     )
 }
 
@@ -608,13 +729,57 @@ pub fn sign_response_xml(
     sign_assertions: bool,
     sign_responses: bool,
 ) -> Result<String, ProfileError> {
+    sign_response_xml_with(
+        response_xml,
+        signer,
+        cert_der_b64,
+        response_id,
+        assertion_id,
+        sign_assertions,
+        sign_responses,
+        &SigningAlgorithms::default(),
+    )
+}
+
+/// [`sign_response_xml`] with explicit signature and digest algorithms.
+///
+/// `algorithms` overrides the signer's default for this one response (a `None`
+/// field keeps the default: the signer's method, SHA-256 digest). An HSM-backed
+/// signer can only use its token's own signature algorithm; asking for another
+/// is an error (see [`SamlSigner::signature_method_uri_for`]).
+#[allow(clippy::too_many_arguments)]
+pub fn sign_response_xml_with(
+    response_xml: &str,
+    signer: &SamlSigner,
+    cert_der_b64: &str,
+    response_id: &str,
+    assertion_id: Option<&str>,
+    sign_assertions: bool,
+    sign_responses: bool,
+    algorithms: &SigningAlgorithms,
+) -> Result<String, ProfileError> {
+    // Nothing to sign: do not consult the signer. An HSM-backed signer refuses a
+    // signature method other than its token's, and that must not fail a
+    // response that is intentionally unsigned.
+    if !sign_assertions && !sign_responses {
+        return Ok(response_xml.to_string());
+    }
+    let signature_method = signer.signature_method_uri_for(algorithms.signature)?;
+    let digest_method = algorithms
+        .digest
+        .map_or(DIGEST_METHOD_SHA256, DigestMethod::uri);
     let mut xml = response_xml.to_string();
 
     if sign_assertions {
         let assertion_id = assertion_id.ok_or_else(|| {
             ProfileError::Other("sign_assertions requested without an assertion_id".to_string())
         })?;
-        let sig = signature_template(assertion_id, cert_der_b64, signer.signature_method_uri()?);
+        let sig = signature_template_with_digest(
+            assertion_id,
+            cert_der_b64,
+            signature_method,
+            digest_method,
+        );
         xml = insert_signature_after_issuer(
             &xml,
             namespace::SAML_ASSERTION_NS,
@@ -626,7 +791,12 @@ pub fn sign_response_xml(
     }
 
     if sign_responses {
-        let sig = signature_template(response_id, cert_der_b64, signer.signature_method_uri()?);
+        let sig = signature_template_with_digest(
+            response_id,
+            cert_der_b64,
+            signature_method,
+            digest_method,
+        );
         xml = insert_signature_after_issuer(
             &xml,
             namespace::SAML_PROTOCOL_NS,
@@ -770,6 +940,260 @@ mod tests {
     }
 
     #[test]
+    fn requested_subject_reads_the_principal_named_in_subject() {
+        use crate::core::assertion::name_id::NameIdOrEncryptedId;
+        let name_id = NameId {
+            value: "alice".to_string(),
+            format: Some(constants::NAMEID_UNSPECIFIED.to_string()),
+            name_qualifier: None,
+            sp_name_qualifier: None,
+            sp_provided_id: None,
+        };
+        let mut request = make_authn_request();
+
+        // No Subject at all.
+        request.subject = None;
+        assert!(request.requested_subject().is_none());
+        assert!(request.requested_subject_name_id().is_none());
+
+        // A Subject that names no principal.
+        request.subject = Some(Subject {
+            name_id: None,
+            subject_confirmations: vec![],
+        });
+        assert!(request.requested_subject().is_none());
+
+        // A plaintext NameID.
+        request.subject = Some(Subject {
+            name_id: Some(NameIdOrEncryptedId::NameId(name_id.clone())),
+            subject_confirmations: vec![],
+        });
+        assert_eq!(request.requested_subject_name_id(), Some(&name_id));
+        assert!(matches!(
+            request.requested_subject(),
+            Some(NameIdOrEncryptedId::NameId(_))
+        ));
+    }
+
+    #[test]
+    fn an_encrypted_requested_subject_is_not_mistaken_for_no_subject() {
+        use crate::core::assertion::name_id::{EncryptedId, NameIdOrEncryptedId};
+        let mut request = make_authn_request();
+        request.subject = Some(Subject {
+            name_id: Some(NameIdOrEncryptedId::EncryptedId(EncryptedId {
+                raw: b"<saml:EncryptedID/>".to_vec(),
+            })),
+            subject_confirmations: vec![],
+        });
+        // It cannot be read as a plaintext NameID...
+        assert!(request.requested_subject_name_id().is_none());
+        // ...but the request does name a principal, and the caller can tell.
+        assert!(matches!(
+            request.requested_subject(),
+            Some(NameIdOrEncryptedId::EncryptedId(_))
+        ));
+    }
+
+    #[test]
+    fn test_process_authn_request_rejects_subject_confirmation() {
+        let mut request = make_authn_request();
+        request.subject = Some(Subject {
+            name_id: None,
+            subject_confirmations: vec![SubjectConfirmation {
+                method: "urn:oasis:names:tc:SAML:2.0:cm:bearer".to_string(),
+                name_id: None,
+                subject_confirmation_data: None,
+            }],
+        });
+        assert!(matches!(
+            process_authn_request(&request, &make_sp_metadata(), false),
+            Err(ProfileError::SubjectConfirmationInAuthnRequest)
+        ));
+
+        // A Subject that carries no confirmation is not refused by this rule.
+        request.subject = Some(Subject {
+            name_id: None,
+            subject_confirmations: vec![],
+        });
+        assert!(process_authn_request(&request, &make_sp_metadata(), false).is_ok());
+    }
+
+    #[test]
+    fn test_process_authn_request_rejects_an_empty_requested_authn_context() {
+        let mut request = make_authn_request();
+        request.requested_authn_context = Some(RequestedAuthnContext {
+            authn_context_class_refs: vec![],
+            authn_context_decl_refs: vec![],
+            comparison: AuthnContextComparison::Exact,
+        });
+        assert!(matches!(
+            process_authn_request(&request, &make_sp_metadata(), false),
+            Err(ProfileError::EmptyRequestedAuthnContext)
+        ));
+
+        // An absent element is a different thing: no constraint.
+        request.requested_authn_context = None;
+        let result = process_authn_request(&request, &make_sp_metadata(), false).unwrap();
+        assert!(result.requested_authn_context_class_refs.is_empty());
+        assert!(result.requested_authn_context_decl_refs.is_empty());
+        assert!(result.authn_context_comparison.is_none());
+    }
+
+    #[test]
+    fn test_process_authn_request_keeps_declaration_refs() {
+        let mut request = make_authn_request();
+        request.requested_authn_context = Some(RequestedAuthnContext {
+            authn_context_class_refs: vec![],
+            authn_context_decl_refs: vec!["urn:example:decl".to_string()],
+            comparison: AuthnContextComparison::Exact,
+        });
+        let result = process_authn_request(&request, &make_sp_metadata(), false).unwrap();
+        assert!(result.requested_authn_context_class_refs.is_empty());
+        assert_eq!(
+            result.requested_authn_context_decl_refs,
+            vec!["urn:example:decl".to_string()],
+            "a declaration-only constraint must survive processing"
+        );
+    }
+
+    const POST: &str = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST";
+    const REDIRECT: &str = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect";
+    const ARTIFACT: &str = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Artifact";
+
+    /// `make_sp_metadata()` (POST default at index 0, Redirect at index 1) plus
+    /// an Artifact endpoint at index 2 and the POST location also registered
+    /// under Artifact at index 3.
+    fn metadata_with_artifact() -> SpSsoDescriptor {
+        let mut sp = make_sp_metadata();
+        sp.assertion_consumer_services.push(IndexedEndpoint::new(
+            Endpoint::new(ARTIFACT, "https://sp.example.com/acs/artifact"),
+            2,
+        ));
+        sp.assertion_consumer_services.push(IndexedEndpoint::new(
+            Endpoint::new(ARTIFACT, "https://sp.example.com/acs/post"),
+            3,
+        ));
+        sp
+    }
+
+    /// A request that names its ACS only through the given attributes.
+    fn acs_request(url: Option<&str>, index: Option<u16>, binding: Option<&str>) -> AuthnRequest {
+        let mut request = make_authn_request();
+        request.assertion_consumer_service_url = url.map(str::to_string);
+        request.assertion_consumer_service_index = index;
+        request.protocol_binding = binding.map(str::to_string);
+        request
+    }
+
+    fn acs(request: &AuthnRequest) -> Result<(String, String), ProfileError> {
+        process_authn_request(request, &metadata_with_artifact(), false)
+            .map(|p| (p.acs_url, p.acs_binding))
+    }
+
+    #[test]
+    fn an_acs_url_without_a_protocol_binding_uses_the_binding_it_is_registered_under() {
+        // Used to assume HTTP-POST and fail with AcsUrlMismatch for a URL
+        // registered only under another binding.
+        let (url, binding) = acs(&acs_request(
+            Some("https://sp.example.com/acs/artifact"),
+            None,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(url, "https://sp.example.com/acs/artifact");
+        assert_eq!(binding, ARTIFACT);
+
+        // Registered under several bindings: the first in metadata order,
+        // unless the request names one.
+        let post_url = Some("https://sp.example.com/acs/post");
+        assert_eq!(acs(&acs_request(post_url, None, None)).unwrap().1, POST);
+        assert_eq!(
+            acs(&acs_request(post_url, None, Some(ARTIFACT))).unwrap().1,
+            ARTIFACT
+        );
+    }
+
+    #[test]
+    fn an_acs_url_must_still_be_registered_with_the_requested_binding() {
+        // The pair is one endpoint: the Redirect location is not registered
+        // under POST, and an unregistered URL is never accepted.
+        assert!(matches!(
+            acs(&acs_request(
+                Some("https://sp.example.com/acs/redirect"),
+                None,
+                Some(POST)
+            )),
+            Err(ProfileError::AcsUrlMismatch)
+        ));
+        assert!(matches!(
+            acs(&acs_request(
+                Some("https://evil.example.com/acs"),
+                None,
+                None
+            )),
+            Err(ProfileError::AcsUrlMismatch)
+        ));
+    }
+
+    #[test]
+    fn a_protocol_binding_alone_picks_the_default_endpoint_of_that_binding() {
+        // Used to be ignored: the response went to the default (POST) endpoint
+        // whatever binding the SP asked for.
+        let (url, binding) = acs(&acs_request(None, None, Some(REDIRECT))).unwrap();
+        assert_eq!(url, "https://sp.example.com/acs/redirect");
+        assert_eq!(binding, REDIRECT);
+        assert_eq!(
+            acs(&acs_request(None, None, Some(ARTIFACT))).unwrap().0,
+            "https://sp.example.com/acs/artifact",
+            "lowest index among the Artifact endpoints"
+        );
+        // Nothing requested: the SP's default, as before.
+        assert_eq!(acs(&acs_request(None, None, None)).unwrap().1, POST);
+        // A binding with no registered endpoint is an error, not a fallback to
+        // the default endpoint in a binding the SP did not ask for.
+        assert!(matches!(
+            acs(&acs_request(
+                None,
+                None,
+                Some("urn:example:no-such-binding")
+            )),
+            Err(ProfileError::NoAcsEndpoint(_))
+        ));
+    }
+
+    #[test]
+    fn an_acs_index_and_a_protocol_binding_must_agree() {
+        assert_eq!(
+            acs(&acs_request(None, Some(1), None)).unwrap().1,
+            REDIRECT,
+            "index alone is unchanged"
+        );
+        assert_eq!(
+            acs(&acs_request(None, Some(1), Some(REDIRECT))).unwrap().1,
+            REDIRECT
+        );
+        assert!(matches!(
+            acs(&acs_request(None, Some(1), Some(POST))),
+            Err(ProfileError::AcsUrlMismatch)
+        ));
+        assert!(matches!(
+            acs(&acs_request(None, Some(99), None)),
+            Err(ProfileError::NoAcsEndpoint(_))
+        ));
+    }
+
+    #[test]
+    fn when_an_acs_url_and_index_are_both_given_the_url_wins_as_in_pysaml2() {
+        let (url, _) = acs(&acs_request(
+            Some("https://sp.example.com/acs/post"),
+            Some(1),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(url, "https://sp.example.com/acs/post");
+    }
+
+    #[test]
     fn test_process_authn_request_acs_url_mismatch() {
         let mut request = make_authn_request();
         request.assertion_consumer_service_url = Some("https://evil.example.com/acs".to_string());
@@ -855,6 +1279,7 @@ mod tests {
                 friendly_name: None,
                 values: vec![],
             }],
+            authenticating_authorities: vec![],
         };
         let name_id = NameId {
             value: "user@example.com".to_string(),
@@ -939,6 +1364,7 @@ mod tests {
             authn_context_class_ref: Some(constants::AUTHN_CONTEXT_PASSWORD.to_string()),
             client_address: None,
             attributes: vec![],
+            authenticating_authorities: vec![],
         };
         let name_id = NameId {
             value: "user@example.com".to_string(),
@@ -1068,6 +1494,60 @@ mod tests {
         assert!(tmpl.contains("<ds:DigestValue/>"));
         assert!(tmpl.contains("<ds:SignatureValue/>"));
         assert!(tmpl.contains("<ds:X509Certificate>CERTB64</ds:X509Certificate>"));
+    }
+
+    #[test]
+    fn an_unsigned_response_does_not_consult_the_signer_for_algorithms() {
+        use std::sync::Arc;
+
+        struct Token;
+        impl kryptering::Signer for Token {
+            fn algorithm(&self) -> kryptering::SignatureAlgorithm {
+                kryptering::SignatureAlgorithm::RsaPkcs1v15(kryptering::HashAlgorithm::Sha256)
+            }
+            fn sign(&self, _data: &[u8]) -> kryptering::Result<Vec<u8>> {
+                unreachable!("not used by this test")
+            }
+        }
+        let signer =
+            SamlSigner::with_hsm_signer(crate::crypto::KeysManager::new(), Arc::new(Token));
+        let algorithms = SigningAlgorithms {
+            signature: Some(crate::crypto::SignatureMethod::RsaSha512),
+            digest: None,
+        };
+        let xml = "<r/>";
+
+        // Nothing to sign: a preference the token cannot honour is irrelevant.
+        assert_eq!(
+            sign_response_xml_with(xml, &signer, "CERT", "_r", None, false, false, &algorithms)
+                .unwrap(),
+            xml
+        );
+        // Asking for a signature does reach the mismatch.
+        assert!(
+            sign_response_xml_with(xml, &signer, "CERT", "_r", None, false, true, &algorithms)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_signature_template_with_digest_uses_the_requested_digest() {
+        let tmpl = signature_template_with_digest(
+            "_a1",
+            "CERTB64",
+            RSA_SHA256_URI,
+            DigestMethod::Sha512.uri(),
+        );
+        assert!(tmpl.contains(&format!(
+            r#"<ds:DigestMethod Algorithm="{}"/>"#,
+            DigestMethod::Sha512.uri()
+        )));
+        assert!(
+            !tmpl.contains("xmlenc#sha256"),
+            "the SHA-256 default must not leak into a SHA-512 template"
+        );
+        // The plain constructor still emits SHA-256.
+        assert!(signature_template("_a1", "CERTB64", RSA_SHA256_URI).contains("xmlenc#sha256"));
     }
 
     #[test]

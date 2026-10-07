@@ -117,7 +117,7 @@ pub struct AuthnRequestOptions {
 }
 
 /// Options for creating a Response (IdP-side).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ResponseOptions {
     /// IdP entity ID (used as Issuer).
     pub idp_entity_id: String,
@@ -148,6 +148,11 @@ pub struct ResponseOptions {
 
     /// Additional attributes to include in an AttributeStatement.
     pub attributes: Vec<Attribute>,
+
+    /// The authenticating authorities the principal authenticated to
+    /// (SAML Core §2.7.2.2). For an originating IdP this is normally empty;
+    /// a proxying IdP MUST name the authority it relied on.
+    pub authenticating_authorities: Vec<String>,
 }
 
 /// The two semantically-distinct instants that go into a Response.

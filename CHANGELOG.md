@@ -5,6 +5,489 @@ All notable changes to this repository will be documented in this file.
 The project is still pre-1.0, so minor releases may include behavior changes
 where needed to correct protocol handling.
 
+## [Unreleased]
+
+### Added
+
+- Added `idp::orchestrator`, a new module composing the existing IdP
+  primitives (`ReleasePolicy`, `IdentDb`, `AuthnBroker`, `AssertionStore`)
+  into the actual SAML Web Browser SSO response-assembly flow:
+  `ResponseEngine`, `check_request` (the pure ForceAuthn × IsPassive ×
+  RequestedAuthnContext decision matrix), `create_authn_response` /
+  `create_denial_response`, the pluggable `AttributeRelease` seam
+  (`ReleasePolicy`, `PassThroughRelease`, `ChainedRelease`), and a closed
+  `Denial` enum with a fixed SAML `Status` mapping, including `AuthnFailed` and
+  `Cancelled` for a failed or user-cancelled login. Denials are always signed
+  unconditionally. `example-idp` is rewritten onto this engine, replacing its
+  hand-rolled response-assembly and NameID/authn-context negotiation code.
+  With no `RequestedAuthnContext`, any session/method is accepted regardless
+  of what the `AuthnBroker` happens to have registered (an inline/ad-hoc
+  method never registered in the broker is not rejected just because the
+  broker also has an `unspecified` baseline). `AuthnMethodRef::resolve`
+  returns `Option<(String, Option<String>)>`: a `BrokerReference` naming no
+  registered method resolves to `None` rather than falling back to treating
+  the opaque reference string itself as the AuthnContext class ref, so a
+  stale or mistyped reference can no longer become a bogus
+  `AuthnContextClassRef` in a signed assertion. An `AuthnMethodRef::Inline`
+  method (documented as usable without any broker registration) whose
+  class ref is a literal, exact match for the request is accepted even when
+  that class ref was never registered with the `AuthnBroker` -
+  `check_request`'s session-reuse check and `create_authn_response`'s
+  revalidation both check `Comparison="exact"` by literal match against the
+  requested class refs directly, rather than requiring the broker to have a
+  registration for it (which `AuthnBroker::pick`'s exact branch needs, but
+  satisfying an already-resolved method's literal class ref does not).
+- Added `ResponseParams::new` and `ResponseParams::from_entity`, which check
+  that the SP entity descriptor is the SP the request was validated for
+  (`ProfileError::SpEntityMismatch`), `new` also requires the supplied SP role to
+  be one of that descriptor's own (`ProfileError::SpRoleMismatch`), and `from_entity` takes the SAML 2.0 SP
+  role from that same descriptor. The descriptor's entity categories and
+  `subject-id:req` decide what is released, so pairing one SP's request with
+  another SP's descriptor would release attributes under the wrong policy. The
+  fields are public, so `create_authn_response` and `create_denial_response`
+  repeat the check; the Actix handler builds its parameters through `new`.
+- Added `gamlastan-actix`'s `AuthnSubjectCallback`, a higher-level companion
+  to the existing `AuthnCallback`, returning an `AuthnSubjectResult` of
+  `Authenticated(AuthenticatedSubject) | Redirect(HttpResponse) |
+  Deny(Denial)` for handlers built on `idp::orchestrator`. It receives the
+  processed request, the parsed `&AuthnRequest`, the `&Disposition` and the
+  `HttpRequest`. The parsed request carries what `ProcessedAuthnRequest`
+  leaves out - `Scoping` (a proxy must enforce `ProxyCount` / `IDPList`) and the
+  requested `Subject` - which a POST callback could not otherwise read, as the
+  form body is already consumed. The SSO handler calls
+  `idp::orchestrator::check_request` itself before invoking the callback and
+  handles a `Deny` disposition directly (a signed protocol error; the callback
+  is never invoked for it), so a callback cannot redirect to a login form for
+  `IsPassive` or reuse a session `ForceAuthn` should have defeated.
+  `AuthnCallback`, the lower-level path, is unchanged and does not receive the
+  request; its documentation points to `AuthnSubjectCallback`.
+- Added `ResponseOptions::authenticating_authorities` and an `impl Default`
+  for `ResponseOptions`. `create_response` now writes the field into the
+  `AuthnContext` instead of hardcoding an empty list, so proxying IdPs can
+  name the authority they relied on (SAML Core §2.7.2.2).
+- Added `ProcessedAuthnRequest::requested_sp_name_qualifier`, extracted from
+  the request's `NameIDPolicy/@SPNameQualifier`, so `IdentDb::construct_nameid`
+  can honour it instead of always falling back to the SP entity ID.
+- Added `PolicyEntry::with_session_lifetime` / `ReleasePolicy::session_lifetime`,
+  separate from the existing assertion `lifetime`, so `AuthnStatement/@SessionNotOnOrAfter`
+  no longer has to collapse to the (typically much shorter) assertion validity
+  window. Falls back to the assertion lifetime when unset.
+- Added `EntityDescriptor::for_sp`, a convenience constructor wrapping a
+  single `SpSsoDescriptor` with no extensions/organization/contacts.
+- Added `gamlastan-actix`'s `EstablishedSessionCallback`, reporting whether
+  the current request already carries an established IdP session (read from
+  the application's own cookie/session mechanism) for
+  `idp::orchestrator::check_request` to weigh against
+  `ForceAuthn`/`IsPassive`/`RequestedAuthnContext` before the
+  `AuthnSubjectCallback` runs.
+- Added `IdpConfig::trusted_sp_entity`, returning a trusted SP's full entity
+  descriptor (entity categories and other entity-level extensions), alongside
+  the existing `trusted_sp` (SSO descriptor only).
+- Added `idp::NameIdConstructor`, an object-safe view of
+  `IdentDb::construct_nameid`, implemented for `IdentDb<S>` over any
+  `IdentityStore`. `ResponseEngine` is no longer generic over `S:
+  IdentityStore` — `idents` is `&dyn NameIdConstructor` — so a ready-made
+  framework integration with a fixed function signature (a route handler
+  registered once, not parameterized per application) can accept a
+  Redis/SQL-backed `IdentDb`, not just the default in-memory store.
+- Added `gamlastan-actix`'s `ResponseEngineParts`, an owned bundle of
+  `ResponseEngine`'s dependencies (`Arc<ReleasePolicy>`,
+  `Arc<dyn AttributeRelease>`, `Arc<dyn NameIdConstructor>`,
+  `Arc<AuthnBroker>`, `Arc<SamlSigner>`, etc.), registered once as
+  `web::Data<Arc<ResponseEngineParts>>`; the SSO handler builds a
+  short-lived borrowed `ResponseEngine` from it per request via
+  `ResponseEngineParts::engine`. Registering `ResponseEngine<'static>`
+  directly would force every dependency to independently satisfy `'static`,
+  which for ordinary application-owned state means leaking it. The
+  `/saml/metadata` handler now also accepts `ResponseEngineParts` and
+  prefers its certificate over `IdpSigningContext`/`IdpConfig` when an
+  `AuthnSubjectCallback` is registered too, which is the only case in which
+  the engine signs (`idp_sso` takes the policy-driven path only with both).
+  Previously the metadata handler had no idea `ResponseEngineParts` existed,
+  so registering only it (the documented policy-driven setup, with no
+  `IdpSigningContext`) produced signed responses while metadata advertised no
+  key at all - or a *different* key, if `IdpSigningContext` also happened to
+  be registered with its own certificate. With parts but only the low-level
+  `AuthnCallback`, responses are signed by `IdpSigningContext`, and that is the
+  certificate metadata advertises.
+- Added `IdentDb::with_persist_transient` (default off; see "Changed" for why
+  transient NameIDs are no longer stored by default). Opting in stores each
+  transient NameID so `find_local_id` resolves it, which a back-channel (SOAP)
+  LogoutRequest carrying one needs. The record trait has no expiry, so the
+  backend must expire them (a TTL index, a periodic purge); issuing a
+  transient NameID then needs the store to be reachable. A stored transient is
+  still never reused by a NameIDMapping request.
+- Added `IdentityStore::find` and `IdentDb::find_nameid` (pysaml2
+  `find_nameid`): the NameIDs of a user matching a `NameIdFilter` on format,
+  `SPNameQualifier`, `NameQualifier` and `SPProvidedID`, where an unset field
+  matches anything. `find` has a default that filters `for_user`; a backend
+  overrides it to push the filter into a query. The conformance suite checks
+  that an override agrees with the default's semantics.
+- Added per-SP signature and digest algorithm selection. `SignatureMethod`
+  (SHA-2 RSA and ECDSA), `DigestMethod` (SHA-2), `SigningPreference` and
+  `SigningAlgorithms` live in `crypto`; `PolicyEntry::with_signing_preference`
+  sets an SP's ordered preference. The orchestrator signs each response (and
+  each denial) with the first preferred algorithm the SP also advertises in its
+  metadata, else the first listed. Signatures are matched only against the
+  SP's `alg:SigningMethod` entries and digests only against `alg:DigestMethod`
+  (`SigningPreference::resolve` takes the two lists), so a URI placed under the
+  wrong element does not count. The advertisement is untrusted: it only
+  chooses among the IdP's own entries, and SHA-1, MD5 and the like are not
+  representable, so neither configuration nor a peer can select them. The
+  digest used to be hardcoded to SHA-256; with no preference configured the
+  defaults are unchanged (the signer's method, SHA-256). Lower level:
+  `sign_response_xml_with`, `signature_template_with_digest` and
+  `SamlSigner::signature_method_uri_for`. An HSM-backed signer can only use its
+  token's own signature algorithm, and asking for another is an error, but only
+  when something is actually signed: `sign_response_xml_with`, asked to sign
+  nothing, never consults the signer (the orchestrator never asks that, see
+  below). The SP's advertisement is read from the entity-level
+  extensions and the SAML 2.0 SP role the request was bound to, not from every
+  IdP and SP role of the entity (which `EntityDescriptor::supported_algorithms`
+  aggregates), so an algorithm advertised only by another role is not selected.
+  With an HSM-backed signer, list only the token's signature method in a
+  preference: another one makes the response (and a denial) fail with an error
+  for the SPs that resolve to it, when it is signed, not at startup.
+- `ident::conformance` (the reusable `IdentityStore` backend check) gains
+  non-panicking entry points for callers that are not Rust tests, such as a
+  language binding: `check` / `check_with` return the first violation as a
+  `ConformanceError` naming the failing check, `check_one` runs a single check
+  by name, `CHECKS` lists the names, and `Options::threads` sets the concurrent
+  checks' thread count. `run` still panics and is unchanged for Rust tests. A
+  backend call that fails is now a failed check naming the operation, and the
+  concurrent-insert check no longer counts a backend failure as a lost race
+  (which made a dead backend look as if it had exactly one winner). The
+  concurrent get-or-insert check treats `ValueTaken` as a violation instead of
+  retrying with the same candidate, which never ended against a backend that
+  always reports it. The docs
+  state what the suite cannot prove: its concurrent checks run on threads in
+  one process, so a backend that serialises its calls can pass without having
+  the constraint, and a race between separate processes is not detected. The
+  module moved to `idp/ident/conformance.rs`.
+- Added `AttributeConverter::from_directions`, `add_wire_to_local` and
+  `add_local_to_wire`, for building a converter from independent inbound and
+  outbound maps, which is the shape of a pysaml2 attribute map (`MAP["fro"]`
+  and `MAP["to"]`). `add_mapping` and `from_entries` set both directions at
+  once and so cannot load a map whose directions differ; such maps are real
+  (a deployed eduID `saml_uri` map has 83 inbound and 99 outbound entries).
+  Mirroring one would make an SP-supplied attribute name resolve to a local
+  attribute it did not before, and would make the outbound name depend on
+  insertion order for a map with several wire names per local name.
+  `from_static` now goes through `from_directions` with identical results,
+  which a test checks for every shipped map.
+- A requested NameID format longer than `MAX_NAMEID_FORMAT_LEN` (256 bytes) is
+  refused with `InvalidNameIDPolicy`, whatever is configured
+  (`ReleasePolicy::supports_nameid_format`). Formats are short URIs, and the
+  requested one is stored with each durable record, so it is bounded. The orchestrator module docs
+  now list the permissive defaults to review before production (attribute
+  release, NameID formats, signing with an HSM, transient NameIDs).
+- Added an opt-in supported-format set for requested NameIDs:
+  `PolicyEntry::with_supported_nameid_formats`,
+  `ReleasePolicy::supports_nameid_format` and `ISSUABLE_NAMEID_FORMATS`. With a
+  set configured, a requested `NameIDPolicy/@Format` outside it is denied with
+  `InvalidNameIDPolicy` (SAML Core 3.4.1.1) before anything is minted; the SP's
+  own default format is always allowed. **Without one, which is the default,
+  any requested format is accepted**, as in pysaml2, which never validates it:
+  an identifier is issued in whatever format was asked for, so an SP that sends
+  invented format strings gets one stored record per string.
+  `ISSUABLE_NAMEID_FORMATS` (transient, persistent, emailAddress, unspecified)
+  is a reasonable set to pass; it leaves out `encrypted`, a request to encrypt
+  the NameID, which is not supported.
+- Added `AuthnRequest::requested_subject` and `requested_subject_name_id`
+  (pysaml2 `Request.subject_id()`): the principal an AuthnRequest names in
+  `Subject`, with an `EncryptedID` returned as such, not as "no subject". The
+  orchestrator still does not compare it with the authenticated principal, as
+  in pysaml2: mapping a NameID to a local user is deployment-specific (eduID's
+  "re-login as the same user" and MFA step-up flows send an eppn in an
+  `unspecified`-format NameID and honor it only for allowlisted SPs). A
+  deployment that supports a requested subject must compare it itself.
+
+### Changed
+
+- **Breaking:** `ResponseOptions` gained the `authenticating_authorities`
+  field. Every struct literal must add it (or use `..Default::default()`).
+  External consumers with hand-built literals (e.g. tunnelbana) need a
+  one-line-per-site compat patch.
+- **Breaking:** `ProcessedAuthnRequest` gained
+  `requested_sp_name_qualifier`, `has_name_id_policy` and
+  `requested_authn_context_decl_refs`. The struct is only produced by
+  `process_authn_request`, so hand-construction sites need all three fields
+  added. `process_authn_request` used to discard `AuthnContextDeclRef`s, so a
+  `RequestedAuthnContext` naming only declarations looked like no constraint at
+  all and the engine would reuse any session or issue any class ref. An
+  `AuthnMethod` carries a class ref only, so a declaration cannot be shown to be
+  met: `check_request` and `create_authn_response` now deny such a request with
+  `NoAuthnContext`, and `ResponseParams::requested_authn_context()` no longer
+  reports it as no constraint. A `RequestedAuthnContext` element that names no
+  class or declaration ref at all is malformed (the schema requires at least
+  one) and is no longer collapsed into "no constraint" either:
+  `process_authn_request` rejects it with
+  `ProfileError::EmptyRequestedAuthnContext`, and the engine denies it with
+  `NoAuthnContext` for parameters built by hand.
+- **Breaking:** `gamlastan-actix`'s `TrustedSp.sp_sso: SpSsoDescriptor` field
+  is now `entity: EntityDescriptor`, with no separate registration-key field:
+  `IdpConfig::with_trusted_sp(entity_id, sp_sso)` is now
+  `with_trusted_sp(entity: EntityDescriptor)`, keyed by the descriptor's own
+  `entity_id` (wrap a bare `SpSsoDescriptor` with `EntityDescriptor::for_sp`
+  at call sites that don't need entity-level extensions), so a mismatched
+  call site can no longer register one issuer's authorization under a
+  different entity's ACS endpoints and release policy.
+  `TrustedSpResolver::resolve_sp`'s return type changed from
+  `SpSsoDescriptor` to `EntityDescriptor` to match, and the handler now
+  rejects a resolver response whose `entity_id` disagrees with the requested
+  one. Previously the SSO handler's policy-driven path also always passed
+  `sp_entity: None` to `idp::orchestrator`, so entity-category
+  attribute-release policy could never engage through it; the full
+  descriptor is now threaded through from trusted-SP resolution. Selecting
+  the SAML 2.0 role out of a registered entity's roles (added
+  `EntityDescriptor::saml2_sp_sso_descriptor`) is by `protocolSupportEnumeration`,
+  not descriptor order, so metadata carrying a non-SAML-2.0 `SPSSODescriptor`
+  before the SAML 2.0 one is resolved correctly. `IdpConfig::trusted_sp_verifier`
+  (the aggregate verifier built from every registered trusted SP) also now
+  filters each entity's roles by SAML 2.0 protocol support before collecting
+  signing certificates, so a certificate published only for a non-SAML-2.0
+  role can no longer become trusted for verifying SAML 2.0 messages.
+- **Breaking:** `IdentityStore` is now a record-shaped backend: one record per
+  (user, NameID) association (`for_user`, `user_for`, `find_durable`,
+  `get_or_insert_durable`, `insert`, `replace`, `remove`, `remove_all`).
+  In 0.9.x it was a plain `get`/`set`/`remove` trait; that shape is now
+  `KeyValueStore` (`InMemoryKeyValueStore`), which `Eptid` uses.
+  `IdentDb`'s atomicity comes from two uniqueness constraints the backend
+  enforces - the NameID value is unique across all records, and among
+  durable records (every format except transient) `(user, sp_name_qualifier,
+  name_qualifier, format)` is unique - so two concurrent first requests for
+  the same (user, SP, format) converge on one identifier instead of minting
+  different ones, and a removal cannot orphan a reverse mapping because there
+  is no separate reverse key.
+  The constraints live in the store, so the trait has no default write
+  methods (a non-atomic default would silently leave the race open on a
+  multi-instance deployment) and `ident::conformance::run` is provided to
+  check that a backend honours them. Both constraints hold on every write
+  path, not only on `get_or_insert_durable`: `insert` and `replace` refuse
+  a second durable record of the same format for the same `(user,
+  sp_name_qualifier, name_qualifier)` with `InsertError::DurableExists`
+  (`get_or_insert_durable` and `find_durable` take the format; `replace` now returns
+  `InsertError`, and `IdentDb::store` returns `IdentError`, which gains
+  `DurableExists`), and the conformance suite checks each path.
+  `InMemoryIdentityStore` takes one lock per call; a Mongo/SQL-backed store
+  must back the two constraints with real unique indexes (the second a
+  partial unique index on `(user, sp_name_qualifier, name_qualifier, format)`
+  where the format is not transient, an absent format counting as
+  `unspecified`), applied to every write. A store that
+  already holds several records of one format per (user, SP) - 0.9.x minted a
+  new one at every login for email and unspecified - must be deduplicated
+  before that index can be built.
+  Migration: an external implementor of the 0.9.x trait (pygamlastan's
+  `PyIdentityStore` is one) implements `KeyValueStore` for the `Eptid` cache
+  and the new `IdentityStore` for `IdentDb`; code still implementing the old
+  three methods as `IdentityStore` fails to compile rather than misbehaving.
+- **Behaviour change:** `AuthnBroker::pick` treats every listed
+  `AuthnContextClassRef` (or, failing those, `AuthnContextDeclRef`) as an
+  alternative for every comparison, not just `exact`: a method qualifies if it satisfies any of them, deduplicated
+  and in the request's order. Before, `minimum`, `maximum` and `better` read
+  only the first ref, so `[unknown, supported]` was denied. This follows SAML
+  Core 3.3.2.2.1 ("one of the authentication contexts specified") and differs
+  from pysaml2, which also reads only the first; it can only accept requests
+  that were refused before.
+  With no `RequestedAuthnContext` and no `unspecified` method registered,
+  `pick` now offers every registered method instead of none (nothing was
+  requested, so all qualify).
+- **Behaviour change:** `nameid-format:encrypted` is never issued, with or
+  without an opt-in supported-format set: it asks for an `EncryptedID`, which the response path
+  cannot produce, and a plain NameID labelled that way would break the
+  requester's confidentiality requirement. A request naming it is denied with
+  `InvalidNameIDPolicy`; an SP whose configured default format it is (the
+  request names none) gets an error, as that is a configuration fault.
+- **Behaviour change:** `SignTargets::resolve` never resolves to "sign nothing".
+  The Web Browser SSO profile (SAML Profiles 4.1.4.5) requires a signed
+  Response or a signed Assertion, so when the response is not to be signed the
+  assertion is. A default `ReleasePolicy` (nothing configured) therefore signs
+  the assertion, and the engine needs a real signing key; before, it issued an
+  unsigned, forgeable response. pysaml2's default signs nothing; set
+  `SignTargets::response` to sign the envelope instead.
+- `check_request` does not deny a request with `NoAuthnContext` before login
+  when the broker has no registrations at all (new `AuthnBroker::is_empty`) and
+  the request is `exact`: an `Inline`-only deployment (a proxy) has no
+  capabilities to check, so it gets `Authenticate` with no methods and
+  `create_authn_response` checks the method the callback reports. `minimum`,
+  `maximum` and `better` need the broker's strength ordering, so with nothing
+  registered they are denied before login. A broker with registrations that
+  match nothing still denies.
+- A denial is a `DeniedResponse` (`xml`, `response_id`), not an
+  `IssuedResponse`: `create_denial_response` and `ResponseOutcome::Denied` no
+  longer carry an empty NameID and a `not_on_or_after` of "now" that an audit
+  consumer could mistake for issuance data.
+- `AuthnBroker::pick`'s documentation now states its real order (the request's
+  class-ref order, then registration order), not "strongest first"; only
+  `check_request` sorts by strength.
+- `InMemoryAssertionStore` keeps both indexes under one lock, and re-storing an
+  assertion ID for a different subject removes it from the old subject's index.
+  Before, a lookup for the old subject returned the other subject's assertion.
+- `ResponseParams::requested_authn_context` returns a constraint (not `None`)
+  for a present but empty `RequestedAuthnContext`, which the engine refuses.
+- `example-idp` refuses an `AuthnRequest` that names a `Subject`: it issues for
+  whoever logs in and does not compare them with a requested principal.
+- **Behaviour change (store contract):** `IdentityStore::replace` (and so
+  `IdentDb::store`) no longer moves a record to another user. A value held by a
+  different user is `InsertError::ValueTaken` (`IdentError::ValueTaken` from
+  `IdentDb::store`) and left untouched; the owner can still update it in place.
+  Reassigning would let the new user log in as the old one at every SP that has
+  seen the value. Nothing in this crate relied on it (ManageNameID passes the
+  owner it just looked up). A Mongo or SQL upsert filtered on `(value, user_id)`
+  gets this from the unique index on the value; the conformance check
+  `replace_upserts_by_value` now asserts it.
+- Added `PolicyEntry::with_deny_unconfigured_release` (and
+  `ReleasePolicy::deny_unconfigured_release`), an opt-in to fail closed on
+  attribute release. **By default, as in pysaml2 and unchanged from 0.9.x, an SP
+  that no attribute rule covers is released every attribute the application
+  supplied**: the policy only narrows (entity categories, the attributes the SP
+  requests in its metadata, attribute restrictions), so with none of those the
+  application is the only filter. With the setting on, such an SP gets an
+  assertion with no attribute statement; an SP covered by any rule is filtered
+  as before. It resolves like the other policy settings (SP entry, registration
+  authority, `default`), so it can be set globally on the `default` entry and
+  overridden per SP. `PassThroughRelease` is unaffected. This default is now
+  documented on `ReleasePolicy`.
+- `IdentDb` gives up after 8 attempts to mint an unused NameID, with a
+  `StoreError`, instead of looping forever against a backend that always reports
+  `ValueTaken` or says every value is in use. Real collisions of 256-bit values
+  do not occur, so this only bounds a broken backend's cost.
+- `create_authn_response` resolves and checks the authentication method before
+  it constructs the NameID, so a stale `BrokerReference` or a method that does
+  not satisfy the request is refused before anything is stored. It also
+  re-checks a reused session's absolute expiry (`authn_instant +
+  session_lifetime`) at that point: a session `check_request` approved but that
+  expired while the application callback ran is denied (`AuthnFailed`) instead
+  of issuing an assertion whose `SessionNotOnOrAfter` is already past.
+- `gamlastan-actix`'s SSO handler returns a `Configuration` error when
+  `ResponseEngineParts::idp_entity_id` differs from `IdpConfig::entity_id`,
+  instead of signing responses whose Issuer every SP would reject.
+- **Behaviour change:** AuthnRequest parsing and processing no longer repair
+  malformed input into a more permissive request. An `IDPEntry` without the
+  required `ProviderID` is rejected, where it used to be dropped (shrinking a
+  restrictive `IDPList`, possibly to an empty one, which reads as no
+  restriction). A repeated `Subject`, `NameIDPolicy`, `Conditions`,
+  `RequestedAuthnContext`, `Scoping` or `IDPList` is rejected, where only the
+  first used to be read and the rest ignored. A `Subject` carrying a
+  `SubjectConfirmation` is rejected with
+  `ProfileError::SubjectConfirmationInAuthnRequest`, a variant that existed but
+  was never raised. `ProcessedAuthnRequest` documents what it does not carry:
+  `Scoping`, which a proxying IdP must read from the original request itself,
+  and the principal named by `Subject`.
+- **Behaviour change:** the durable NameID formats other than persistent
+  (email, unspecified, and any other non-transient format) are now stable per
+  `(user, SP, NameQualifier, format)`, as persistent always was: an existing
+  record is returned instead of a new value being minted. 0.9.x minted and
+  stored a fresh value on every call, so an email-format NameID changed at each
+  login, which no SP can use to recognise a user, and the identity store grew
+  with every response. `IdentityStore::get_or_insert_persistent` and
+  `find_persistent` became `get_or_insert_durable` and `find_durable`
+  (`find_durable` takes the format), and `InsertError::PersistentExists`
+  became `DurableExists`. `AllowCreate=false` still gates only the persistent
+  format.
+- **Behaviour change:** `IdentDb::construct_nameid` treats a request with **no
+  `NameIDPolicy` at all** as allowing the IdP to create a persistent identifier.
+  0.9.x computed `AllowCreate` as `false` in that case, so an IdP whose default
+  format is persistent refused every first-time user whose request omitted the
+  policy with `CreateNotAllowed`. Only an explicit `NameIDPolicy` with
+  `AllowCreate="false"` forbids creating one, and a policy that is present but
+  omits `AllowCreate` is unchanged (`false`, the schema default). This matches
+  pysaml2, whose SSO flow mints whatever `AllowCreate` says; gamlastan still
+  honours an explicit `false`. It affects the persistent format only, and it
+  mints a new durable identifier where an upgrade used to refuse, so check it
+  if SPs omit `NameIDPolicy`. Before this PR nothing in a response path called
+  `construct_nameid`, so it concerns applications that did.
+- **Behaviour change:** ACS endpoint selection honours `ProtocolBinding`, as
+  pysaml2 does. A `ProtocolBinding` with no URL or index picks the default
+  endpoint among those registered with that binding (it used to be ignored, so
+  the response went to the default endpoint in whatever binding that was; it is
+  an error now if none is registered). An `AssertionConsumerServiceURL` without
+  a `ProtocolBinding` uses the binding the URL is registered under, the first in
+  metadata order if it is registered under several (it used to assume
+  HTTP-POST, so a URL registered only under another binding failed with
+  `AcsUrlMismatch`). A `ProtocolBinding` given with an index must match that
+  endpoint's binding. The response still only goes to an endpoint registered in
+  the SP's metadata, and a URL and an index given together still resolve by the
+  URL, as in pysaml2. `ProcessedAuthnRequest::acs_binding` is the binding the
+  endpoint is registered under, so it can be HTTP-Artifact or HTTP-Redirect. The
+  ready Actix handler and `example-idp` deliver by HTTP-POST only, and now refuse
+  a request that resolves to another binding
+  (`SamlActixError::UnsupportedBinding`) instead of POSTing a Response to an
+  endpoint that expects an artifact or a redirect; an application that has to
+  serve such an SP uses the profile functions and delivers by `acs_binding`.
+- **Breaking:** the store traits are fallible. `IdentityStore`, `KeyValueStore`
+  and `AssertionStore` methods return `Result<_, StoreError>` (the two insert
+  paths return `InsertError`, which separates a `ValueTaken` conflict from a
+  backend failure), and `IdentDb`, `Eptid`, `get_authn_statements`,
+  `create_assertion_id_request_response` and `create_authn_query_response`
+  propagate it. A backend that cannot answer must return an error, never an
+  empty result: reading an outage as "no record" would mint a second "stable"
+  persistent NameID for a user who already has one, and make `Eptid` recompute
+  a value that may differ from the one already issued. In `idp::orchestrator`
+  a store failure is `Err(ProfileError::Store)`, not a signed denial, since the
+  SP did not cause it. `IdentError` gains a `Store` variant.
+- **Behaviour change:** `IdentDb` no longer stores transient NameIDs by
+  default. 0.9.x stored every non-persistent NameID, transient ones included;
+  they are one-time-use (SAML Core §8.3.7) and the default per-SP format is
+  transient, so every response added a record that was never read back and the
+  store grew without bound. As a result `find_local_id` on a transient NameID
+  now finds nothing, which matters to a back-channel (SOAP) LogoutRequest that
+  carries one; such a deployment opts in with
+  `IdentDb::with_persist_transient`. Issuing a transient NameID no longer
+  consults the store at all, so it does not depend on the store being
+  reachable.
+
+### Fixed
+
+- `IdentDb::match_local_id` (persistent NameID lookup) now matches only a
+  stored identifier whose own format is also `persistent`, not any
+  non-transient format. Previously, a persistent-format request for a
+  (user, SP) pair that already had e.g. an `email`-format identifier stored
+  would return that identifier's value labeled as `persistent` instead of
+  minting/reusing an actual persistent one - matching pysaml2's production
+  Mongo-backed `IdentMDB.match_local_id`, which filters on
+  `name_id.format == NAMEID_FORMAT_PERSISTENT` explicitly, rather than
+  pysaml2's looser shelve-backed base `IdentDB`.
+- **Breaking:** `AuthnBroker::pick` with `Comparison="exact"` now requires a
+  literal match of one of the requested `AuthnContextClassRef` values, per
+  saml-core-2.0-os 3.3.2.2.1, instead of broadening to every method
+  registered at the same security level as the requested class (pysaml2's
+  own `AuthnBroker` has the same broadening; gamlastan diverges from it
+  here). Added `AuthnBroker::allow_exact_level_matching` to opt back into the
+  looser, pysaml2-compatible behavior. The orchestrator honours the opt-in
+  consistently: a same-level method that `check_request` offers is accepted by
+  `create_authn_response` once the user authenticates with it, and a session it
+  established is reusable, rather than being denied for not being a literal
+  match.
+- Closed a check-then-create race on persistent NameID minting: two concurrent
+  first requests for the same (user, SP) could each find no existing
+  association and mint two different "stable" persistent identifiers. The
+  store's `get_or_insert_durable` is now atomic, backed by the uniqueness
+  constraints described under "Changed".
+- `idp::orchestrator`'s NameIDPolicy handling only honours
+  `NameIDPolicy/@SPNameQualifier` when it equals the requester's own
+  (verified) entity ID. Per saml-core-2.0-os 8.3.7, SPNameQualifier may
+  legitimately name an affiliation the requester belongs to, but only when
+  the IdP can verify that membership (`AffiliationDescriptor`), which this
+  crate does not implement; honouring an arbitrary requester-supplied value
+  would let one SP request another SP's persistent identifier for the same
+  subject just by naming it, defeating pairwise-identifier scoping. A
+  request naming a different entity is denied with `InvalidNameIdPolicy`.
+- `idp::orchestrator::check_request`/`create_authn_response` now treat a
+  session's `authn_instant + session_lifetime` as its real, absolute expiry:
+  `check_request` refuses to reuse a session past that point (previously it
+  only checked `ForceAuthn` and method satisfaction), and the assertion's
+  `AuthnStatement/@SessionNotOnOrAfter` on reuse is derived from the
+  session's original `authn_instant`, not `now` - otherwise every reused
+  session pushed its own absolute cap further out on each SSO hop, turning
+  it into an unbounded sliding window in practice. The Actix handler enforces
+  this for the `AuthnSubjectCallback` path: on `ReuseSession` it takes the
+  method, `authn_instant` and session index from the established session, so
+  a callback returning `authn_instant: None` cannot restart the window. The
+  callback must return the session's own `subject_id`: a different one is a
+  `Configuration` error, not relabelled, since that would sign the session
+  user's NameID over another user's attributes.
+
 ## [0.9.1] - 2026-09-29
 
 ### Changed

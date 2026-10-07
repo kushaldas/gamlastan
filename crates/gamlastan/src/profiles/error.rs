@@ -155,4 +155,38 @@ pub enum ProfileError {
 
     #[error("{0}")]
     Other(String),
+
+    /// The AuthnRequest has a `RequestedAuthnContext` element that names no
+    /// `AuthnContextClassRef` and no `AuthnContextDeclRef`. The schema requires
+    /// at least one, and treating the empty element as "no constraint" would let
+    /// a malformed request reuse any session.
+    #[error("RequestedAuthnContext names no AuthnContextClassRef or AuthnContextDeclRef")]
+    EmptyRequestedAuthnContext,
+
+    /// The SP descriptor handed to the response engine is not the SP the
+    /// validated request came from. Its entity categories and `subject-id:req`
+    /// control attribute release, so pairing one SP's request with another SP's
+    /// descriptor would release attributes under the wrong policy.
+    #[error(
+        "SP descriptor entity ID {descriptor:?} does not match the request's SP entity ID {request:?}"
+    )]
+    SpEntityMismatch {
+        /// The SP entity ID the request was validated for.
+        request: String,
+        /// The entity ID of the descriptor that was supplied.
+        descriptor: String,
+    },
+
+    /// The SP role supplied for response assembly is not one of the supplied
+    /// entity descriptor's own SP roles.
+    #[error("the SP role is not one of the SP roles of entity descriptor {entity_id:?}")]
+    SpRoleMismatch {
+        /// The entity ID of the descriptor the role was checked against.
+        entity_id: String,
+    },
+
+    /// An identity or assertion store backend failed. An operational fault,
+    /// not a protocol refusal: it must surface as an error, never as a denial.
+    #[error(transparent)]
+    Store(#[from] crate::idp::ident::StoreError),
 }

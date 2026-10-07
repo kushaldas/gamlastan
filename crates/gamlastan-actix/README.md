@@ -99,6 +99,7 @@ requires `SpSigningContext`, and signs the Redirect query before sending it.
 ```rust,no_run
 use std::sync::Arc;
 use actix_web::{web, App, HttpServer};
+use gamlastan::metadata::types::entity_descriptor::EntityDescriptor;
 use gamlastan_actix::{AuthnCallback, IdpConfig, IdpSigningContext, idp::configure_idp};
 
 #[actix_web::main]
@@ -110,7 +111,7 @@ async fn main() -> std::io::Result<()> {
         "https://idp.example.com/sso",   // SSO URL
     )
     .with_signing_cert("base64-encoded-DER-cert")
-    .with_trusted_sp("https://sp.example.com", trusted_sp);
+    .with_trusted_sp(EntityDescriptor::for_sp("https://sp.example.com", trusted_sp));
 
     // Set up signing context with your private key
     let signing_ctx: Arc<IdpSigningContext> = todo!("load signing key");

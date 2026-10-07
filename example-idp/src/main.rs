@@ -12,6 +12,22 @@
 //
 // Test users: alice/hunter2, bob/hunter2
 //
+// This IdP builds its responses through `gamlastan::idp::orchestrator`
+// (ResponseEngine), so NameIDs are opaque, per-format identifiers minted by
+// IdentDb — not the user's literal email address, even when the requested
+// format is "email address". A real, human-readable value (the released
+// `email`/`uid`/`givenName`/`sn` attributes) is always available separately
+// in the AttributeStatement.
+//
+// Which one an SP should match a returning user on depends on the NameID's
+// format: a `transient` NameID is a fresh, unlinkable value every session
+// and must never be used to recognize a returning user - match on an
+// attribute instead. A `persistent` NameID is the opposite: it is
+// deliberately *stable* per (user, SP) precisely so an SP can recognize a
+// returning subject without being handed a reassignable identifier like
+// email - matching on the persistent NameID is the safe choice there, since
+// a mutable attribute can later be reassigned to a different real person.
+//
 // SP_METADATA_PATH may point at a single SP metadata file or a directory of
 // *.xml files; in the directory case every file is loaded as a trusted SP, so
 // the IdP can serve more than one Service Provider at a time.
@@ -37,7 +53,7 @@ use std::io;
 use std::sync::{Arc, Mutex};
 
 use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer};
-use chrono::Utc;
+use chrono::{TimeDelta, Utc};
 use log::info;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
@@ -46,16 +62,20 @@ use rustls::ServerConfig;
 use gamlastan::bindings::redirect::{redirect_decode, redirect_verify_signature, RedirectDecoded};
 use gamlastan::bindings::relay_state::RelayState;
 use gamlastan::core::assertion::attribute::{Attribute, AttributeValue};
-use gamlastan::core::assertion::name_id::NameId;
 use gamlastan::core::constants;
 use gamlastan::core::identifiers::SamlId;
-use gamlastan::core::protocol::request::{AuthnContextComparison, RequestedAuthnContext};
-use gamlastan::core::protocol::status::Status;
 use gamlastan::crypto::{KeysManager, SamlSigner, SamlVerifier, VerifyResult};
 use gamlastan::idp::authn_broker::AuthnBroker;
+use gamlastan::idp::ident::IdentDb;
+use gamlastan::idp::orchestrator::{
+    check_request, create_authn_response, create_denial_response, AuthenticatedSubject,
+    AuthnMethodRef, Denial, Disposition, EstablishedSession, ResponseEngine, ResponseOutcome,
+    ResponseParams,
+};
+use gamlastan::idp::policy::{PolicyEntry, ReleasePolicy, SignTargets};
 use gamlastan::metadata::types::entity_descriptor::EntityDescriptorRef;
+use gamlastan::profiles::error::ProfileError;
 use gamlastan::profiles::sso::idp as idp_profile;
-use gamlastan::profiles::sso::web_browser::{ResponseOptions, ResponseTimes};
 use gamlastan::xml::deserialize::parse_saml;
 use gamlastan::xml::serialize::SamlSerialize;
 use gamlastan_actix::{ActixHttpRequest, IdpConfig, IdpSigningContext};
@@ -111,21 +131,6 @@ impl User {
             },
         ]
     }
-
-    /// Build a NameID in the requested format supported by this example IdP.
-    fn name_id(&self, requested_format: Option<&str>) -> NameId {
-        NameId {
-            value: self.email.clone(),
-            format: Some(
-                requested_format
-                    .unwrap_or(constants::NAMEID_EMAIL)
-                    .to_string(),
-            ),
-            name_qualifier: None,
-            sp_name_qualifier: None,
-            sp_provided_id: None,
-        }
-    }
 }
 
 fn test_users() -> HashMap<String, User> {
@@ -158,6 +163,9 @@ fn test_users() -> HashMap<String, User> {
 #[derive(Debug, Clone)]
 struct PendingAuthnRequest {
     processed: idp_profile::ProcessedAuthnRequest,
+    /// The requesting SP's descriptor, captured at validation time so
+    /// `handle_login` doesn't need to re-resolve it from `trusted_sps`.
+    sp_sso: gamlastan::metadata::types::sp::SpSsoDescriptor,
     relay_state: Option<String>,
     /// Monotonic insertion time used to expire abandoned login forms.
     created_at: std::time::Instant,
@@ -196,6 +204,129 @@ struct AppState {
     pending_requests: Arc<Mutex<HashMap<String, PendingAuthnRequest>>>,
     /// Map of session_cookie_value -> Session
     sessions: Arc<Mutex<HashMap<String, Session>>>,
+    /// Per-SP response-assembly decisions (lifetime, NameID format, signing
+    /// targets) for `idp::orchestrator`.
+    decisions: ReleasePolicy,
+    /// Identity database: constructs and stores NameIDs (`idp::orchestrator`).
+    idents: IdentDb,
+    /// Authentication-method broker used by `check_request` and the login form.
+    broker: AuthnBroker,
+}
+
+/// Build a `ResponseEngine` borrowing this app's response-assembly pieces.
+fn build_engine(state: &AppState) -> ResponseEngine<'_> {
+    ResponseEngine {
+        idp_entity_id: &state.config.entity_id,
+        decisions: &state.decisions,
+        release: &state.decisions,
+        idents: &state.idents,
+        broker: &state.broker,
+        assertions: None,
+        signer: &state.signing_ctx.signer,
+        cert_der_b64: &state.signing_ctx.cert_b64,
+    }
+}
+
+/// The authentication-method broker used by `check_request` and the login form.
+fn supported_authn_contexts() -> AuthnBroker {
+    let mut broker = AuthnBroker::new();
+    broker.add(
+        constants::AUTHN_CONTEXT_UNSPECIFIED,
+        "password-form",
+        0,
+        None,
+    );
+    broker.add(constants::AUTHN_CONTEXT_PASSWORD, "password-form", 1, None);
+    broker.add(
+        constants::AUTHN_CONTEXT_PASSWORD_PROTECTED_TRANSPORT,
+        "password-form",
+        2,
+        None,
+    );
+    broker
+}
+
+/// The example's response-assembly decisions: sign per `IdpConfig`, keep the
+/// prior "release the whole profile" behavior (no per-SP required-attribute
+/// enforcement — this example never had any), and use `config`'s assertion
+/// lifetime.
+fn response_decisions(config: &IdpConfig) -> ReleasePolicy {
+    ReleasePolicy::with_default(
+        PolicyEntry::new()
+            .with_sign(SignTargets {
+                response: config.sign_responses,
+                assertion: config.sign_assertions,
+                on_demand: true,
+            })
+            .with_lifetime(
+                TimeDelta::try_seconds(config.assertion_lifetime_seconds as i64)
+                    .unwrap_or(TimeDelta::try_minutes(5).unwrap()),
+            )
+            .with_session_lifetime(
+                TimeDelta::try_seconds(config.session_lifetime_seconds as i64)
+                    .unwrap_or(TimeDelta::try_hours(8).unwrap()),
+            )
+            .with_fail_on_missing_requested(false),
+    )
+}
+
+/// POST-encode an already-signed SAML Response XML for delivery to `acs_url`.
+fn render_issued_xml(xml: &str, acs_url: &str, relay_state: Option<String>) -> HttpResponse {
+    let relay = relay_state.as_deref().map(RelayState::echo);
+    let html =
+        gamlastan::bindings::post::post_encode(xml.as_bytes(), false, acs_url, relay.as_ref());
+    HttpResponse::Ok()
+        .content_type("text/html; charset=utf-8")
+        .insert_header(("Cache-Control", "no-cache, no-store"))
+        .insert_header(("Pragma", "no-cache"))
+        .body(html)
+}
+
+/// Render the engine's outcome (issued or denied — both carry signed XML) or
+/// report a programming/configuration fault.
+fn render_outcome(
+    outcome: Result<ResponseOutcome, ProfileError>,
+    acs_url: &str,
+    relay_state: Option<String>,
+) -> HttpResponse {
+    match outcome {
+        Ok(ResponseOutcome::Issued(issued)) => render_issued_xml(&issued.xml, acs_url, relay_state),
+        Ok(ResponseOutcome::Denied { response, .. }) => {
+            render_issued_xml(&response.xml, acs_url, relay_state)
+        }
+        Err(e) => {
+            HttpResponse::InternalServerError().body(format!("Failed to build response: {e}"))
+        }
+    }
+}
+
+/// Render a denial computed outside `create_authn_response` (e.g. from
+/// `check_request` before any subject was authenticated).
+fn render_denial(
+    engine: &ResponseEngine,
+    params: &ResponseParams,
+    denial: &Denial,
+    acs_url: &str,
+    relay_state: Option<String>,
+) -> HttpResponse {
+    match create_denial_response(engine, params, denial) {
+        Ok(issued) => render_issued_xml(&issued.xml, acs_url, relay_state),
+        Err(e) => HttpResponse::InternalServerError()
+            .body(format!("Failed to build denial response: {e}")),
+    }
+}
+
+/// Build the `EstablishedSession` `check_request` needs from a cookie session.
+fn established_session(session: &Session) -> EstablishedSession {
+    EstablishedSession {
+        subject_id: session.username.clone(),
+        authn_method: AuthnMethodRef::Inline {
+            class_ref: session.authn_context_class_ref.clone(),
+            authn_authority: None,
+        },
+        authn_instant: session.authn_instant,
+        session_index: session.session_index.clone(),
+    }
 }
 
 struct Pkcs11SigningConfig {
@@ -504,78 +635,60 @@ async fn handle_authn_request(
         processed.sp_entity_id, processed.request_id, processed.acs_url
     );
 
-    if !requested_name_id_is_supported(&processed) {
-        return build_saml_error_response(
-            &state,
-            &processed,
-            relay_state,
-            constants::STATUS_REQUESTER,
-            constants::STATUS_INVALID_NAMEID_POLICY,
-            "The example IdP supports only email-address and unspecified NameID formats",
-        );
-    }
+    // Safe: `validate_authn_request` only succeeds for an entity ID present in
+    // `trusted_sps`, and `processed.sp_entity_id` is that same validated issuer.
+    let sp_sso = state.trusted_sps[&processed.sp_entity_id].sp_sso.clone();
+    let params = ResponseParams {
+        processed: processed.clone(),
+        sp_sso,
+        sp_entity: None,
+    };
+    let engine = build_engine(&state);
+    let session = get_session_from_cookie(&req, &state);
+    let established = session.as_ref().map(established_session);
 
-    if select_authn_context(&processed).is_none() {
-        return build_saml_error_response(
-            &state,
-            &processed,
-            relay_state,
-            constants::STATUS_RESPONDER,
-            constants::STATUS_NO_AUTHN_CONTEXT,
-            "The requested authentication context is unavailable",
-        );
-    }
-
-    // Check if user already has a session. ForceAuthn deliberately bypasses
-    // reuse; combined with IsPassive it therefore produces NoPassive below.
-    if !processed.force_authn {
-        if let Some(session) = get_session_from_cookie(&req, &state) {
-            info!(
-                "User {} already has session, responding directly",
-                session.username
-            );
-            if let Some(user) = state.users.get(&session.username) {
-                if authn_context_satisfies(&processed, &session.authn_context_class_ref) {
-                    return build_saml_response(
-                        &state,
-                        &processed,
-                        user,
-                        relay_state,
-                        session.authn_instant,
-                        session.session_index,
-                        session.authn_context_class_ref,
-                    );
-                }
+    match check_request(&engine, &params, established.as_ref()) {
+        Disposition::Deny { denial } => {
+            render_denial(&engine, &params, &denial, &processed.acs_url, relay_state)
+        }
+        Disposition::ReuseSession { session } => {
+            info!("User {} has a reusable session", session.subject_id);
+            let Some(user) = state.users.get(&session.subject_id) else {
+                return HttpResponse::InternalServerError()
+                    .body("Session subject no longer exists");
+            };
+            let subject = AuthenticatedSubject {
+                subject_id: session.subject_id,
+                attributes: user.attributes(),
+                authn_method: session.authn_method,
+                authn_instant: Some(session.authn_instant),
+                session_index: Some(session.session_index),
+            };
+            render_outcome(
+                create_authn_response(&engine, &params, &subject),
+                &processed.acs_url,
+                relay_state,
+            )
+        }
+        Disposition::Authenticate { .. } => {
+            // No reusable session — store pending request and show login form.
+            let pending_id = SamlId::generate().to_string();
+            if !store_pending_authn_request(
+                &state.pending_requests,
+                pending_id.clone(),
+                PendingAuthnRequest {
+                    processed,
+                    sp_sso: params.sp_sso,
+                    relay_state,
+                    created_at: std::time::Instant::now(),
+                },
+            ) {
+                return HttpResponse::TooManyRequests()
+                    .body("Too many pending authentication requests");
             }
+            show_login_form(&pending_id, None)
         }
     }
-
-    if processed.is_passive {
-        return build_saml_error_response(
-            &state,
-            &processed,
-            relay_state,
-            constants::STATUS_RESPONDER,
-            constants::STATUS_NO_PASSIVE,
-            "Passive authentication is not possible without a reusable session",
-        );
-    }
-
-    // No session — store pending request and show login form
-    let pending_id = SamlId::generate().to_string();
-    if !store_pending_authn_request(
-        &state.pending_requests,
-        pending_id.clone(),
-        PendingAuthnRequest {
-            processed,
-            relay_state,
-            created_at: std::time::Instant::now(),
-        },
-    ) {
-        return HttpResponse::TooManyRequests().body("Too many pending authentication requests");
-    }
-
-    show_login_form(&pending_id, None)
 }
 
 /// Handle login form submission
@@ -615,12 +728,44 @@ async fn handle_login(
         }
     };
 
+    let params = ResponseParams {
+        processed: pending.processed.clone(),
+        sp_sso: pending.sp_sso,
+        sp_entity: None,
+    };
+    let engine = build_engine(&state);
+
+    // Re-derive the strongest authn method satisfying the request. The policy
+    // (ForceAuthn/IsPassive/ACR) was already checked when the login form was
+    // shown; a fresh login always authenticates, so this can only be `Deny`
+    // (a session invalidated between showing the form and submitting it,
+    // which can't happen here since none was created yet) or `Authenticate`.
+    let methods = match check_request(&engine, &params, None) {
+        Disposition::Authenticate { methods } => methods,
+        Disposition::Deny { denial } => {
+            return render_denial(
+                &engine,
+                &params,
+                &denial,
+                &pending.processed.acs_url,
+                pending.relay_state,
+            )
+        }
+        Disposition::ReuseSession { .. } => {
+            return HttpResponse::InternalServerError()
+                .body("Unexpected session reuse during fresh login")
+        }
+    };
+    let selected = methods
+        .iter()
+        .max_by_key(|method| method.level)
+        .expect("pending request policy was checked before login")
+        .clone();
+
     // Create session
     let session_id = SamlId::generate().to_string();
     let session_index = SamlId::generate().to_string();
     let authn_instant = Utc::now();
-    let selected_authn_context = select_authn_context(&pending.processed)
-        .expect("pending request policy was checked before login");
     {
         let mut sessions = state.sessions.lock().unwrap();
         sessions.insert(
@@ -629,20 +774,26 @@ async fn handle_login(
                 username: username.to_string(),
                 session_index: session_index.clone(),
                 authn_instant,
-                authn_context_class_ref: selected_authn_context.clone(),
+                authn_context_class_ref: selected.class_ref.clone(),
             },
         );
     }
 
-    // Build SAML Response
-    let mut response = build_saml_response(
-        &state,
-        &pending.processed,
-        user,
+    // Build the SAML Response
+    let subject = AuthenticatedSubject {
+        subject_id: username.to_string(),
+        attributes: user.attributes(),
+        authn_method: AuthnMethodRef::Inline {
+            class_ref: selected.class_ref,
+            authn_authority: None,
+        },
+        authn_instant: Some(authn_instant),
+        session_index: Some(session_index),
+    };
+    let mut response = render_outcome(
+        create_authn_response(&engine, &params, &subject),
+        &pending.processed.acs_url,
         pending.relay_state,
-        authn_instant,
-        session_index,
-        selected_authn_context,
     );
 
     // Set session cookie
@@ -655,128 +806,6 @@ async fn handle_login(
     );
 
     response
-}
-
-/// Build a signed SAML Response for the given user and send via POST binding
-fn build_saml_response(
-    state: &AppState,
-    processed: &idp_profile::ProcessedAuthnRequest,
-    user: &User,
-    relay_state: Option<String>,
-    authn_instant: chrono::DateTime<Utc>,
-    session_index: String,
-    authn_context_class_ref: String,
-) -> HttpResponse {
-    let now = Utc::now();
-    let session_not_on_or_after = now
-        + chrono::TimeDelta::try_seconds(state.config.session_lifetime_seconds as i64)
-            .unwrap_or(chrono::TimeDelta::try_hours(8).unwrap());
-
-    let response_options = ResponseOptions {
-        idp_entity_id: state.config.entity_id.clone(),
-        in_response_to: Some(processed.request_id.clone()),
-        sp_entity_id: processed.sp_entity_id.clone(),
-        acs_url: processed.acs_url.clone(),
-        assertion_lifetime_seconds: state.config.assertion_lifetime_seconds,
-        session_index: Some(session_index),
-        session_not_on_or_after: Some(session_not_on_or_after),
-        authn_context_class_ref: Some(authn_context_class_ref),
-        client_address: None,
-        attributes: user.attributes(),
-    };
-
-    let response = idp_profile::create_response(
-        &response_options,
-        &user.name_id(processed.requested_name_id_format.as_deref()),
-        ResponseTimes {
-            issue_instant: now,
-            authn_instant,
-        },
-    );
-
-    render_saml_response(
-        state,
-        response,
-        &processed.acs_url,
-        relay_state,
-        state.config.sign_assertions,
-    )
-}
-
-/// Build, sign, and POST a protocol error response to the validated ACS.
-#[allow(clippy::too_many_arguments)]
-fn build_saml_error_response(
-    state: &AppState,
-    processed: &idp_profile::ProcessedAuthnRequest,
-    relay_state: Option<String>,
-    top_level_status: &str,
-    sub_status: &str,
-    message: &str,
-) -> HttpResponse {
-    let response = idp_profile::create_error_response(
-        &state.config.entity_id,
-        Some(&processed.request_id),
-        &processed.acs_url,
-        Status::with_sub_status(top_level_status, sub_status, Some(message.to_string())),
-        Utc::now(),
-    );
-    render_saml_response(state, response, &processed.acs_url, relay_state, false)
-}
-
-/// Serialize, sign, and encode a SAML Response for HTTP-POST delivery.
-///
-/// Assertion-less error responses are signed at the Response level whenever
-/// either normal response or assertion signing is enabled.
-fn render_saml_response(
-    state: &AppState,
-    response: gamlastan::core::protocol::response::Response,
-    acs_url: &str,
-    relay_state: Option<String>,
-    sign_assertion: bool,
-) -> HttpResponse {
-    let response_xml = match response.to_xml_string() {
-        Ok(xml) => xml,
-        Err(e) => {
-            return HttpResponse::InternalServerError()
-                .body(format!("Failed to serialize Response: {e}"));
-        }
-    };
-
-    // Sign the Response and, for successful responses, its Assertion.
-    let assertion_id = response.assertions.first().map(|a| a.id.as_str());
-    let sign_response = state.config.sign_responses
-        || (response.assertions.is_empty() && state.config.sign_assertions);
-    let signed_xml = match gamlastan_actix::idp::sign_response_xml(
-        &response_xml,
-        &state.signing_ctx,
-        &response.base.id,
-        assertion_id,
-        sign_assertion,
-        sign_response,
-    ) {
-        Ok(xml) => xml,
-        Err(e) => {
-            return HttpResponse::InternalServerError()
-                .body(format!("Failed to sign Response: {e}"));
-        }
-    };
-
-    // Build RelayState
-    let relay = relay_state.as_deref().map(RelayState::echo);
-
-    // POST-encode and send
-    let html = gamlastan::bindings::post::post_encode(
-        signed_xml.as_bytes(),
-        false, // is_response (not request)
-        acs_url,
-        relay.as_ref(),
-    );
-
-    HttpResponse::Ok()
-        .content_type("text/html; charset=utf-8")
-        .insert_header(("Cache-Control", "no-cache, no-store"))
-        .insert_header(("Pragma", "no-cache"))
-        .body(html)
 }
 
 /// GET+POST /slo - Single Logout endpoint (stub)
@@ -795,75 +824,6 @@ async fn slo_handler() -> HttpResponse {
 }
 
 // ── Helper functions ──────────────────────────────────────────────────────
-
-/// Return whether the request's NameID format can be issued by this IdP.
-fn requested_name_id_is_supported(processed: &idp_profile::ProcessedAuthnRequest) -> bool {
-    matches!(
-        processed.requested_name_id_format.as_deref(),
-        None | Some(constants::NAMEID_EMAIL) | Some(constants::NAMEID_UNSPECIFIED)
-    )
-}
-
-/// Build the authentication-method broker used by the example login form.
-fn supported_authn_contexts() -> AuthnBroker {
-    let mut broker = AuthnBroker::new();
-    broker.add(
-        constants::AUTHN_CONTEXT_UNSPECIFIED,
-        "password-form",
-        0,
-        None,
-    );
-    broker.add(constants::AUTHN_CONTEXT_PASSWORD, "password-form", 1, None);
-    broker.add(
-        constants::AUTHN_CONTEXT_PASSWORD_PROTECTED_TRANSPORT,
-        "password-form",
-        2,
-        None,
-    );
-    broker
-}
-
-/// Convert the processed request fields back into broker input.
-fn requested_authn_context(
-    processed: &idp_profile::ProcessedAuthnRequest,
-) -> Option<RequestedAuthnContext> {
-    if processed.requested_authn_context_class_refs.is_empty() {
-        return None;
-    }
-    Some(RequestedAuthnContext {
-        authn_context_class_refs: processed.requested_authn_context_class_refs.clone(),
-        authn_context_decl_refs: Vec::new(),
-        comparison: processed
-            .authn_context_comparison
-            .unwrap_or(AuthnContextComparison::Exact),
-    })
-}
-
-/// Select the strongest supported authentication context satisfying a request.
-fn select_authn_context(processed: &idp_profile::ProcessedAuthnRequest) -> Option<String> {
-    let Some(requested) = requested_authn_context(processed) else {
-        return Some(constants::AUTHN_CONTEXT_PASSWORD_PROTECTED_TRANSPORT.to_string());
-    };
-    supported_authn_contexts()
-        .pick(Some(&requested))
-        .into_iter()
-        .max_by_key(|method| method.level)
-        .map(|method| method.class_ref.clone())
-}
-
-/// Return whether an existing session satisfies the requested context policy.
-fn authn_context_satisfies(
-    processed: &idp_profile::ProcessedAuthnRequest,
-    established_class_ref: &str,
-) -> bool {
-    let Some(requested) = requested_authn_context(processed) else {
-        return true;
-    };
-    supported_authn_contexts()
-        .pick(Some(&requested))
-        .iter()
-        .any(|method| method.class_ref == established_class_ref)
-}
 
 /// Remove expired pending requests while the caller holds the state lock.
 fn purge_expired_pending_authn_requests(pending: &mut HashMap<String, PendingAuthnRequest>) {
@@ -1065,7 +1025,24 @@ fn validate_authn_request(
         return Err("unsigned AuthnRequest rejected by IdP policy".to_string());
     }
 
-    idp_profile::process_authn_request(authn_request, &sp.sp_sso, signed).map_err(|e| e.to_string())
+    // This example issues an assertion for whoever logs in and never compares
+    // them with a principal the SP names, so a requested Subject is refused:
+    // otherwise an SP could ask for Alice and receive an assertion for Bob.
+    if authn_request.requested_subject().is_some() {
+        return Err("this IdP does not support a requested Subject".to_string());
+    }
+
+    let processed = idp_profile::process_authn_request(authn_request, &sp.sp_sso, signed)
+        .map_err(|e| e.to_string())?;
+    // This example delivers every Response by HTTP-POST. An ACS registered for
+    // another binding would be answered with the wrong one, so refuse it.
+    if processed.acs_binding != gamlastan::core::constants::BINDING_HTTP_POST {
+        return Err(format!(
+            "ACS {} is registered for {}, but this IdP delivers by HTTP-POST only",
+            processed.acs_url, processed.acs_binding
+        ));
+    }
+    Ok(processed)
 }
 
 /// Load every trusted SP, keyed by entity ID.
@@ -1441,6 +1418,10 @@ async fn main() -> io::Result<()> {
         .with_metadata_url(format!("{base_url}/metadata"))
         .with_signing_cert(cert_b64);
 
+    let decisions = response_decisions(&config);
+    let idents = IdentDb::in_memory(config.entity_id.clone());
+    let broker = supported_authn_contexts();
+
     let state = web::Data::new(AppState {
         config,
         trusted_sps,
@@ -1449,6 +1430,9 @@ async fn main() -> io::Result<()> {
         users: test_users(),
         pending_requests: Arc::new(Mutex::new(HashMap::new())),
         sessions: Arc::new(Mutex::new(HashMap::new())),
+        decisions,
+        idents,
+        broker,
     });
 
     // Load TLS certificates
@@ -1518,7 +1502,7 @@ mod tests {
     use chrono::Utc;
     use gamlastan::core::assertion::issuer::Issuer;
     use gamlastan::core::identifiers::SamlVersion;
-    use gamlastan::core::protocol::request::{AuthnRequest, RequestBase};
+    use gamlastan::core::protocol::request::{AuthnContextComparison, AuthnRequest, RequestBase};
     use gamlastan::metadata::types::endpoint::{Endpoint, IndexedEndpoint};
     use gamlastan::metadata::types::role_descriptor::{RoleDescriptorBase, SsoDescriptorBase};
     use gamlastan::metadata::types::sp::SpSsoDescriptor;
@@ -1547,6 +1531,27 @@ mod tests {
         let path = std::env::temp_dir().join(format!("example-idp-test-{unique}.xml"));
         fs::write(&path, contents).unwrap();
         path
+    }
+
+    /// A real signing context backed by the example's own fixture cert/key.
+    ///
+    /// Denials are always signed unconditionally by `idp::orchestrator`
+    /// (an unsigned denial is trivially forgeable), so tests exercising that
+    /// path need an actual key, unlike the pre-engine example which only
+    /// signed when `sign_responses`/`sign_assertions` were both set.
+    fn test_signing_ctx() -> Arc<IdpSigningContext> {
+        let cert_pem = include_bytes!("../certs/idp-cert.pem");
+        let key_pem = include_bytes!("../certs/idp-key.pem");
+        let cert_b64 = extract_cert_b64(cert_pem);
+        let mut signing_key =
+            gamlastan::crypto::keys::loader::load_pem_auto(key_pem, None).unwrap();
+        signing_key.usage = gamlastan::crypto::KeyUsage::Sign;
+        let mut keys_manager = KeysManager::new();
+        keys_manager.add_key(signing_key);
+        Arc::new(IdpSigningContext::new(
+            SamlSigner::new(keys_manager),
+            cert_b64,
+        ))
     }
 
     fn test_metadata(authn_requests_signed: Option<bool>) -> String {
@@ -1603,20 +1608,24 @@ mod tests {
                 },
             );
         }
+        let config = IdpConfig::new(
+            "https://idp.example.se/metadata".to_string(),
+            "https://idp.example.se/sso".to_string(),
+        );
+        let decisions = response_decisions(&config);
+        let idents = IdentDb::in_memory(config.entity_id.clone());
+        let broker = supported_authn_contexts();
         AppState {
-            config: IdpConfig::new(
-                "https://idp.example.se/metadata".to_string(),
-                "https://idp.example.se/sso".to_string(),
-            ),
+            config,
             trusted_sps,
             want_authn_requests_signed: require_signed_authn_requests,
-            signing_ctx: Arc::new(IdpSigningContext::new(
-                SamlSigner::new(KeysManager::new()),
-                String::new(),
-            )),
+            signing_ctx: test_signing_ctx(),
             users: test_users(),
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            decisions,
+            idents,
+            broker,
         }
     }
 
@@ -1647,6 +1656,56 @@ mod tests {
         }
     }
 
+    /// This example delivers every Response by HTTP-POST, so a request that
+    /// resolves to an ACS registered for another binding is refused rather than
+    /// answered with the wrong one.
+    #[test]
+    fn an_acs_registered_for_a_non_post_binding_is_refused() {
+        let mut state = test_state(false, &["https://sp.example.se/metadata"]);
+        state
+            .trusted_sps
+            .get_mut("https://sp.example.se/metadata")
+            .expect("trusted SP")
+            .sp_sso
+            .assertion_consumer_services
+            .push(gamlastan::metadata::types::endpoint::IndexedEndpoint::new(
+                gamlastan::metadata::types::endpoint::Endpoint::new(
+                    "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Artifact",
+                    "https://sp.example.se/artifact",
+                ),
+                9,
+            ));
+        let mut request = unsigned_request("https://sp.example.se/metadata");
+        request.assertion_consumer_service_url = None;
+        request.protocol_binding = None;
+        request.assertion_consumer_service_index = Some(9);
+
+        let err = validate_authn_request(&state, &request, "", None).unwrap_err();
+        assert!(err.contains("HTTP-POST only"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_authn_request_refuses_a_requested_subject() {
+        let state = test_state(false, &["https://sp.example.se/metadata"]);
+        let mut request = unsigned_request("https://sp.example.se/metadata");
+        request.subject = Some(gamlastan::core::assertion::subject::Subject {
+            name_id: Some(
+                gamlastan::core::assertion::name_id::NameIdOrEncryptedId::NameId(
+                    gamlastan::core::assertion::name_id::NameId {
+                        value: "alice".to_string(),
+                        format: None,
+                        name_qualifier: None,
+                        sp_name_qualifier: None,
+                        sp_provided_id: None,
+                    },
+                ),
+            ),
+            subject_confirmations: vec![],
+        });
+        let err = validate_authn_request(&state, &request, "", None).unwrap_err();
+        assert!(err.contains("requested Subject"), "{err}");
+    }
+
     /// Build a validated request for helper-level policy and state tests.
     fn processed_request() -> idp_profile::ProcessedAuthnRequest {
         let state = test_state(false, &["https://sp.example.se/metadata"]);
@@ -1659,52 +1718,105 @@ mod tests {
         .expect("test request should be valid")
     }
 
-    /// Requested NameID formats are either honored or rejected explicitly.
+    /// The engine issues whatever NameID format is requested (or the default,
+    /// transient, format when none is), including persistent — unlike the
+    /// pre-engine example, which could only honor email/unspecified because it
+    /// hand-built the NameID from the user's literal email address. NameIDs
+    /// are now opaque, IdentDb-minted identifiers (matching a real federated
+    /// IdP's privacy-preserving default), not the user's literal email.
     #[test]
-    fn requested_name_id_policy_is_enforced() {
+    fn requested_name_id_format_is_honored() {
+        // One shared engine/store across every format in the loop - the
+        // realistic production shape (a single IdentDb instance, not one
+        // reset per request), and a regression check that a later format
+        // request doesn't reuse an earlier format's stored identifier
+        // (IdentDb::match_local_id is format-aware for persistent lookups).
+        let state = test_state(false, &["https://sp.example.se/metadata"]);
+        let engine = build_engine(&state);
         let mut processed = processed_request();
-        assert!(requested_name_id_is_supported(&processed));
+        let sp_sso = dummy_sp_sso(Some(false));
+        let subject = AuthenticatedSubject {
+            subject_id: "alice".to_string(),
+            attributes: test_users()["alice"].attributes(),
+            authn_method: AuthnMethodRef::Inline {
+                class_ref: constants::AUTHN_CONTEXT_PASSWORD.to_string(),
+                authn_authority: None,
+            },
+            authn_instant: None,
+            session_index: Some("_sess1".to_string()),
+        };
 
-        processed.requested_name_id_format = Some(constants::NAMEID_UNSPECIFIED.to_string());
-        assert!(requested_name_id_is_supported(&processed));
-        assert_eq!(
-            test_users()["alice"]
-                .name_id(processed.requested_name_id_format.as_deref())
-                .format,
-            Some(constants::NAMEID_UNSPECIFIED.to_string())
-        );
-
-        processed.requested_name_id_format = Some(constants::NAMEID_PERSISTENT.to_string());
-        assert!(!requested_name_id_is_supported(&processed));
+        for format in [
+            constants::NAMEID_UNSPECIFIED,
+            constants::NAMEID_EMAIL,
+            constants::NAMEID_PERSISTENT,
+            constants::NAMEID_TRANSIENT,
+        ] {
+            processed.has_name_id_policy = true;
+            processed.requested_name_id_format = Some(format.to_string());
+            processed.allow_create = true;
+            let params = ResponseParams {
+                processed: processed.clone(),
+                sp_sso: sp_sso.clone(),
+                sp_entity: None,
+            };
+            let outcome =
+                create_authn_response(&engine, &params, &subject).expect("no config fault");
+            match outcome {
+                ResponseOutcome::Issued(issued) => {
+                    assert_eq!(issued.name_id.format.as_deref(), Some(format));
+                }
+                other => panic!("expected Issued for format {format}, got {other:?}"),
+            }
+        }
     }
 
-    /// AuthnContext selection honors all comparison modes and rejects gaps.
+    /// The check_request matrix honors all comparison modes and rejects gaps
+    /// the broker cannot satisfy.
     #[test]
     fn requested_authn_context_is_negotiated() {
+        let state = test_state(false, &["https://sp.example.se/metadata"]);
+        let engine = build_engine(&state);
+        let sp_sso = dummy_sp_sso(Some(false));
         let mut processed = processed_request();
         processed.requested_authn_context_class_refs =
             vec![constants::AUTHN_CONTEXT_PASSWORD.to_string()];
-
         processed.authn_context_comparison = Some(AuthnContextComparison::Exact);
-        assert_eq!(
-            select_authn_context(&processed).as_deref(),
-            Some(constants::AUTHN_CONTEXT_PASSWORD)
-        );
+
+        let params = |p: &idp_profile::ProcessedAuthnRequest| ResponseParams {
+            processed: p.clone(),
+            sp_sso: sp_sso.clone(),
+            sp_entity: None,
+        };
+
+        let disposition = check_request(&engine, &params(&processed), None);
+        let Disposition::Authenticate { methods } = disposition else {
+            panic!("expected Authenticate, got {disposition:?}");
+        };
+        assert_eq!(methods.len(), 1);
+        assert_eq!(methods[0].class_ref, constants::AUTHN_CONTEXT_PASSWORD);
 
         processed.authn_context_comparison = Some(AuthnContextComparison::Better);
+        let disposition = check_request(&engine, &params(&processed), None);
+        let Disposition::Authenticate { methods } = disposition else {
+            panic!("expected Authenticate, got {disposition:?}");
+        };
+        // "better" than Password: only PasswordProtectedTransport (level 2).
+        assert_eq!(methods.len(), 1);
         assert_eq!(
-            select_authn_context(&processed).as_deref(),
-            Some(constants::AUTHN_CONTEXT_PASSWORD_PROTECTED_TRANSPORT)
+            methods[0].class_ref,
+            constants::AUTHN_CONTEXT_PASSWORD_PROTECTED_TRANSPORT
         );
 
+        // Nothing is "better" than the strongest registered method.
         processed.requested_authn_context_class_refs =
             vec![constants::AUTHN_CONTEXT_PASSWORD_PROTECTED_TRANSPORT.to_string()];
-        assert!(select_authn_context(&processed).is_none());
-
-        processed.authn_context_comparison = Some(AuthnContextComparison::Maximum);
-        assert!(authn_context_satisfies(
-            &processed,
-            constants::AUTHN_CONTEXT_PASSWORD
+        let disposition = check_request(&engine, &params(&processed), None);
+        assert!(matches!(
+            disposition,
+            Disposition::Deny {
+                denial: Denial::NoAuthnContext
+            }
         ));
     }
 
@@ -1713,12 +1825,14 @@ mod tests {
     fn pending_authn_requests_are_bounded_and_one_time() {
         let pending = Mutex::new(HashMap::new());
         let processed = processed_request();
+        let sp_sso = dummy_sp_sso(Some(false));
         for index in 0..MAX_PENDING_AUTHN_REQUESTS {
             assert!(store_pending_authn_request(
                 &pending,
                 format!("pending-{index}"),
                 PendingAuthnRequest {
                     processed: processed.clone(),
+                    sp_sso: sp_sso.clone(),
                     relay_state: None,
                     created_at: std::time::Instant::now(),
                 },
@@ -1729,6 +1843,7 @@ mod tests {
             "overflow".to_string(),
             PendingAuthnRequest {
                 processed: processed.clone(),
+                sp_sso: sp_sso.clone(),
                 relay_state: None,
                 created_at: std::time::Instant::now(),
             },
@@ -1742,6 +1857,7 @@ mod tests {
             "expired".to_string(),
             PendingAuthnRequest {
                 processed,
+                sp_sso,
                 relay_state: None,
                 created_at: std::time::Instant::now()
                     - PENDING_AUTHN_REQUEST_TTL
@@ -1752,11 +1868,14 @@ mod tests {
     }
 
     /// IsPassive without a suitable session returns without creating login state.
+    ///
+    /// Denials are always signed unconditionally by `idp::orchestrator`
+    /// regardless of `sign_assertions`/`sign_responses` (an unsigned denial is
+    /// trivially forgeable), so `test_state`'s real fixture key is exercised
+    /// here even though this SP has no session to reuse.
     #[actix_web::test]
     async fn passive_request_does_not_prompt_for_credentials() {
-        let mut state = test_state(false, &["https://sp.example.se/metadata"]);
-        state.config.sign_assertions = false;
-        state.config.sign_responses = false;
+        let state = test_state(false, &["https://sp.example.se/metadata"]);
         let state = web::Data::new(state);
         let mut request = unsigned_request("https://sp.example.se/metadata");
         request.is_passive = Some(true);
