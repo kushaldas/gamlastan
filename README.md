@@ -6,7 +6,7 @@ passes the Italian SPID (Sistema Pubblico di Identita Digitale) conformance
 test suite (263/263 tests).
 
 The plan is to become Rust equivalent of
-[pysaml2](https://https://github.com/IdentityPython/pysaml2) project. We will
+[pysaml2](https://github.com/IdentityPython/pysaml2) project. We will
 not be 100% compatible, but will try to close the gap. We thank the amazing
 maintainers of the `pysaml2` project for maintaining the stack for the community.
 
@@ -29,6 +29,8 @@ The `gamlastan` crate contains the following modules:
 | `crypto` | Cryptographic operations (signing, verification) via [bergshamra](https://github.com/kushaldas/bergshamra) |
 | `metadata` | SAML metadata types, SPID extensions, caching, and validation |
 | `bindings` | HTTP Redirect, POST, Artifact, SOAP, PAOS bindings and RelayState handling |
+| `attribute_map` | Attribute name conversion between wire names and local names (pysaml2 `attribute_maps`), with shipped maps |
+| `idp` | IdP side: release policy, entity categories, NameID store, authn broker, assertion store, and the `orchestrator` that assembles responses |
 | `security` | 35-check assertion validator, replay cache, clock skew handling |
 | `profiles` | Web Browser SSO (SP + IdP), SLO, ECP, artifact resolution, name ID management, Sweden Connect deployment profile |
 
@@ -66,6 +68,23 @@ The ordinary Web Browser SSO profile is fully covered. Holder-of-key is supporte
 at the metadata/constant and `SubjectConfirmation`-method level; the mutual-TLS
 transport requirement is a deployment concern outside the library. The DSS/SAP
 `SignRequest`/`SignResponse` envelope and SAD verification are out of scope.
+
+## Building an IdP
+
+`gamlastan::idp::orchestrator` composes the IdP primitives into the Web Browser
+SSO response flow. The application supplies the authenticated subject and its
+attributes; the engine decides ForceAuthn, IsPassive and `RequestedAuthnContext`
+(`check_request`), derives the NameID, releases attributes, and signs the
+response (`create_authn_response`), or answers with a signed protocol error
+(`create_denial_response`). Identity and assertion stores are traits
+(`IdentityStore`, `AssertionStore`), with in-memory implementations and a
+conformance suite, `idp::ident::conformance`, to check a database-backed one.
+
+`gamlastan-actix` provides ready handlers on top of it (`AuthnSubjectCallback`),
+and [`example-idp`](example-idp/) is a runnable reference. Several defaults follow
+pysaml2 and are permissive (attribute release, accepted NameID formats); the
+`idp::orchestrator` module docs list the ones to review before production, and
+[ADR 0045](docs/adr/0045-idp-response-orchestration.md) has the design.
 
 ## Security
 
