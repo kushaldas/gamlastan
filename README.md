@@ -12,6 +12,13 @@ maintainers of the `pysaml2` project for maintaining the stack for the community
 
 The workspace requires Rust 1.88 or later.
 
+The unreleased 0.10 series uses uppsala 0.12, bergshamra 0.11 and kryptering
+0.7. Consumers that exchange XML documents, keys or signers with gamlastan
+must use matching versions, or use the re-exports in `gamlastan::xml` and
+`gamlastan::crypto`. The crypto stack uses the RustCrypto provider with legacy,
+post-quantum and PKCS#11 support; the SAML algorithm policy still controls
+which algorithms are accepted.
+
 ## Workspace Structure
 
 | Crate | Description |
