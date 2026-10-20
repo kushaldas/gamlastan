@@ -24,6 +24,13 @@ sibling object does not authorize a wrapped object.
   processing, the SPID conformance ACS, and the example IdP all enforce this.
 - The E91 `ds:Object` guard is namespace-aware and fails closed on unparseable
   signature XML.
+- Enveloped verification shares one unmodified document between the E91 guard,
+  algorithm policy and backend. It retains metadata-tolerant parsing for
+  structural comments/PIs; protocol consumers still use strict parsing.
+  Original XML is supplied to generic transforms only alongside the document
+  parsed from those exact bytes. No caller-owned or mutated DOM is accepted
+  through this internal path. Explicitly disabling all verifier guards retains
+  the previous backend parser behavior; it does not change the safe defaults.
 - The binding composes with `bergshamra`'s own strict XSW check (a reference must
   target an ancestor/sibling/document-element of the `Signature`); the gamlastan
   binding closes the residual sibling/document-element case bergshamra permits.

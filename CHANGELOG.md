@@ -207,6 +207,10 @@ where needed to correct protocol handling.
 
 ### Changed
 
+- Reuse one parsed document for enveloped signature policy checks and backend
+  verification, eliminating two repeated top-level parses under the default
+  policy. Preserve metadata parsing rules, guard order, per-signature results,
+  and the original XML source for generic transform fallbacks.
 - Upgrade the XML-security stack together to bergshamra 0.11.0, uppsala
   0.12.0 and kryptering 0.7.0, including upstream canonicalization,
   traversal and key-reuse improvements. Consumers passing re-exported XML
