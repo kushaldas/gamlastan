@@ -59,6 +59,9 @@ jobs:
       - name: Tests
         run: cargo test --workspace --verbose
 
+      - name: SAML benchmark smoke checks
+        run: cargo test -p gamlastan --bench saml_pipeline --locked -- --self-test
+
   # HSM / PKCS#11 signing is exercised against a real SoftHSM2 token. The
   # integration test is `#[ignore]`d (it needs a provisioned token), so it is
   # invisible to the main `cargo test --workspace` run above; this job

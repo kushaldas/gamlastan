@@ -93,6 +93,11 @@ pysaml2 and are permissive (attribute release, accepted NameID formats); the
 `idp::orchestrator` module docs list the ones to review before production, and
 [ADR 0045](docs/adr/0045-idp-response-orchestration.md) has the design.
 
+## Performance
+
+See [the SAML pipeline benchmark guide](docs/performance.md) for reproducible
+native parsing and verification measurements and their limitations.
+
 ## Security
 
 gamlastan is built to fail closed against the SAML attack classes catalogued in
