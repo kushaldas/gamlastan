@@ -1,7 +1,7 @@
 // gamlastan crypto verifier - SAML signature verification wrapping bergshamra::dsig.
 
 use bergshamra_dsig::{
-    verify::{verify, verify_all},
+    verify::{verify_all_document_with_source, verify_document_with_source},
     DsigContext, VerifyResult,
 };
 use bergshamra_keys::{KeyUsage, KeysManager};
@@ -100,7 +100,7 @@ fn validate_signature_algorithms(
 }
 
 fn validate_enveloped_algorithm_policy(
-    signed_xml: &str,
+    doc: &Document<'_>,
     policy: &AlgorithmPolicy,
     reject_hmac_signatures: bool,
     selection: SignatureSelection,
@@ -109,20 +109,15 @@ fn validate_enveloped_algorithm_policy(
         return Ok(());
     }
 
-    let doc = crate::xml::parse_secure_metadata(signed_xml).map_err(|error| {
-        CryptoError::VerificationFailed(format!(
-            "could not parse XML for algorithm policy check: {error}"
-        ))
-    })?;
     let Some(root) = doc.document_element() else {
         return Ok(());
     };
 
     for signature in std::iter::once(root)
         .chain(doc.descendants(root))
-        .filter(|node| is_dsig_element(&doc, *node, "Signature"))
+        .filter(|node| is_dsig_element(doc, *node, "Signature"))
     {
-        validate_signature_algorithms(&doc, signature, policy, reject_hmac_signatures)?;
+        validate_signature_algorithms(doc, signature, policy, reject_hmac_signatures)?;
         if matches!(selection, SignatureSelection::First) {
             break;
         }
@@ -305,33 +300,14 @@ impl SamlVerifier {
     ///
     /// Per E91: checks for and rejects `<ds:Object>` elements in the signature
     /// if `reject_ds_object` is enabled.
+    ///
+    /// Policy checks and cryptographic verification share one parsed document.
+    /// The original source is retained for backend transform fallbacks; the
+    /// document is never mutated between parsing and verification.
     pub fn verify_enveloped(&self, signed_xml: &str) -> Result<VerifyResult, CryptoError> {
-        // E91 check: reject XMLDSig Object elements before handing the
-        // document to the verifier. The helper parses XML and compares
-        // expanded names, so attackers cannot bypass it by changing prefixes.
-        // Fail closed: if the document cannot be parsed for this check we must
-        // not proceed as though it were clean (CWE-693).
-        if self.reject_ds_object {
-            match crate::security::signature::contains_ds_object(signed_xml) {
-                Ok(true) => return Err(CryptoError::SignatureContainsDsObject),
-                Ok(false) => {}
-                Err(e) => {
-                    return Err(CryptoError::VerificationFailed(format!(
-                        "could not parse XML for E91 ds:Object check: {e}"
-                    )))
-                }
-            }
-        }
-
-        validate_enveloped_algorithm_policy(
-            signed_xml,
-            &self.algorithm_policy,
-            self.reject_hmac_signatures,
-            SignatureSelection::First,
-        )?;
-
+        let doc = self.parse_enveloped(signed_xml, SignatureSelection::First)?;
         let ctx = self.dsig_context();
-        let result = verify(&ctx, signed_xml)?;
+        let result = verify_document_with_source(&ctx, &doc, Some(signed_xml))?;
         Ok(result)
     }
 
@@ -349,30 +325,53 @@ impl SamlVerifier {
     ///
     /// The same E91 `<ds:Object>` guard as [`verify_enveloped`](Self::verify_enveloped)
     /// applies, and it fails closed if the document cannot be parsed for that
-    /// check.
+    /// check. Policy checks and the backend share an unmodified document, as in
+    /// [`verify_enveloped`](Self::verify_enveloped).
     pub fn verify_all_enveloped(&self, signed_xml: &str) -> Result<Vec<VerifyResult>, CryptoError> {
-        if self.reject_ds_object {
-            match crate::security::signature::contains_ds_object(signed_xml) {
-                Ok(true) => return Err(CryptoError::SignatureContainsDsObject),
-                Ok(false) => {}
-                Err(e) => {
-                    return Err(CryptoError::VerificationFailed(format!(
-                        "could not parse XML for E91 ds:Object check: {e}"
-                    )))
-                }
-            }
-        }
+        let doc = self.parse_enveloped(signed_xml, SignatureSelection::All)?;
+        let ctx = self.dsig_context();
+        let results = verify_all_document_with_source(&ctx, &doc, Some(signed_xml))?;
+        Ok(results)
+    }
 
+    /// Parse once and apply the existing guards in their original order.
+    ///
+    /// Use the metadata policy because these entry points also verify signed
+    /// metadata with structural comments/PIs. Strict protocol parsing remains
+    /// the responsibility of the protocol deserializer. Preserve the backend
+    /// parser and its error type when callers explicitly disable every guard.
+    fn parse_enveloped<'a>(
+        &self,
+        signed_xml: &'a str,
+        selection: SignatureSelection,
+    ) -> Result<Document<'a>, CryptoError> {
+        let check_algorithms =
+            !self.algorithm_policy.is_permissive() || self.reject_hmac_signatures;
+        let doc = if self.reject_ds_object || check_algorithms {
+            crate::xml::parse_secure_metadata(signed_xml).map_err(|error| {
+                let check = if self.reject_ds_object {
+                    "E91 ds:Object"
+                } else {
+                    "algorithm policy"
+                };
+                CryptoError::VerificationFailed(format!(
+                    "could not parse XML for {check} check: {error}"
+                ))
+            })?
+        } else {
+            uppsala::parse(signed_xml)
+                .map_err(|error| bergshamra_core::Error::XmlParse(error.to_string()))?
+        };
+        if self.reject_ds_object && crate::security::signature::contains_ds_object_document(&doc) {
+            return Err(CryptoError::SignatureContainsDsObject);
+        }
         validate_enveloped_algorithm_policy(
-            signed_xml,
+            &doc,
             &self.algorithm_policy,
             self.reject_hmac_signatures,
-            SignatureSelection::All,
+            selection,
         )?;
-
-        let ctx = self.dsig_context();
-        let results = verify_all(&ctx, signed_xml)?;
-        Ok(results)
+        Ok(doc)
     }
 
     /// Build a [`DsigContext`] from this verifier's configured policy. Shared by
@@ -455,8 +454,28 @@ impl SamlVerifier {
 }
 
 #[cfg(test)]
+#[path = "verifier_document_tests.rs"]
+mod document_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    // Keep the policy tests expressed in XML while the runtime helper borrows
+    // the verifier's already-parsed document.
+    fn validate_enveloped_algorithm_policy(
+        xml: &str,
+        policy: &AlgorithmPolicy,
+        reject_hmac: bool,
+        selection: SignatureSelection,
+    ) -> Result<(), CryptoError> {
+        let doc = crate::xml::parse_secure_metadata(xml).map_err(|error| {
+            CryptoError::VerificationFailed(format!(
+                "could not parse XML for algorithm policy check: {error}"
+            ))
+        })?;
+        super::validate_enveloped_algorithm_policy(&doc, policy, reject_hmac, selection)
+    }
 
     const RSA_SHA1: &str = "http://www.w3.org/2000/09/xmldsig#rsa-sha1";
     const RSA_SHA256: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";

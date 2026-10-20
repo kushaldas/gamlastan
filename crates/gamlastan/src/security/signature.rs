@@ -29,19 +29,25 @@
 /// `Err` result forces callers to decide explicitly, and every caller in this
 /// crate treats it as a rejection (CWE-693).
 pub fn contains_ds_object(signature_xml: &str) -> Result<bool, uppsala::XmlError> {
-    const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
-
-    // Use the comment/PI-tolerant metadata parse. This helper runs inside
-    // `verify_enveloped`, which also verifies federation metadata (MDQ), and
+    // Use the same comment/PI-tolerant metadata parse as `verify_enveloped`,
+    // which also verifies federation metadata (MDQ), and
     // metadata legitimately carries comments. A strict parse here would fail
     // closed on comment-bearing-but-valid metadata. Nothing is weakened: this is
     // a structural scan for a `{XMLDSig}Object` element (comments cannot hide or
     // forge an element), CDATA/DTD are still rejected, and the comment-truncation
     // defense for protocol messages is enforced at the deserialize parse layer.
     let doc = crate::xml::parse_secure_metadata(signature_xml)?;
+    Ok(contains_ds_object_document(&doc))
+}
 
+/// E91 scan for a document already parsed under the caller's security policy.
+///
+/// Keep the public string helper and the verifier on the same namespace-aware
+/// scan without requiring the verifier to parse its input again.
+pub(crate) fn contains_ds_object_document(doc: &uppsala::Document<'_>) -> bool {
+    const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
     let Some(root) = doc.document_element() else {
-        return Ok(false);
+        return false;
     };
 
     for node in doc.descendants(root) {
@@ -54,11 +60,11 @@ pub fn contains_ds_object(signature_xml: &str) -> Result<bool, uppsala::XmlError
         if elem.name.local_name == "Object"
             && elem.name.namespace_uri.as_deref() == Some(XMLDSIG_NS)
         {
-            return Ok(true);
+            return true;
         }
     }
 
-    Ok(false)
+    false
 }
 
 /// HMAC-family XML-DSig `SignatureMethod` URIs.

@@ -102,6 +102,8 @@ Do not infer a speedup merely from adding this harness or from differences
 between unrelated workload sizes. Retain raw output as well as summaries.
 
 The initial results are in [the baseline record](performance-baseline.md).
+The first runtime optimization, sharing parsed XML between verification
+stages, is measured in [the document-reuse comparison](performance-verification.md).
 This first slice does not measure allocation counts, parse counts, isolated
 canonicalization/crypto time, cold verification, metadata, rollover keys, HSM
 latency, Python FFI or tunnelbana throughput. Those require separate cases and
