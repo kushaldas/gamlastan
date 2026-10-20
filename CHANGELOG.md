@@ -5,7 +5,7 @@ All notable changes to this repository will be documented in this file.
 The project is still pre-1.0, so minor releases may include behavior changes
 where needed to correct protocol handling.
 
-## [Unreleased]
+## [0.10.0] - [unreleased]
 
 ### Added
 
@@ -204,6 +204,16 @@ where needed to correct protocol handling.
 
 ### Changed
 
+- Upgrade the XML-security stack together to bergshamra 0.11.0, uppsala
+  0.12.0 and kryptering 0.7.0, including upstream canonicalization,
+  traversal and key-reuse improvements. Consumers passing re-exported XML
+  documents, keys or signers must use the matching dependency versions.
+  RustCrypto, legacy algorithm support, post-quantum support and PKCS#11
+  remain enabled; SAML algorithm policy is unchanged.
+- Bump all workspace packages and internal requirements to 0.10.0 and use
+  Cargo's MSRV-aware resolver, retaining the Rust 1.88 minimum.
+- Refresh the lockfile to Rustls 0.23.46 for its security fixes and
+  yoke-derive 0.8.4 to replace the yanked 0.8.3 release.
 - **Breaking:** `ResponseOptions` gained the `authenticating_authorities`
   field. Every struct literal must add it (or use `..Default::default()`).
   External consumers with hand-built literals (e.g. tunnelbana) need a
