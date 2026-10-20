@@ -9,6 +9,9 @@ where needed to correct protocol handling.
 
 ### Added
 
+- Add a dependency-free `saml_pipeline` benchmark with deterministic signed
+  fixtures and separate secure-parse, typed-extraction and verification
+  measurements. This establishes a baseline without changing runtime behavior.
 - Added `idp::orchestrator`, a new module composing the existing IdP
   primitives (`ReleasePolicy`, `IdentDb`, `AuthnBroker`, `AssertionStore`)
   into the actual SAML Web Browser SSO response-assembly flow:
