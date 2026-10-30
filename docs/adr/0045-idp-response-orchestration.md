@@ -381,7 +381,7 @@ failure is a real protocol error rather than a silent per-integrator choice.
   directly is not. Cost: one `user_for` per record
   returned, and `user_for` must see the store's own writes.
 
-- `Eptid` shape-checks a value read from its cache (`<idp>!<sp>!<opaque>`, on by
+- `Eptid` shape-checks a value read from its cache (`<idp>!<sp>!<opaque>` with no `!` in the opaque part, on by
   default, `Eptid::with_store_verification(false)` to skip), and
   `idp::ident::kv_conformance` checks a `KeyValueStore` backend: read-your-writes,
   exact keys, scoped removal, no eviction, and sound concurrent writes. The cache

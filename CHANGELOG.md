@@ -553,7 +553,7 @@ where needed to correct protocol handling.
   binds the answer to the NameID value asked about; it does not authorize the
   requester, which stays with the responder.
 - `Eptid` checks the shape of a value it reads from its cache: it must be
-  `<idp>!<sp>!<opaque>`, otherwise a `StoreError`. The cache is trusted to return
+  `<idp>!<sp>!<opaque>` where the opaque part has no `!` (an entity ID may, so a longer SP ID could otherwise pass for this one), otherwise a `StoreError`. The cache is trusted to return
   what was issued, which is its purpose, but a value of the wrong shape was not
   issued for this IdP and SP, and the realistic causes (a cache shared with another
   IdP or tenant, a key written by the wrong code, a restored or flushed cache)

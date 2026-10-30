@@ -191,7 +191,7 @@ impl<S: KeyValueStore> Eptid<S> {
     /// The cache is trusted to return what was issued: that is its purpose, since
     /// recomputing could give a different value after the secret or digest
     /// changed. But a value that does not have the shape this type derives,
-    /// `<idp>!<sp>!<opaque>`, was not issued for this IdP and SP, and the realistic
+    /// `<idp>!<sp>!<opaque>` with a non-empty opaque part that contains no `!` (entity IDs may contain `!`, so `<idp>!<sp>!x!y` could be another SP's), was not issued for this IdP and SP, and the realistic
     /// causes are operational: a cache shared with another IdP or tenant, a key
     /// written by the wrong code, a restored or flushed cache. With this on such a
     /// value is a [`StoreError`] instead of an identifier handed to the SP, and
@@ -247,7 +247,10 @@ impl<S: KeyValueStore> Eptid<S> {
         if let Some(cached) = self.store.get(&key)? {
             if self.verify_cache {
                 let prefix = format!("{idp_entity_id}!{sp_entity_id}!");
-                if cached.len() <= prefix.len() || !cached.starts_with(&prefix) {
+                // `!` is legal in an entity ID, so `<idp>!<sp>!x!y` could be another
+                // SP's identifier; `make` always renders the opaque part as hex.
+                let opaque = cached.strip_prefix(&prefix).unwrap_or("");
+                if opaque.is_empty() || opaque.contains('!') {
                     return Err(StoreError::new(format!(
                         "the EPTID cache returned a value that does not have the shape of an \
                          identifier issued for this IdP and SP ({prefix}<opaque>); refusing to \
@@ -397,6 +400,20 @@ mod tests {
         let good = "https://idp.example!https://sp.example!abc";
         let eptid = Eptid::with_store(Answers(good), "secret");
         assert_eq!(eptid.get(idp, sp, "alice").unwrap(), good);
+
+        // `!` is legal in an entity ID: another SP whose ID extends this one
+        // must not pass for it.
+        for ambiguous in [
+            "https://idp.example!https://sp.example!other!abc",
+            "https://idp.example!https://sp.example!abc!def",
+        ] {
+            assert!(
+                Eptid::with_store(Answers(ambiguous), "secret")
+                    .get(idp, sp, "alice")
+                    .is_err(),
+                "{ambiguous}"
+            );
+        }
 
         // Values issued under an earlier IdP entity ID carry the old one.
         let old = "https://old-idp.example!https://sp.example!abc";

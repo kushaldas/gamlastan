@@ -247,6 +247,24 @@ fn keys_are_exact<S: KeyValueStore>(s: &S) -> Outcome {
              character"
         );
     }
+    // Every lookup above hits a stored key, so a backend that matches prefixes or
+    // substrings can pass if it happens to meet the exact key first. These keys
+    // were never written but are a prefix or a suffix of one that was.
+    for probe in [
+        "a_",
+        "b",
+        "_b",
+        "eptid:https://idp.example__https://sp.example__ali",
+        "ptid:https://idp.example__https://sp.example__alice",
+    ] {
+        debug_assert!(!keys.contains(&probe));
+        ensure_eq!(
+            get(s, probe)?,
+            None,
+            "key {probe:?} was never written but is a prefix or suffix of one that was: \
+             a lookup must not match part of a key"
+        );
+    }
     Ok(())
 }
 

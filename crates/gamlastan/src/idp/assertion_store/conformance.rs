@@ -119,11 +119,23 @@ fn store<S: AssertionStore>(s: &S, a: Assertion) -> Result<(), String> {
     step("store_assertion", s.store_assertion(a))
 }
 
+/// The IDs the store lists for `subject`, sorted. Each assertion it returns must
+/// itself be that subject's: `get_authn_statements` rejects one that is not, so a
+/// backend that lists assertions with a missing or wrong subject must fail here too.
 fn ids_for<S: AssertionStore>(s: &S, subject: &str) -> Result<Vec<String>, String> {
-    let mut ids: Vec<String> = step("assertions_for_subject", s.assertions_for_subject(subject))?
-        .into_iter()
-        .map(|a| a.id)
-        .collect();
+    let assertions = step("assertions_for_subject", s.assertions_for_subject(subject))?;
+    for a in &assertions {
+        if subject_value(a).as_deref() != Some(subject) {
+            return Err(format!(
+                "assertions_for_subject({subject:?}) returned assertion {:?} whose subject is \
+                 {:?}; a listing must contain only that subject's assertions, with the subject \
+                 intact",
+                a.id,
+                subject_value(a)
+            ));
+        }
+    }
+    let mut ids: Vec<String> = assertions.into_iter().map(|a| a.id).collect();
     ids.sort();
     Ok(ids)
 }
@@ -373,11 +385,13 @@ where
         })
         .collect();
     join_all(handles)?;
+    let mut expected: Vec<String> = (0..n).map(|i| format!("_c{i}")).collect();
+    expected.sort();
     ensure_eq!(
-        ids_for(&*store, "alice")?.len(),
-        n,
-        "concurrent stores for one subject lost entries - the subject index is updated \
-         with a non-atomic read-modify-write"
+        ids_for(&*store, "alice")?,
+        expected,
+        "concurrent stores for one subject lost or duplicated entries - the subject index \
+         is updated with a non-atomic read-modify-write"
     );
     Ok(())
 }
@@ -451,6 +465,10 @@ mod tests {
         error_on_missing: bool,
         /// Read the index, pause, write it back (a lost update).
         lossy_index: bool,
+        /// List assertions with their subject stripped.
+        blank_subject: bool,
+        /// List the first assertion over and over: the right count, the wrong IDs.
+        repeat_first: bool,
     }
 
     impl AssertionStore for Bent {
@@ -505,6 +523,16 @@ mod tests {
                 };
                 if hit {
                     out.extend(ids.iter().filter_map(|id| by_id.get(id).cloned()));
+                }
+            }
+            if self.blank_subject {
+                for a in &mut out {
+                    a.subject = None;
+                }
+            }
+            if self.repeat_first {
+                if let Some(first) = out.first().cloned() {
+                    out = vec![first; out.len()];
                 }
             }
             Ok(out)
@@ -573,6 +601,23 @@ mod tests {
     fn a_lossy_subject_index_loses_concurrent_stores() {
         fails("concurrent_stores_lose_nothing", || Bent {
             lossy_index: true,
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn a_listing_with_the_subject_stripped_is_caught() {
+        fails("subject_lookup_is_exact_and_isolated", || Bent {
+            blank_subject: true,
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn concurrent_stores_are_compared_by_id_not_by_count() {
+        // Two entries are listed, as many as were stored, but both are `_c0`.
+        fails("concurrent_stores_lose_nothing", || Bent {
+            repeat_first: true,
             ..Default::default()
         });
     }
