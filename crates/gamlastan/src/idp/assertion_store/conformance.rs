@@ -26,11 +26,13 @@
 //! The concurrent checks race threads against one store instance. A backend that
 //! serialises every call can pass them without being safe across processes, and a
 //! race between separate processes or instances is not detected. Real backends
-//! may round timestamps, so assertions are compared by identity, subject and
-//! authentication statement, not field for field.
+//! may round timestamps, so assertions are compared by identity, subject,
+//! authentication statement and validity window (to the second), not field for
+//! field.
 
 use super::*;
 use crate::core::assertion::authn::AuthnContext;
+use crate::core::assertion::conditions::Conditions;
 use crate::core::assertion::name_id::NameId;
 use crate::idp::ident::conformance::{ConformanceError, Options};
 use std::fmt;
@@ -97,7 +99,13 @@ fn fixture(id: &str, subject: &str, session_index: &str) -> Assertion {
             })),
             subject_confirmations: vec![],
         }),
-        conditions: None,
+        conditions: Some(Conditions {
+            not_before: None,
+            not_on_or_after: Some(Utc::now() + chrono::TimeDelta::hours(1)),
+            audience_restrictions: vec![],
+            one_time_use: false,
+            proxy_restriction: None,
+        }),
         advice: None,
         authn_statements: vec![AuthnStatement {
             authn_instant: Utc::now(),
@@ -251,6 +259,30 @@ fn missing_assertion_is_absent<S: AssertionStore>(s: &S) -> Outcome {
 /// What was stored is found by its ID, readable immediately.
 fn store_then_get_round_trips<S: AssertionStore>(s: &S) -> Outcome {
     store(s, fixture("_a1", "alice", "_s1"))?;
+    store(s, fixture("_b1", "bob", "_s2"))?;
+    // With more than one assertion stored, each ID must return its own: a backend
+    // that checks the ID exists but then fetches "the" assertion would pass with one.
+    for (id, subject, session) in [("_b1", "bob", "_s2"), ("_a1", "alice", "_s1")] {
+        let got = step("get_assertion", s.get_assertion(id))?;
+        ensure_eq!(
+            got.as_ref().map(|a| a.id.clone()),
+            Some(id.to_string()),
+            "get_assertion({id:?}) returned a different assertion than the one asked for"
+        );
+        ensure_eq!(
+            got.as_ref().and_then(subject_value),
+            Some(subject.to_string()),
+            "get_assertion({id:?}) returned another subject's assertion"
+        );
+        ensure_eq!(
+            got.and_then(|a| a
+                .authn_statements
+                .first()
+                .and_then(|st| st.session_index.clone())),
+            Some(session.to_string()),
+            "get_assertion({id:?}) returned another assertion's authentication statement"
+        );
+    }
     let got = step("get_assertion", s.get_assertion("_a1"))?;
     let Some(got) = got else {
         return Err(
@@ -276,6 +308,29 @@ fn store_then_get_round_trips<S: AssertionStore>(s: &S) -> Outcome {
         Some("_s1".to_string()),
         "the assertion's authentication statement was altered"
     );
+    // The validity window is what lets `get_authn_statements` use the assertion at
+    // all: one without a bounded NotOnOrAfter is silently dropped there. Real
+    // backends round timestamps, so allow a second.
+    let expected = fixture("_a1", "alice", "_s1")
+        .conditions
+        .and_then(|c| c.not_on_or_after)
+        .expect("the fixture has a bounded window");
+    let listed = step("assertions_for_subject", s.assertions_for_subject("alice"))?;
+    for (path, a) in [
+        ("get_assertion", Some(got)),
+        ("assertions_for_subject", listed.into_iter().next()),
+    ] {
+        let kept = a
+            .and_then(|a| a.conditions)
+            .and_then(|c| c.not_on_or_after)
+            .is_some_and(|got| (got - expected).num_seconds().abs() <= 1);
+        if !kept {
+            return Err(format!(
+                "{path} lost or changed the assertion's Conditions NotOnOrAfter (within one \
+                 second); get_authn_statements ignores an assertion without a bounded window"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -297,6 +352,11 @@ fn subject_lookup_is_exact_and_isolated<S: AssertionStore>(s: &S) -> Outcome {
         ids_for(s, "bob")?,
         vec!["_b1".to_string()],
         "bob's assertions"
+    );
+    ensure_eq!(
+        ids_for(s, "Alice")?,
+        vec!["_c1".to_string()],
+        "a subject lookup is case sensitive: \"Alice\" is not \"alice\""
     );
     ensure_eq!(
         ids_for(s, "ali")?,
@@ -355,14 +415,18 @@ fn remove_is_scoped_and_clears_the_subject_index<S: AssertionStore>(s: &S) -> Ou
     Ok(())
 }
 
+/// Join every worker, then report the first failure. Stopping at the first error
+/// would detach the others, leaving writes running after the check has returned.
 fn join_all<T>(handles: Vec<thread::JoinHandle<Result<T, String>>>) -> Result<Vec<T>, String> {
-    handles
+    let results: Vec<Result<T, String>> = handles
         .into_iter()
         .map(|h| {
             h.join()
-                .map_err(|_| "a worker thread panicked".to_string())?
+                .map_err(|_| "a worker thread panicked".to_string())
+                .and_then(|r| r)
         })
-        .collect()
+        .collect();
+    results.into_iter().collect()
 }
 
 /// Concurrent stores for one subject all land: the subject index is not a
@@ -469,10 +533,20 @@ mod tests {
         blank_subject: bool,
         /// List the first assertion over and over: the right count, the wrong IDs.
         repeat_first: bool,
+        /// Drop the validity window when storing.
+        strip_conditions: bool,
+        /// `get_assertion` returns the lowest ID once the asked-for one exists.
+        get_wrong_one: bool,
+        /// Look subjects up lower-cased, storing them unchanged.
+        fold_lookup: bool,
     }
 
     impl AssertionStore for Bent {
         fn store_assertion(&self, assertion: Assertion) -> Result<(), StoreError> {
+            let mut assertion = assertion;
+            if self.strip_conditions {
+                assertion.conditions = None;
+            }
             let id = assertion.id.clone();
             let subject = subject_value(&assertion).unwrap();
             let previous = self.by_id.lock().unwrap().insert(id.clone(), assertion);
@@ -505,7 +579,12 @@ mod tests {
             Ok(())
         }
         fn get_assertion(&self, id: &str) -> Result<Option<Assertion>, StoreError> {
-            let found = self.by_id.lock().unwrap().get(id).cloned();
+            let by_id = self.by_id.lock().unwrap();
+            let mut found = by_id.get(id).cloned();
+            if self.get_wrong_one && found.is_some() {
+                found = by_id.values().min_by_key(|a| a.id.clone()).cloned();
+            }
+            drop(by_id);
             if found.is_none() && self.error_on_missing {
                 return Err(StoreError::new("KeyError"));
             }
@@ -518,6 +597,8 @@ mod tests {
             for (key, ids) in idx.iter() {
                 let hit = if self.prefix_subject {
                     key.starts_with(subject)
+                } else if self.fold_lookup {
+                    *key == subject.to_lowercase()
                 } else {
                     key == subject
                 };
@@ -620,6 +701,47 @@ mod tests {
             repeat_first: true,
             ..Default::default()
         });
+    }
+
+    #[test]
+    fn a_backend_that_drops_the_validity_window_is_caught() {
+        fails("store_then_get_round_trips", || Bent {
+            strip_conditions: true,
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn a_get_that_ignores_which_id_was_asked_for_is_caught() {
+        fails("store_then_get_round_trips", || Bent {
+            get_wrong_one: true,
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn a_lookup_that_folds_case_is_caught() {
+        fails("subject_lookup_is_exact_and_isolated", || Bent {
+            fold_lookup: true,
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn every_worker_is_joined_before_the_first_failure_is_reported() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let finished = Arc::new(AtomicBool::new(false));
+        let slow = Arc::clone(&finished);
+        let handles = vec![
+            thread::spawn(|| Err::<(), String>("fast failure".to_string())),
+            thread::spawn(move || {
+                thread::sleep(std::time::Duration::from_millis(100));
+                slow.store(true, Ordering::SeqCst);
+                Ok(())
+            }),
+        ];
+        assert_eq!(join_all(handles).unwrap_err(), "fast failure");
+        assert!(finished.load(Ordering::SeqCst), "a worker was left running");
     }
 
     #[test]

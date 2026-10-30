@@ -11,7 +11,9 @@ where needed to correct protocol handling.
 
 - Added `idp::assertion_store::conformance`, a reusable check that an
   `AssertionStore` backend honours its contract: absent assertions read as absent,
-  stored assertions round-trip, a subject lookup is exact and isolated, storing an
+  stored assertions round-trip (each ID returns its own assertion, and the
+  validity window survives both read paths), a subject lookup is exact and
+  isolated (case sensitive, and every listed assertion carries that subject), storing an
   ID again does not duplicate it, storing it for another subject moves it (the old
   subject's lookup must not return an assertion issued to someone else), removal
   clears the subject index, and concurrent stores lose nothing and leave an ID

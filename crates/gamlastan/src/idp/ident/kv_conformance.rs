@@ -301,14 +301,18 @@ fn values_are_not_evicted<S: KeyValueStore>(s: &S) -> Outcome {
     Ok(())
 }
 
+/// Join every worker, then report the first failure. Stopping at the first error
+/// would detach the others, leaving writes running after the check has returned.
 fn join_all<T>(handles: Vec<thread::JoinHandle<Result<T, String>>>) -> Result<Vec<T>, String> {
-    handles
+    let results: Vec<Result<T, String>> = handles
         .into_iter()
         .map(|h| {
             h.join()
-                .map_err(|_| "a worker thread panicked".to_string())?
+                .map_err(|_| "a worker thread panicked".to_string())
+                .and_then(|r| r)
         })
-        .collect()
+        .collect();
+    results.into_iter().collect()
 }
 
 /// Concurrent writers on distinct keys each read back exactly what they wrote,
@@ -514,6 +518,23 @@ mod tests {
             prefix_match: true,
             ..Default::default()
         });
+    }
+
+    #[test]
+    fn every_worker_is_joined_before_the_first_failure_is_reported() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let finished = Arc::new(AtomicBool::new(false));
+        let slow = Arc::clone(&finished);
+        let handles = vec![
+            thread::spawn(|| Err::<(), String>("fast failure".to_string())),
+            thread::spawn(move || {
+                thread::sleep(std::time::Duration::from_millis(100));
+                slow.store(true, Ordering::SeqCst);
+                Ok(())
+            }),
+        ];
+        assert_eq!(join_all(handles).unwrap_err(), "fast failure");
+        assert!(finished.load(Ordering::SeqCst), "a worker was left running");
     }
 
     #[test]
