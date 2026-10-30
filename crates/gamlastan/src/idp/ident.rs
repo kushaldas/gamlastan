@@ -259,6 +259,11 @@ pub trait IdentityStore: Send + Sync {
     /// Every NameID of `user_id` that satisfies `filter`, in unspecified order
     /// (pysaml2 `find_nameid`). Overridable to push the filter down to an
     /// index or query; the default filters [`for_user`](Self::for_user).
+    ///
+    /// An override must apply the *whole* filter, with the semantics of
+    /// [`NameIdFilter::matches`] (including treating a missing format as
+    /// `unspecified`): [`IdentDb::find_nameid`] refuses the result if any record
+    /// fails it, rather than filtering again.
     fn find(&self, user_id: &str, filter: &NameIdFilter) -> Result<Vec<NameId>, StoreError> {
         Ok(self
             .for_user(user_id)?
@@ -668,11 +673,13 @@ impl<S: IdentityStore> IdentDb<S> {
     /// value to the user - and a durable lookup must return the slot that was
     /// asked for. Anything else is a [`StoreError`], not a result.
     ///
-    /// The check lives here, not in each store method, so no path can skip it and
-    /// it covers every backend, including the default `find` / `find_durable`
-    /// that filter [`for_user`](IdentityStore::for_user). It costs one `user_for`
-    /// per record returned, and it needs `user_for` to see the store's own writes
-    /// (not a lagging replica).
+    /// The check lives here, not in each store method, so every lookup made through
+    /// this type is covered, including the default `find` / `find_durable` that
+    /// filter [`for_user`](IdentityStore::for_user), and
+    /// [`find_local_id`](Self::find_local_id) (which round-trips through
+    /// `for_user`). A caller that reads the store directly is not. It costs one
+    /// `user_for` per record returned, and it needs `user_for` to see the store's
+    /// own writes (not a lagging replica); run [`conformance`] against the backend.
     ///
     /// Pass `false` for a store you fully trust, such as
     /// [`InMemoryIdentityStore`], to skip the extra reads.
@@ -694,8 +701,9 @@ impl<S: IdentityStore> IdentDb<S> {
         match self.store.user_for(&record.value)? {
             Some(owner) if owner == user_id => Ok(()),
             _ => Err(StoreError::new(format!(
-                "the store's {call} returned a NameID that it does not attribute to this \
-                 user; refusing to use it"
+                "the store's {call} returned a NameID that its user_for does not attribute to \
+                 this user; refusing to use it (a wrong lookup, or a user_for that does not \
+                 see the store's own writes - check the backend with idp::ident::conformance)"
             ))),
         }
     }
@@ -799,8 +807,29 @@ impl<S: IdentityStore> IdentDb<S> {
     }
 
     /// The local user a NameID was issued to (pysaml2 `find_local_id()`).
+    ///
+    /// With [store verification](Self::with_store_verification) on, the owner the
+    /// store names must also hold a record with this value in its own
+    /// [`for_user`](IdentityStore::for_user) listing. `NameIDMappingRequest` and
+    /// `ManageNameIDRequest` act on this answer, so a stale or wrong reverse index
+    /// must not pick the user they act for.
     pub fn find_local_id(&self, name_id: &NameId) -> Result<Option<String>, StoreError> {
-        self.store.user_for(&name_id.value)
+        let Some(owner) = self.store.user_for(&name_id.value)? else {
+            return Ok(None);
+        };
+        if self.verify_store
+            && !self
+                .store
+                .for_user(&owner)?
+                .iter()
+                .any(|r| r.value == name_id.value)
+        {
+            return Err(StoreError::new(
+                "the store's user_for attributes a NameID value to a user whose own records \
+                 do not include it; refusing to use it",
+            ));
+        }
+        Ok(Some(owner))
     }
 
     /// Find an existing *persistent* NameID for (user, SP, IdP) (pysaml2
@@ -1815,6 +1844,66 @@ mod tests {
         assert!(db.name_ids_for("alice").unwrap().is_empty());
     }
 
+    /// A store whose `find` pushes the filter down on format and SPNameQualifier
+    /// only, the partial pushdown the trait invites.
+    struct PartialPushdown(InMemoryIdentityStore);
+
+    impl IdentityStore for PartialPushdown {
+        fn for_user(&self, user_id: &str) -> Result<Vec<NameId>, StoreError> {
+            self.0.for_user(user_id)
+        }
+        fn user_for(&self, value: &str) -> Result<Option<String>, StoreError> {
+            self.0.user_for(value)
+        }
+        fn find(&self, user_id: &str, filter: &NameIdFilter) -> Result<Vec<NameId>, StoreError> {
+            let partial = NameIdFilter {
+                sp_provided_id: None,
+                ..filter.clone()
+            };
+            self.0.find(user_id, &partial)
+        }
+        fn get_or_insert_durable(
+            &self,
+            user_id: &str,
+            candidate: NameId,
+        ) -> Result<NameId, InsertError> {
+            self.0.get_or_insert_durable(user_id, candidate)
+        }
+        fn insert(&self, user_id: &str, name_id: NameId) -> Result<(), InsertError> {
+            self.0.insert(user_id, name_id)
+        }
+        fn replace(&self, user_id: &str, name_id: NameId) -> Result<(), InsertError> {
+            self.0.replace(user_id, name_id)
+        }
+        fn remove(&self, value: &str) -> Result<(), StoreError> {
+            self.0.remove(value)
+        }
+        fn remove_all(&self, user_id: &str) -> Result<(), StoreError> {
+            self.0.remove_all(user_id)
+        }
+    }
+
+    #[test]
+    fn a_find_that_ignores_part_of_the_filter_is_refused() {
+        let store = PartialPushdown(InMemoryIdentityStore::new());
+        store.insert("alice", persistent_nid("v1", SP)).unwrap();
+        let filter = NameIdFilter {
+            format: Some(constants::NAMEID_PERSISTENT.to_string()),
+            sp_name_qualifier: Some(SP.to_string()),
+            sp_provided_id: Some("a-different-id".to_string()),
+            ..Default::default()
+        };
+        let db = IdentDb::new(store, IDP);
+        let err = db.find_nameid("alice", &filter).unwrap_err();
+        assert!(err.to_string().contains("does not satisfy the"), "{err}");
+        // A filter the pushdown fully honours is fine.
+        let ok = NameIdFilter {
+            sp_provided_id: None,
+            ..filter
+        };
+        assert_eq!(db.find_nameid("alice", &ok).unwrap().len(), 1);
+    }
+
     #[test]
     fn find_nameid_filters_a_users_records() {
         let db = db();
@@ -2364,6 +2453,7 @@ mod tests {
         inner: InMemoryIdentityStore,
         leak_for_user: bool,
         hijack_get_or_insert: Option<String>,
+        wrong_owner: Option<String>,
     }
 
     impl IdentityStore for LeakyStore {
@@ -2379,6 +2469,9 @@ mod tests {
             self.inner.for_user(user_id)
         }
         fn user_for(&self, value: &str) -> Result<Option<String>, StoreError> {
+            if let Some(wrong) = &self.wrong_owner {
+                return Ok(Some(wrong.clone()));
+            }
             self.inner.user_for(value)
         }
         fn get_or_insert_durable(
@@ -2427,6 +2520,30 @@ mod tests {
         assert!(db.name_ids_for("mallory").is_err());
         assert!(db.match_local_id("mallory", Some(SP), Some(IDP)).is_err());
         assert!(db.find_nameid("mallory", &NameIdFilter::default()).is_err());
+    }
+
+    #[test]
+    fn a_reverse_index_that_names_the_wrong_owner_is_refused() {
+        let db = leaky_with_victim(|s| s.wrong_owner = Some("mallory".into()));
+        let nid = persistent_nid("victim-value", SP);
+        let err = db.find_local_id(&nid).unwrap_err();
+        assert!(err.to_string().contains("do not include it"), "{err}");
+        let policy = NameIdPolicy {
+            format: None,
+            sp_name_qualifier: None,
+            allow_create: true,
+        };
+        assert!(db.handle_name_id_mapping_request(&nid, &policy).is_err());
+        assert!(db
+            .handle_manage_name_id_request(&nid, &NewIdOrTerminate::Terminate)
+            .is_err());
+        // Trusting the store skips the extra read, as documented.
+        let trusting = leaky_with_victim(|s| s.wrong_owner = Some("mallory".into()))
+            .with_store_verification(false);
+        assert_eq!(
+            trusting.find_local_id(&nid).unwrap().as_deref(),
+            Some("mallory")
+        );
     }
 
     #[test]

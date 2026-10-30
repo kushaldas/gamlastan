@@ -39,7 +39,9 @@ pub mod conformance;
 /// [`create_assertion_id_request_response`], [`create_authn_query_response`]) do
 /// not trust the answers: an assertion returned for a subject must be that
 /// subject's, and one returned for an ID must have that ID, otherwise the call is
-/// a [`StoreError`]. A backend still has to get the rest right - an ID stored
+/// a [`StoreError`]. The subject check binds the answer to the NameID *value*
+/// that was asked about; it does not decide who may ask. Whether the requester
+/// may learn about that subject's assertions is the responder's call. A backend still has to get the rest right - an ID stored
 /// again for another subject must leave the old subject's index, removal must
 /// clear it, and concurrent stores must not lose entries - and [`conformance`]
 /// checks that against a real instance.
@@ -152,7 +154,9 @@ impl AssertionStore for InMemoryAssertionStore {
 /// The store is not trusted to have scoped its answer: every assertion it returns
 /// must be for `name_id_value`, otherwise the call fails with a [`StoreError`]. An
 /// index that is stale or keyed wrongly would otherwise put one subject's
-/// authentication statements into an answer about another's.
+/// authentication statements into an answer about another's. This binds the
+/// answer to the value asked about, not to the requester: authorizing the
+/// requester (for example by SP entity ID) is up to the caller.
 pub fn get_authn_statements(
     store: &dyn AssertionStore,
     name_id_value: &str,

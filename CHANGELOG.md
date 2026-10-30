@@ -224,6 +224,13 @@ where needed to correct protocol handling.
 
 ### Changed
 
+- **Breaking:** `IdentDb` verifies what its `IdentityStore` returns by default
+  (`with_store_verification`), and `Eptid` shape-checks its cache. A backend whose
+  `user_for` lags its writes (a read replica, an eventually consistent store) now
+  fails the first login that creates a NameID with a `StoreError` instead of
+  silently working. Run `idp::ident::conformance` against the backend, read from
+  the primary, or pass `with_store_verification(false)` for a store you fully
+  trust. See Security below.
 - Reuse one parsed document for enveloped signature policy checks and backend
   verification, eliminating two repeated top-level parses under the default
   policy. Preserve metadata parsing rules, guard order, per-signature results,
@@ -542,14 +549,17 @@ where needed to correct protocol handling.
   trust the `AssertionStore` to have scoped its answer. An assertion returned for a
   subject must be that subject's, and one returned for an ID must have that ID,
   otherwise a `StoreError`. A stale or wrongly keyed index would otherwise put one
-  subject's authentication statements into a response about another's.
+  subject's authentication statements into a response about another's. The check
+  binds the answer to the NameID value asked about; it does not authorize the
+  requester, which stays with the responder.
 - `Eptid` checks the shape of a value it reads from its cache: it must be
   `<idp>!<sp>!<opaque>`, otherwise a `StoreError`. The cache is trusted to return
   what was issued, which is its purpose, but a value of the wrong shape was not
   issued for this IdP and SP, and the realistic causes (a cache shared with another
   IdP or tenant, a key written by the wrong code, a restored or flushed cache)
   would otherwise hand the SP a permanently wrong identifier and remember it. A
-  forged value of the right shape is not detected, so the cache must still be
+  forged value of the right shape (including another user's value for the same
+  IdP and SP) is not detected, so the cache must still be
   private to this IdP and this secret, and must not evict. On by default;
   `Eptid::with_store_verification(false)` for a cache whose values were issued
   under an earlier IdP entity ID, or one you fully trust.
@@ -561,9 +571,11 @@ where needed to correct protocol handling.
   `StoreError`. A lookup that forgot the user in its `WHERE`, a wrong index or a
   stale cache could otherwise hand one user another user's persistent NameID,
   which is account takeover at every SP that has seen the value, with nothing
-  written to betray it. The check is in `IdentDb`, not in each store method, so no
-  path can skip it and it covers the default `find` / `find_durable` that filter
-  `for_user` - the path a minimal backend takes. It costs one `user_for` per
+  written to betray it. The check is in `IdentDb`, not in each store method, so
+  every lookup made through it is covered, including the default `find` /
+  `find_durable` that filter `for_user` (the path a minimal backend takes) and
+  `find_local_id`, which the NameIDMapping and ManageNameID handlers act on and
+  which must be confirmed by the owner's own `for_user` listing. It costs one `user_for` per
   record returned, and needs `user_for` to see the store's own writes. On by
   default; `IdentDb::with_store_verification(false)` skips it for a store you
   fully trust.

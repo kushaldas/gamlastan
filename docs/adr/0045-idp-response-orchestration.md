@@ -375,8 +375,10 @@ failure is a real protocol error rather than a silent per-integrator choice.
   `StoreError`. The uniqueness constraints stop a backend writing two identifiers
   for one slot; this stops a backend that *reads* the wrong user's record, which a
   Rust or Python backend with a lookup that forgot the user can do. It lives in
-  `IdentDb`, not in each store method, so no path (including the default `find` /
-  `find_durable` built on `for_user`) can skip it. Cost: one `user_for` per record
+  `IdentDb`, not in each store method, so every lookup made through it (including
+  the default `find` / `find_durable` built on `for_user`, and `find_local_id`,
+  which round-trips through `for_user`) is covered; code that reads the store
+  directly is not. Cost: one `user_for` per record
   returned, and `user_for` must see the store's own writes.
 
 - `Eptid` shape-checks a value read from its cache (`<idp>!<sp>!<opaque>`, on by
@@ -436,7 +438,7 @@ failure is a real protocol error rather than a silent per-integrator choice.
 ## Validation
 
 - `idp/orchestrator/tests.rs`: an authenticating authority that is empty, has no
-  scheme, contains whitespace or control characters or is too long is refused, from
+  scheme, contains whitespace, control or non-XML characters or is too long is refused, from
   an inline method and from a broker registration, and leaves no stored NameID;
   entity IDs and URNs are accepted.
 - `idp/assertion_store.rs`: a store that answers every subject lookup with another

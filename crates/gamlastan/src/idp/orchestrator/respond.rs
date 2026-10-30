@@ -161,8 +161,14 @@ const MAX_AUTHORITY_LEN: usize = 1024;
 /// An `AuthenticatingAuthority` is an `xs:anyURI` naming the authority that
 /// authenticated the principal, typically an entity ID. Accept an absolute URI
 /// (a scheme, then something), at most [`MAX_AUTHORITY_LEN`] bytes, with no
-/// whitespace or control characters. Anything else is a configuration fault: it
+/// whitespace, control or non-XML characters. Anything else is a configuration fault: it
 /// would be signed into the assertion as written.
+/// Whether `c` is a legal XML 1.0 character. U+FFFE and U+FFFF are not, and are
+/// not `char::is_control`, so they would otherwise be rewritten when serialised.
+fn is_xml_char(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}')
+}
+
 fn validate_authenticating_authority(authority: &str) -> Result<(), ProfileError> {
     let has_scheme = authority.split_once(':').is_some_and(|(scheme, rest)| {
         !rest.is_empty()
@@ -178,12 +184,12 @@ fn validate_authenticating_authority(authority: &str) -> Result<(), ProfileError
         || !has_scheme
         || authority
             .chars()
-            .any(|c| c.is_whitespace() || c.is_control())
+            .any(|c| c.is_whitespace() || c.is_control() || !is_xml_char(c))
     {
         return Err(ProfileError::Other(format!(
             "the authenticating authority {authority:?} (from AuthenticatedSubject or the \
-             AuthnBroker registration) is not a URI: it needs a scheme, no whitespace or \
-             control characters, and at most {MAX_AUTHORITY_LEN} bytes"
+             AuthnBroker registration) is not a URI: it needs a scheme, no whitespace, control or non-XML \
+             characters, and at most {MAX_AUTHORITY_LEN} bytes"
         )));
     }
     Ok(())
