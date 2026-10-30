@@ -379,6 +379,15 @@ failure is a real protocol error rather than a silent per-integrator choice.
   `find_durable` built on `for_user`) can skip it. Cost: one `user_for` per record
   returned, and `user_for` must see the store's own writes.
 
+- `Eptid` shape-checks a value read from its cache (`<idp>!<sp>!<opaque>`, on by
+  default, `Eptid::with_store_verification(false)` to skip), and
+  `idp::ident::kv_conformance` checks a `KeyValueStore` backend: read-your-writes,
+  exact keys, scoped removal, no eviction, and sound concurrent writes. The cache
+  exists so a later change of secret or digest cannot change what an SP already
+  knows, so a cache that loses or lags behind its own writes silently issues a
+  different identifier. It is trusted by design, so the check catches operational
+  faults, not forgery: the cache must be private to the IdP and must not evict.
+
 ## Alternatives considered
 
 - **Status quo -- leave orchestration to the integrator (ADR 0008's
@@ -403,6 +412,15 @@ failure is a real protocol error rather than a silent per-integrator choice.
   structure was not.
 
 ## Validation
+
+- `idp/eptid.rs`: a cached value of the wrong shape (another SP's, another IdP's,
+  arbitrary, empty opaque part) is refused by `get`, `name_id` and `attribute`; a
+  value of the right shape is used; verification can be turned off for values
+  issued under an earlier entity ID.
+- `idp/ident/kv_conformance.rs`: the suite passes on `InMemoryKeyValueStore` and is
+  verified to fail against a store that errors on a missing key, one that lags
+  behind its writes, one that folds case or matches prefixes, a `remove` that does
+  nothing, an evicting store, and one that merges concurrent values.
 
 - `idp/ident.rs`: a store whose `for_user` forgot the user cannot hand over
   another user's persistent NameID through `get_nameid`, `match_local_id`,

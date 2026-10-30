@@ -9,6 +9,15 @@ where needed to correct protocol handling.
 
 ### Added
 
+- Added `idp::ident::kv_conformance`, a reusable check that a `KeyValueStore`
+  backend (the `Eptid` cache) honours its contract: an absent key is `Ok(None)`,
+  values round-trip and are readable immediately after they are set, keys are
+  exact (no case folding or prefix matching), `remove` is scoped, issued values are
+  not evicted, and concurrent writers read their own writes and never leave a
+  merged value. Same shape as `ident::conformance` (`run`, `check`, `check_with`,
+  `check_one`, `CHECKS`), reusing its `ConformanceError` and `Options`. A cache that
+  loses or lags behind its own writes silently issues a different identifier, which
+  an SP maps to a different account.
 - Add a dependency-free `saml_pipeline` benchmark with deterministic signed
   fixtures and separate secure-parse, typed-extraction and verification
   measurements. This establishes a baseline without changing runtime behavior.
@@ -507,6 +516,16 @@ where needed to correct protocol handling.
 
 ### Security
 
+- `Eptid` checks the shape of a value it reads from its cache: it must be
+  `<idp>!<sp>!<opaque>`, otherwise a `StoreError`. The cache is trusted to return
+  what was issued, which is its purpose, but a value of the wrong shape was not
+  issued for this IdP and SP, and the realistic causes (a cache shared with another
+  IdP or tenant, a key written by the wrong code, a restored or flushed cache)
+  would otherwise hand the SP a permanently wrong identifier and remember it. A
+  forged value of the right shape is not detected, so the cache must still be
+  private to this IdP and this secret, and must not evict. On by default;
+  `Eptid::with_store_verification(false)` for a cache whose values were issued
+  under an earlier IdP entity ID, or one you fully trust.
 - `IdentDb` no longer trusts what its `IdentityStore` returns. Each record a
   lookup returns for a user (`name_ids_for`, `find_nameid`, `match_local_id`, and
   the reads inside `get_nameid`) must be one the store's `user_for` attributes to

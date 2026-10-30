@@ -170,6 +170,13 @@ impl NameIdFilter {
 /// Used where a mapping needs no cross-record atomicity, such as
 /// [`Eptid`](crate::idp::Eptid)'s deterministic eduPersonTargetedID cache.
 /// NameID storage needs stronger guarantees and uses [`IdentityStore`].
+///
+/// "No atomicity" is not "no contract". For the EPTID cache the store must return
+/// what was set (read-your-writes), treat keys exactly (no case folding or prefix
+/// matching), and never evict or expire a value, because an evicted identifier is
+/// re-derived and the re-derivation can differ from what the SP was given. Run
+/// [`kv_conformance`] against a real instance to check a backend. A failing call
+/// must be a [`StoreError`], never `Ok(None)`.
 pub trait KeyValueStore: Send + Sync {
     /// Fetch a value.
     fn get(&self, key: &str) -> Result<Option<String>, StoreError>;
@@ -1177,6 +1184,7 @@ pub(crate) fn to_hex(bytes: &[u8]) -> String {
 }
 
 pub mod conformance;
+pub mod kv_conformance;
 
 #[cfg(test)]
 mod tests {
