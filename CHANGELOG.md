@@ -9,6 +9,14 @@ where needed to correct protocol handling.
 
 ### Added
 
+- Added `idp::assertion_store::conformance`, a reusable check that an
+  `AssertionStore` backend honours its contract: absent assertions read as absent,
+  stored assertions round-trip, a subject lookup is exact and isolated, storing an
+  ID again does not duplicate it, storing it for another subject moves it (the old
+  subject's lookup must not return an assertion issued to someone else), removal
+  clears the subject index, and concurrent stores lose nothing and leave an ID
+  under one subject. Same shape as the other two suites (`run`, `check`,
+  `check_with`, `check_one`, `CHECKS`), reusing `ConformanceError` and `Options`.
 - Added `idp::ident::kv_conformance`, a reusable check that a `KeyValueStore`
   backend (the `Eptid` cache) honours its contract: an absent key is `Ok(None)`,
   values round-trip and are readable immediately after they are set, keys are
@@ -516,6 +524,12 @@ where needed to correct protocol handling.
 
 ### Security
 
+- The AssertionIDRequest and AuthnQuery helpers (`get_authn_statements`,
+  `create_assertion_id_request_response`, `create_authn_query_response`) no longer
+  trust the `AssertionStore` to have scoped its answer. An assertion returned for a
+  subject must be that subject's, and one returned for an ID must have that ID,
+  otherwise a `StoreError`. A stale or wrongly keyed index would otherwise put one
+  subject's authentication statements into a response about another's.
 - `Eptid` checks the shape of a value it reads from its cache: it must be
   `<idp>!<sp>!<opaque>`, otherwise a `StoreError`. The cache is trusted to return
   what was issued, which is its purpose, but a value of the wrong shape was not

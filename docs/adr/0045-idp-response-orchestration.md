@@ -388,6 +388,14 @@ failure is a real protocol error rather than a silent per-integrator choice.
   different identifier. It is trusted by design, so the check catches operational
   faults, not forgery: the cache must be private to the IdP and must not evict.
 
+- The AssertionIDRequest / AuthnQuery helpers verify what the `AssertionStore`
+  returns (an assertion for a subject must be that subject's, one for an ID must
+  have that ID), and `idp::assertion_store::conformance` checks a backend for the
+  rest: subject-index exactness, no duplicates, a re-stored ID moving between
+  subjects, removal clearing the index, and concurrent stores. The responders are
+  where assertions leave the IdP for a requester, so that is where a wrongly keyed
+  index must not be believed.
+
 ## Alternatives considered
 
 - **Status quo -- leave orchestration to the integrator (ADR 0008's
@@ -412,6 +420,15 @@ failure is a real protocol error rather than a silent per-integrator choice.
   structure was not.
 
 ## Validation
+
+- `idp/assertion_store.rs`: a store that answers every subject lookup with another
+  subject's assertions, or every ID lookup with another assertion, is refused by
+  `get_authn_statements`, `create_authn_query_response` and
+  `create_assertion_id_request_response`.
+- `idp/assertion_store/conformance.rs`: the suite passes on `InMemoryAssertionStore`
+  and is verified to fail against a stale subject index, a duplicating index, a
+  prefix-matching subject lookup, a `remove` that does nothing, an error on a missing
+  assertion, and a subject index with a lost-update race.
 
 - `idp/eptid.rs`: a cached value of the wrong shape (another SP's, another IdP's,
   arbitrary, empty opaque part) is refused by `get`, `name_id` and `attribute`; a
