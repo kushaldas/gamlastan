@@ -397,6 +397,11 @@ failure is a real protocol error rather than a silent per-integrator choice.
   the type and in the module docs; an engine switch to forbid `Inline` was
   considered and rejected (off by default it protects nobody, on by default it
   breaks the proxy shape this type exists for).
+- The authenticating authority reported by the application or a broker
+  registration is validated as an absolute URI when the response is built
+  (`AuthenticatingAuthority` is an `xs:anyURI` signed into the assertion), as a
+  `ProfileError` before anything is stored. It is checked at response time, not in
+  `AuthnBroker::add`, so the released signature is unchanged.
 - The AssertionIDRequest / AuthnQuery helpers verify what the `AssertionStore`
   returns (an assertion for a subject must be that subject's, one for an ID must
   have that ID), and `idp::assertion_store::conformance` checks a backend for the
@@ -430,6 +435,10 @@ failure is a real protocol error rather than a silent per-integrator choice.
 
 ## Validation
 
+- `idp/orchestrator/tests.rs`: an authenticating authority that is empty, has no
+  scheme, contains whitespace or control characters or is too long is refused, from
+  an inline method and from a broker registration, and leaves no stored NameID;
+  entity IDs and URNs are accepted.
 - `idp/assertion_store.rs`: a store that answers every subject lookup with another
   subject's assertions, or every ID lookup with another assertion, is refused by
   `get_authn_statements`, `create_authn_query_response` and

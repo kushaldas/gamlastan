@@ -524,6 +524,14 @@ where needed to correct protocol handling.
 
 ### Security
 
+- `create_authn_response` validates the authenticating authority it signs into the
+  assertion's `AuthenticatingAuthority` (an `xs:anyURI`): from an
+  `AuthnMethodRef::Inline` or from an `AuthnBroker` registration, it must be an
+  absolute URI - a scheme, nothing after it empty, no whitespace or control
+  characters, at most 1024 bytes - otherwise a `ProfileError` before anything is
+  stored. Before, any string was written into the signed assertion as given. The
+  check is at response time, so the released `AuthnBroker::add` signature is
+  unchanged.
 - Documented that the engine verifies nothing about the authentication method the
   application reports: an `AuthnMethodRef::Inline` class ref satisfies an `exact`
   `RequestedAuthnContext` by matching the request, so building it from the request

@@ -44,7 +44,11 @@ pub enum AuthnMethodRef {
     Inline {
         /// The AuthnContext class ref to report.
         class_ref: String,
-        /// The authenticating authority to report, if not this IdP.
+        /// The authenticating authority to report, if not this IdP. It is written
+        /// into the signed assertion as an `AuthenticatingAuthority` (`xs:anyURI`),
+        /// so `create_authn_response` refuses one that is not an absolute URI (a
+        /// scheme, no whitespace or control characters, at most 1024 bytes) with a
+        /// `ProfileError`, the same for a broker registration's authority.
         authn_authority: Option<String>,
     },
     /// A reference to a method registered in the broker.
