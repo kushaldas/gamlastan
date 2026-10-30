@@ -234,6 +234,14 @@ impl KeyValueStore for InMemoryKeyValueStore {
 /// [`StoreError`], never an empty result: "no record" and "could not look"
 /// are different answers, and conflating them would mint a second durable
 /// identifier for a user who already has one.
+///
+/// [`IdentDb`] does not trust the answers either. Each record a lookup returns
+/// for a user must be one the store's own `user_for` attributes to that user, and
+/// a durable lookup must return the slot that was asked for, otherwise the call
+/// is a [`StoreError`] (see [`IdentDb::with_store_verification`]). A backend that
+/// returns another user's record from `for_user`, `find`, `find_durable` or
+/// `get_or_insert_durable` is therefore refused, not believed; `user_for` must see
+/// the store's own writes (read-your-writes), not a lagging replica.
 pub trait IdentityStore: Send + Sync {
     /// Every NameID associated with `user_id`, in unspecified order.
     fn for_user(&self, user_id: &str) -> Result<Vec<NameId>, StoreError>;
@@ -588,6 +596,9 @@ pub struct IdentDb<S: IdentityStore = InMemoryIdentityStore> {
     /// Also store transient NameIDs (off by default; see
     /// [`with_persist_transient`](Self::with_persist_transient)).
     persist_transient: bool,
+    /// Check what the store hands back (on by default; see
+    /// [`with_store_verification`](Self::with_store_verification)).
+    verify_store: bool,
 }
 
 impl IdentDb<InMemoryIdentityStore> {
@@ -605,6 +616,7 @@ impl<S: IdentityStore> IdentDb<S> {
             name_qualifier: idp_entity_id.into(),
             domain: None,
             persist_transient: false,
+            verify_store: true,
         }
     }
 
@@ -638,19 +650,130 @@ impl<S: IdentityStore> IdentDb<S> {
         self
     }
 
+    /// Check every record the store returns for a user (default: **on**).
+    ///
+    /// A NameID handed to the wrong user is account takeover at every SP that has
+    /// seen the value, and the store is the part of the system least under this
+    /// crate's control: a lookup that forgot the user in its `WHERE`, a wrong
+    /// index or a stale cache would otherwise return one user's persistent NameID
+    /// for another, with nothing written to betray it. So each record a lookup
+    /// returns must be this user's own - the store's `user_for` must attribute its
+    /// value to the user - and a durable lookup must return the slot that was
+    /// asked for. Anything else is a [`StoreError`], not a result.
+    ///
+    /// The check lives here, not in each store method, so no path can skip it and
+    /// it covers every backend, including the default `find` / `find_durable`
+    /// that filter [`for_user`](IdentityStore::for_user). It costs one `user_for`
+    /// per record returned, and it needs `user_for` to see the store's own writes
+    /// (not a lagging replica).
+    ///
+    /// Pass `false` for a store you fully trust, such as
+    /// [`InMemoryIdentityStore`], to skip the extra reads.
+    pub fn with_store_verification(mut self, verify: bool) -> Self {
+        self.verify_store = verify;
+        self
+    }
+
+    /// The store must attribute `record`'s value to `user_id`.
+    fn verify_attributed(
+        &self,
+        user_id: &str,
+        record: &NameId,
+        call: &str,
+    ) -> Result<(), StoreError> {
+        if !self.verify_store {
+            return Ok(());
+        }
+        match self.store.user_for(&record.value)? {
+            Some(owner) if owner == user_id => Ok(()),
+            _ => Err(StoreError::new(format!(
+                "the store's {call} returned a NameID that it does not attribute to this \
+                 user; refusing to use it"
+            ))),
+        }
+    }
+
+    /// A durable record the store returned must be the slot that was asked for,
+    /// and this user's own.
+    fn verify_durable_record(
+        &self,
+        user_id: &str,
+        record: &NameId,
+        slot: (Option<&str>, Option<&str>, &str),
+        call: &str,
+    ) -> Result<(), StoreError> {
+        if !self.verify_store {
+            return Ok(());
+        }
+        let (spq, nq, format) = slot;
+        if !is_durable_match(record, spq, nq, format) {
+            return Err(StoreError::new(format!(
+                "the store's {call} returned a record that is not the durable NameID \
+                 requested (format {format:?}, SPNameQualifier {spq:?}, NameQualifier \
+                 {nq:?}); refusing to use it"
+            )));
+        }
+        self.verify_attributed(user_id, record, call)
+    }
+
+    /// `find_durable`, with the returned record verified.
+    fn find_durable_checked(
+        &self,
+        user_id: &str,
+        sp_name_qualifier: Option<&str>,
+        name_qualifier: Option<&str>,
+        format: &str,
+    ) -> Result<Option<NameId>, StoreError> {
+        let found = self
+            .store
+            .find_durable(user_id, sp_name_qualifier, name_qualifier, format)?;
+        if let Some(record) = &found {
+            self.verify_durable_record(
+                user_id,
+                record,
+                (sp_name_qualifier, name_qualifier, format),
+                "find_durable",
+            )?;
+        }
+        Ok(found)
+    }
+
     /// The NameIDs stored for a local user that satisfy `filter` (pysaml2
     /// `find_nameid()`).
+    ///
+    /// With store verification on (the default, see
+    /// [`with_store_verification`](Self::with_store_verification)) every record
+    /// must satisfy the filter and be the user's own.
     pub fn find_nameid(
         &self,
         user_id: &str,
         filter: &NameIdFilter,
     ) -> Result<Vec<NameId>, StoreError> {
-        self.store.find(user_id, filter)
+        let found = self.store.find(user_id, filter)?;
+        if self.verify_store {
+            for record in &found {
+                if !filter.matches(record) {
+                    return Err(StoreError::new(
+                        "the store's find returned a record that does not satisfy the \
+                         filter; refusing to use it",
+                    ));
+                }
+                self.verify_attributed(user_id, record, "find")?;
+            }
+        }
+        Ok(found)
     }
 
     /// All NameIDs stored for a local user.
+    ///
+    /// With store verification on (the default) every record must be the user's
+    /// own.
     pub fn name_ids_for(&self, user_id: &str) -> Result<Vec<NameId>, StoreError> {
-        self.store.for_user(user_id)
+        let records = self.store.for_user(user_id)?;
+        for record in &records {
+            self.verify_attributed(user_id, record, "for_user")?;
+        }
+        Ok(records)
     }
 
     /// Associate a NameID with a local user (pysaml2 `store()`), replacing
@@ -689,7 +812,7 @@ impl<S: IdentityStore> IdentDb<S> {
         sp_name_qualifier: Option<&str>,
         name_qualifier: Option<&str>,
     ) -> Result<Option<NameId>, StoreError> {
-        self.store.find_durable(
+        self.find_durable_checked(
             user_id,
             sp_name_qualifier,
             name_qualifier,
@@ -774,8 +897,7 @@ impl<S: IdentityStore> IdentDb<S> {
         let durable = format != constants::NAMEID_TRANSIENT;
         if durable {
             if let Some(existing) =
-                self.store
-                    .find_durable(user_id, sp_name_qualifier, name_qualifier, format)?
+                self.find_durable_checked(user_id, sp_name_qualifier, name_qualifier, format)?
             {
                 return Ok(existing);
             }
@@ -794,7 +916,17 @@ impl<S: IdentityStore> IdentDb<S> {
 
             if durable {
                 match self.store.get_or_insert_durable(user_id, name_id) {
-                    Ok(winner) => return Ok(winner),
+                    Ok(winner) => {
+                        // Whether it inserted the candidate or returned an
+                        // existing record, it must be this user's own slot.
+                        self.verify_durable_record(
+                            user_id,
+                            &winner,
+                            (sp_name_qualifier, name_qualifier, format),
+                            "get_or_insert_durable",
+                        )?;
+                        return Ok(winner);
+                    }
                     Err(InsertError::ValueTaken) => continue,
                     Err(InsertError::Store(e)) => return Err(e),
                     // It must hand back the existing record, never refuse.
@@ -2213,5 +2345,140 @@ mod tests {
             .unwrap();
         assert!(nid.value.contains('@'));
         assert_eq!(db.find_local_id(&nid).unwrap().as_deref(), Some("alice"));
+    }
+
+    /// A backend with the defects the verification exists for: a `for_user` that
+    /// forgot its `WHERE user_id` (which the default `find` / `find_durable` build
+    /// on), and an optional `get_or_insert_durable` that hands back a named
+    /// user's record. Everything else delegates to a correct store.
+    #[derive(Default)]
+    struct LeakyStore {
+        inner: InMemoryIdentityStore,
+        leak_for_user: bool,
+        hijack_get_or_insert: Option<String>,
+    }
+
+    impl IdentityStore for LeakyStore {
+        fn for_user(&self, user_id: &str) -> Result<Vec<NameId>, StoreError> {
+            if self.leak_for_user {
+                // Every user's records, whoever asked.
+                let mut all = Vec::new();
+                for user in ["victim", "mallory"] {
+                    all.extend(self.inner.for_user(user)?);
+                }
+                return Ok(all);
+            }
+            self.inner.for_user(user_id)
+        }
+        fn user_for(&self, value: &str) -> Result<Option<String>, StoreError> {
+            self.inner.user_for(value)
+        }
+        fn get_or_insert_durable(
+            &self,
+            user_id: &str,
+            candidate: NameId,
+        ) -> Result<NameId, InsertError> {
+            if let Some(victim) = &self.hijack_get_or_insert {
+                return Ok(self.inner.for_user(victim)?.remove(0));
+            }
+            self.inner.get_or_insert_durable(user_id, candidate)
+        }
+        fn insert(&self, user_id: &str, name_id: NameId) -> Result<(), InsertError> {
+            self.inner.insert(user_id, name_id)
+        }
+        fn replace(&self, user_id: &str, name_id: NameId) -> Result<(), InsertError> {
+            self.inner.replace(user_id, name_id)
+        }
+        fn remove(&self, value: &str) -> Result<(), StoreError> {
+            self.inner.remove(value)
+        }
+        fn remove_all(&self, user_id: &str) -> Result<(), StoreError> {
+            self.inner.remove_all(user_id)
+        }
+    }
+
+    fn leaky_with_victim(configure: impl FnOnce(&mut LeakyStore)) -> IdentDb<LeakyStore> {
+        let mut store = LeakyStore::default();
+        store
+            .inner
+            .insert("victim", persistent_nid("victim-value", SP))
+            .unwrap();
+        configure(&mut store);
+        IdentDb::new(store, IDP)
+    }
+
+    #[test]
+    fn a_for_user_that_forgot_the_user_cannot_hand_over_a_persistent_nameid() {
+        // The store defines neither `find` nor `find_durable`, so the trait
+        // defaults filter its (leaky) `for_user`: the path a minimal backend takes.
+        let db = leaky_with_victim(|s| s.leak_for_user = true);
+        let err = db
+            .get_nameid("mallory", constants::NAMEID_PERSISTENT, Some(SP), Some(IDP))
+            .unwrap_err();
+        assert!(err.to_string().contains("does not attribute"), "{err}");
+        assert!(db.name_ids_for("mallory").is_err());
+        assert!(db.match_local_id("mallory", Some(SP), Some(IDP)).is_err());
+        assert!(db.find_nameid("mallory", &NameIdFilter::default()).is_err());
+    }
+
+    #[test]
+    fn a_get_or_insert_durable_that_returns_another_users_record_is_refused() {
+        let db = leaky_with_victim(|s| s.hijack_get_or_insert = Some("victim".to_string()));
+        let err = db
+            .get_nameid("mallory", constants::NAMEID_PERSISTENT, Some(SP), Some(IDP))
+            .unwrap_err();
+        assert!(err.to_string().contains("does not attribute"), "{err}");
+    }
+
+    #[test]
+    fn a_durable_lookup_that_returns_the_wrong_slot_is_refused() {
+        // The store answers for the right user but the wrong SP.
+        let db = leaky_with_victim(|s| s.hijack_get_or_insert = Some("victim".to_string()));
+        let other_sp = "https://other.example.com";
+        let err = db
+            .get_nameid(
+                "victim",
+                constants::NAMEID_PERSISTENT,
+                Some(other_sp),
+                Some(IDP),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("not the durable NameID"), "{err}");
+    }
+
+    #[test]
+    fn turning_verification_off_trusts_the_store() {
+        let db = leaky_with_victim(|s| s.leak_for_user = true).with_store_verification(false);
+        let stolen = db
+            .get_nameid("mallory", constants::NAMEID_PERSISTENT, Some(SP), Some(IDP))
+            .expect("unverified: the leak goes through");
+        assert_eq!(stolen.value, "victim-value");
+    }
+
+    #[test]
+    fn verification_does_not_disturb_an_honest_store() {
+        let db = IdentDb::in_memory(IDP);
+        let first = db
+            .get_nameid("alice", constants::NAMEID_PERSISTENT, Some(SP), Some(IDP))
+            .unwrap();
+        let again = db
+            .get_nameid("alice", constants::NAMEID_PERSISTENT, Some(SP), Some(IDP))
+            .unwrap();
+        assert_eq!(first.value, again.value);
+        assert_eq!(db.name_ids_for("alice").unwrap().len(), 1);
+        assert_eq!(
+            db.find_nameid("alice", &NameIdFilter::default())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(db
+            .match_local_id("alice", Some(SP), Some(IDP))
+            .unwrap()
+            .is_some());
+        assert!(db
+            .match_local_id("bob", Some(SP), Some(IDP))
+            .unwrap()
+            .is_none());
     }
 }

@@ -505,6 +505,23 @@ where needed to correct protocol handling.
   `Configuration` error, not relabelled, since that would sign the session
   user's NameID over another user's attributes.
 
+### Security
+
+- `IdentDb` no longer trusts what its `IdentityStore` returns. Each record a
+  lookup returns for a user (`name_ids_for`, `find_nameid`, `match_local_id`, and
+  the reads inside `get_nameid`) must be one the store's `user_for` attributes to
+  that user, and a durable lookup must return the `(SPNameQualifier,
+  NameQualifier, format)` slot that was asked for; otherwise the call fails with a
+  `StoreError`. A lookup that forgot the user in its `WHERE`, a wrong index or a
+  stale cache could otherwise hand one user another user's persistent NameID,
+  which is account takeover at every SP that has seen the value, with nothing
+  written to betray it. The check is in `IdentDb`, not in each store method, so no
+  path can skip it and it covers the default `find` / `find_durable` that filter
+  `for_user` - the path a minimal backend takes. It costs one `user_for` per
+  record returned, and needs `user_for` to see the store's own writes. On by
+  default; `IdentDb::with_store_verification(false)` skips it for a store you
+  fully trust.
+
 ## [0.9.1] - 2026-09-29
 
 ### Changed

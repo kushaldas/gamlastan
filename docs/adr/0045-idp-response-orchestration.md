@@ -368,6 +368,17 @@ failure is a real protocol error rather than a silent per-integrator choice.
   above), so `find_local_id` on one finds nothing unless
   `IdentDb::with_persist_transient` is set.
 
+- `IdentDb` verifies what the store returns (on by default,
+  `IdentDb::with_store_verification(false)` to skip): every record a lookup
+  returns for a user must be attributed to that user by the store's `user_for`,
+  and a durable lookup must return the slot that was asked for, else a
+  `StoreError`. The uniqueness constraints stop a backend writing two identifiers
+  for one slot; this stops a backend that *reads* the wrong user's record, which a
+  Rust or Python backend with a lookup that forgot the user can do. It lives in
+  `IdentDb`, not in each store method, so no path (including the default `find` /
+  `find_durable` built on `for_user`) can skip it. Cost: one `user_for` per record
+  returned, and `user_for` must see the store's own writes.
+
 ## Alternatives considered
 
 - **Status quo -- leave orchestration to the integrator (ADR 0008's
@@ -392,6 +403,12 @@ failure is a real protocol error rather than a silent per-integrator choice.
   structure was not.
 
 ## Validation
+
+- `idp/ident.rs`: a store whose `for_user` forgot the user cannot hand over
+  another user's persistent NameID through `get_nameid`, `match_local_id`,
+  `find_nameid` or `name_ids_for`, and neither can a `get_or_insert_durable` that
+  returns another user's record or the wrong slot; with verification off the leak
+  goes through; an honest store is unaffected.
 
 - `idp/orchestrator/tests.rs`: `Denial::status()` exhaustive; `AttributeRelease`
   impls incl. `ChainedRelease` ordering; the ForceAuthn/IsPassive/
