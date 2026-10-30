@@ -258,7 +258,15 @@ fn missing_assertion_is_absent<S: AssertionStore>(s: &S) -> Outcome {
 
 /// What was stored is found by its ID, readable immediately.
 fn store_then_get_round_trips<S: AssertionStore>(s: &S) -> Outcome {
-    store(s, fixture("_a1", "alice", "_s1"))?;
+    // The expected expiry comes from the very value that is stored, captured now:
+    // the tolerance below must measure timestamp rounding, not backend latency.
+    let original = fixture("_a1", "alice", "_s1");
+    let expected = original
+        .conditions
+        .as_ref()
+        .and_then(|c| c.not_on_or_after)
+        .expect("the fixture has a bounded window");
+    store(s, original)?;
     store(s, fixture("_b1", "bob", "_s2"))?;
     // With more than one assertion stored, each ID must return its own: a backend
     // that checks the ID exists but then fetches "the" assertion would pass with one.
@@ -311,23 +319,35 @@ fn store_then_get_round_trips<S: AssertionStore>(s: &S) -> Outcome {
     // The validity window is what lets `get_authn_statements` use the assertion at
     // all: one without a bounded NotOnOrAfter is silently dropped there. Real
     // backends round timestamps, so allow a second.
-    let expected = fixture("_a1", "alice", "_s1")
-        .conditions
-        .and_then(|c| c.not_on_or_after)
-        .expect("the fixture has a bounded window");
     let listed = step("assertions_for_subject", s.assertions_for_subject("alice"))?;
     for (path, a) in [
         ("get_assertion", Some(got)),
         ("assertions_for_subject", listed.into_iter().next()),
     ] {
+        let Some(a) = a else {
+            return Err(format!("{path} returned no assertion for alice"));
+        };
         let kept = a
-            .and_then(|a| a.conditions)
+            .conditions
+            .as_ref()
             .and_then(|c| c.not_on_or_after)
             .is_some_and(|got| (got - expected).num_seconds().abs() <= 1);
         if !kept {
             return Err(format!(
                 "{path} lost or changed the assertion's Conditions NotOnOrAfter (within one \
                  second); get_authn_statements ignores an assertion without a bounded window"
+            ));
+        }
+        // `get_authn_statements` reads the statements off what the subject listing
+        // returns: an assertion that comes back without them answers NoAuthnContext.
+        let session = a
+            .authn_statements
+            .first()
+            .and_then(|st| st.session_index.as_deref());
+        if session != Some("_s1") {
+            return Err(format!(
+                "{path} lost or changed the assertion's authentication statement; \
+                 get_authn_statements and AuthnQuery depend on it"
             ));
         }
     }
@@ -539,6 +559,8 @@ mod tests {
         get_wrong_one: bool,
         /// Look subjects up lower-cased, storing them unchanged.
         fold_lookup: bool,
+        /// List assertions without their authentication statements.
+        strip_listed_statements: bool,
     }
 
     impl AssertionStore for Bent {
@@ -609,6 +631,11 @@ mod tests {
             if self.blank_subject {
                 for a in &mut out {
                     a.subject = None;
+                }
+            }
+            if self.strip_listed_statements {
+                for a in &mut out {
+                    a.authn_statements.clear();
                 }
             }
             if self.repeat_first {
@@ -707,6 +734,14 @@ mod tests {
     fn a_backend_that_drops_the_validity_window_is_caught() {
         fails("store_then_get_round_trips", || Bent {
             strip_conditions: true,
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn a_listing_without_authentication_statements_is_caught() {
+        fails("store_then_get_round_trips", || Bent {
+            strip_listed_statements: true,
             ..Default::default()
         });
     }
