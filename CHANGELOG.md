@@ -524,6 +524,11 @@ where needed to correct protocol handling.
 
 ### Security
 
+- Documented that the engine verifies nothing about the authentication method the
+  application reports: an `AuthnMethodRef::Inline` class ref satisfies an `exact`
+  `RequestedAuthnContext` by matching the request, so building it from the request
+  signs a context that was never established. The warning is on `Inline`, on
+  `AuthenticatedSubject::authn_method` and in the `idp::orchestrator` module docs.
 - The AssertionIDRequest and AuthnQuery helpers (`get_authn_statements`,
   `create_assertion_id_request_response`, `create_authn_query_response`) no longer
   trust the `AssertionStore` to have scoped its answer. An assertion returned for a

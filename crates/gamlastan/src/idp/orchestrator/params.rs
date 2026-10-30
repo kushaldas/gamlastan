@@ -30,6 +30,17 @@ pub enum AuthnMethodRef {
     ///
     /// For a proxy that already knows the upstream authority, or an IdP whose
     /// login flow does not go through the broker.
+    ///
+    /// **The engine verifies nothing about an inline class ref.** For
+    /// `Comparison="exact"` it satisfies the request by *matching the request*, so
+    /// an application that builds it from the `AuthnRequest` signs an assertion
+    /// claiming an authentication context that was never established. Build it from
+    /// what the login flow actually did: a constant, or the upstream IdP's reported
+    /// context in a proxy; never from the request. (A [`BrokerReference`] is held to
+    /// the broker's registration, but is still the application's claim about which
+    /// method ran.)
+    ///
+    /// [`BrokerReference`]: AuthnMethodRef::BrokerReference
     Inline {
         /// The AuthnContext class ref to report.
         class_ref: String,
@@ -82,7 +93,9 @@ pub struct AuthenticatedSubject {
     pub subject_id: String,
     /// The subject's attributes, pre-release and unfiltered.
     pub attributes: Vec<Attribute>,
-    /// The authentication method that actually ran.
+    /// The authentication method that actually ran. The engine takes this on trust
+    /// (see [`AuthnMethodRef::Inline`]): it checks it against the request, not
+    /// against what really happened.
     pub authn_method: AuthnMethodRef,
     /// When the principal authenticated to the IdP. `None` means "now" (a
     /// fresh login); set the session's authentication time when reusing a

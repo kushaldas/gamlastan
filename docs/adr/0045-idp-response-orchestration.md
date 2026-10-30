@@ -388,6 +388,15 @@ failure is a real protocol error rather than a silent per-integrator choice.
   different identifier. It is trusted by design, so the check catches operational
   faults, not forgery: the cache must be private to the IdP and must not evict.
 
+- The engine takes the authentication method the application reports on trust.
+  `check_request` offers the methods that would satisfy the request and
+  `create_authn_response` re-checks the one reported against it, but neither can
+  know what really authenticated the user. An `AuthnMethodRef::Inline` class ref
+  therefore satisfies an `exact` request by matching the request, so it must be
+  built from what the login flow did, never from the `AuthnRequest`. Documented on
+  the type and in the module docs; an engine switch to forbid `Inline` was
+  considered and rejected (off by default it protects nobody, on by default it
+  breaks the proxy shape this type exists for).
 - The AssertionIDRequest / AuthnQuery helpers verify what the `AssertionStore`
   returns (an assertion for a subject must be that subject's, one for an ID must
   have that ID), and `idp::assertion_store::conformance` checks a backend for the
