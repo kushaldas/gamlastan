@@ -3,7 +3,7 @@
 // These functions simplify namespace-aware element lookup and attribute extraction
 // when deserializing SAML XML using the uppsala library.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, TimeDelta, TimeZone, Utc};
 use uppsala::{Document, NodeId};
 
 use crate::xml::error::XmlError;
@@ -115,6 +115,26 @@ pub fn parse_datetime(s: &str) -> Result<DateTime<Utc>, XmlError> {
 /// Format a `DateTime<Utc>` as xs:dateTime string (ISO 8601 / RFC 3339).
 pub fn format_datetime(dt: &DateTime<Utc>) -> String {
     dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// The last instant [`format_datetime`] writes as a valid `xs:dateTime`.
+///
+/// `chrono` has dates far past year 9999, but it formats them as `+262142-12-31...`,
+/// which is not an `xs:dateTime` and which [`parse_datetime`] rejects. A date that
+/// is going into a document must therefore stay within years 0000-9999.
+pub(crate) fn latest_wire_instant() -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(9999, 12, 31, 23, 59, 59)
+        .single()
+        .expect("9999-12-31T23:59:59Z is a valid instant")
+}
+
+/// `start + length`, if the result can be written as an `xs:dateTime` (years
+/// 0000-9999). `None` for an overflow, an underflow, or a date `chrono` has but the
+/// wire format cannot carry.
+pub(crate) fn checked_wire_add(start: DateTime<Utc>, length: TimeDelta) -> Option<DateTime<Utc>> {
+    start
+        .checked_add_signed(length)
+        .filter(|date| (0..=9999).contains(&date.year()))
 }
 
 /// Parse an optional boolean attribute value.

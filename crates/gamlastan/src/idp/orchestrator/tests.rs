@@ -2344,7 +2344,7 @@ fn a_lifetime_too_long_to_add_is_refused_before_a_durable_nameid_is_stored() {
                 true,
             ));
             let err = create_authn_response(engine, &p, &subject_without_mail()).unwrap_err();
-            assert!(err.to_string().contains("too long"), "{what}: {err}");
+            assert!(err.to_string().contains("years 0000-9999"), "{what}: {err}");
             assert!(
                 idents.name_ids_for("alice").unwrap().is_empty(),
                 "{what}: nothing may be stored for a response that is not issued"
@@ -2371,7 +2371,7 @@ fn an_authn_instant_at_the_end_of_time_is_refused_not_a_panic() {
             ..subject_without_mail()
         };
         let err = create_authn_response(engine, &p, &subject).unwrap_err();
-        assert!(err.to_string().contains("too long"), "{err}");
+        assert!(err.to_string().contains("years 0000-9999"), "{err}");
         assert!(idents.name_ids_for("alice").unwrap().is_empty());
     });
 }
@@ -2398,5 +2398,98 @@ fn a_session_lifetime_too_long_to_add_does_not_panic_check_request() {
         });
         let d = check_request(engine, &p, Some(&s));
         assert!(matches!(d, Disposition::ReuseSession { .. }), "{d:?}");
+    });
+}
+
+/// `chrono` holds dates far past year 9999 but writes them as `+11526-...`, which is
+/// not an `xs:dateTime`, so a response carrying one could not be read back. The
+/// limit is what a document can hold, not what `chrono` can add.
+#[test]
+fn an_expiry_past_year_9999_is_refused_though_chrono_can_hold_it() {
+    use crate::idp::policy::PolicyEntry;
+    // About 9 500 years: fine for `chrono`, not for the wire.
+    let decisions = ReleasePolicy::with_default(
+        PolicyEntry::new().with_session_lifetime(TimeDelta::seconds(300_000_000_000)),
+    );
+    with_engine(&decisions, |engine, idents| {
+        let p = params(processed_with_name_id_policy(
+            Some(constants::NAMEID_PERSISTENT),
+            None,
+            true,
+        ));
+        let err = create_authn_response(engine, &p, &subject_without_mail()).unwrap_err();
+        assert!(err.to_string().contains("years 0000-9999"), "{err}");
+        assert!(idents.name_ids_for("alice").unwrap().is_empty());
+    });
+    // A long but writable lifetime is issued.
+    let decisions = ReleasePolicy::with_default(
+        PolicyEntry::new().with_session_lifetime(TimeDelta::days(365 * 100)),
+    );
+    with_engine(&decisions, |engine, _| {
+        let p = params(processed(false, false, vec![], None));
+        let outcome = create_authn_response(engine, &p, &subject_without_mail()).unwrap();
+        assert!(matches!(outcome, ResponseOutcome::Issued(_)));
+    });
+}
+
+/// `checked_add_signed` is `None` for an underflow as well as an overflow. A session
+/// whose lifetime is hugely negative expired long ago, and must not be treated like
+/// one that expires in the far future.
+#[test]
+fn a_hugely_negative_session_lifetime_does_not_make_a_session_reusable() {
+    use crate::idp::policy::PolicyEntry;
+    let decisions = ReleasePolicy::with_default(
+        PolicyEntry::new().with_session_lifetime(TimeDelta::seconds(-9_000_000_000_000)),
+    );
+    with_engine(&decisions, |engine, _| {
+        let s = session(AuthnMethodRef::Inline {
+            class_ref: PASSWORD.to_string(),
+            authn_authority: None,
+        });
+        // Not reused: a fresh login is asked for...
+        let p = params(processed(false, false, vec![PASSWORD], None));
+        let d = check_request(engine, &p, Some(&s));
+        assert!(matches!(d, Disposition::Authenticate { .. }), "{d:?}");
+        // ...and a passive request that would need the session is refused.
+        let p = params(processed(false, true, vec![PASSWORD], None));
+        let d = check_request(engine, &p, Some(&s));
+        assert!(
+            matches!(
+                d,
+                Disposition::Deny {
+                    denial: crate::idp::orchestrator::Denial::NoPassive
+                }
+            ),
+            "{d:?}"
+        );
+    });
+}
+
+#[test]
+fn a_reused_session_with_a_hugely_negative_lifetime_is_refused_as_expired() {
+    use crate::idp::orchestrator::AuthenticatedSubject;
+    use crate::idp::policy::PolicyEntry;
+    let decisions = ReleasePolicy::with_default(
+        PolicyEntry::new().with_session_lifetime(TimeDelta::seconds(-9_000_000_000_000)),
+    );
+    with_engine(&decisions, |engine, idents| {
+        let p = params(processed_with_name_id_policy(
+            Some(constants::NAMEID_PERSISTENT),
+            None,
+            true,
+        ));
+        let subject = AuthenticatedSubject {
+            authn_instant: Some(Utc::now()),
+            ..subject_without_mail()
+        };
+        let outcome = create_authn_response(engine, &p, &subject).unwrap();
+        assert!(matches!(
+            outcome,
+            ResponseOutcome::Denied {
+                denial: crate::idp::orchestrator::Denial::AuthnFailed,
+                ..
+            }
+        ));
+        assert!(idents.name_ids_for("alice").unwrap().is_empty());
     });
 }

@@ -487,12 +487,17 @@ where needed to correct protocol handling.
   time (from the application, e.g. `authn_instant`) overflowed from about 8.2e12
   seconds, taking down the request thread. `create_authn_response` now works out
   the assertion and session expiry dates up front, with checked arithmetic, and
-  returns a `ProfileError` before anything is stored when either cannot be
-  represented. A session whose expiry is too far out to represent has not reached
-  it, so `check_request` treats it as reusable and `create_authn_response` does
-  not refuse it as expired. `profiles::sso::idp::create_response`, which is
-  infallible, now saturates the assertion's `NotOnOrAfter` at the last
-  representable date instead of panicking; and an `assertion_lifetime_seconds`
+  returns a `ProfileError` before anything is stored when either is not a date a
+  response can carry. That is years 0000-9999, not `chrono`'s wider range:
+  `chrono` writes later dates as `+262142-12-31...`, which is not an `xs:dateTime`
+  and which `parse_datetime` rejects. For the session-reuse checks an expiry that
+  cannot be held is judged by direction: past the last date it has not been
+  reached, so `check_request` treats the session as reusable and
+  `create_authn_response` does not refuse it as expired; before the first date (a
+  hugely negative lifetime) it long ago passed, so the session is not reusable and
+  is refused as expired. `profiles::sso::idp::create_response`, which is
+  infallible, now saturates the assertion's `NotOnOrAfter` at
+  9999-12-31T23:59:59Z instead of panicking; and an `assertion_lifetime_seconds`
   above `i64::MAX`, which the old `as i64` cast wrapped into a negative lifetime
   and so an already-expired assertion, saturates the same way.
 - `IdentDb::match_local_id` (persistent NameID lookup) now matches only a

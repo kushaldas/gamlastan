@@ -17,6 +17,7 @@ use crate::idp::policy::{sp_attribute_requirements, PolicyError, ReleasePolicy};
 use crate::profiles::error::ProfileError;
 use crate::profiles::sso::idp::{create_error_response, create_response, sign_response_xml_with};
 use crate::profiles::sso::web_browser::{ResponseOptions, ResponseTimes};
+use crate::xml::helpers::checked_wire_add;
 use crate::xml::serialize::SamlSerialize;
 
 use super::denial::Denial;
@@ -107,9 +108,7 @@ pub fn check_request(
     // An expiry too far out to represent is one that has not been reached;
     // `create_authn_response` reports the configuration fault when it issues.
     let reusable = session.filter(|s| {
-        s.authn_instant
-            .checked_add_signed(session_lifetime)
-            .is_none_or(|expiry| now < expiry)
+        !has_expired(s.authn_instant, session_lifetime, now)
             && !processed.force_authn
             && session_satisfies(engine.broker, requested.as_ref(), s)
     });
@@ -179,13 +178,26 @@ fn expiry(
     start: DateTime<Utc>,
     length: TimeDelta,
 ) -> Result<DateTime<Utc>, ProfileError> {
-    start.checked_add_signed(length).ok_or_else(|| {
+    checked_wire_add(start, length).ok_or_else(|| {
         ProfileError::Other(format!(
-            "the {what} of {} seconds is too long: adding it to {start} does not give a \
-             date that can be represented, so no response is issued",
+            "the {what} of {} seconds cannot be added to {start}: the result is not a date \
+             a response can carry (years 0000-9999), so no response is issued",
             length.num_seconds()
         ))
     })
+}
+
+/// Whether `start + length` is at or before `now`.
+///
+/// For a sum `chrono` cannot hold, the direction decides: past the last date with a
+/// positive `length` is an expiry that has not been reached; before the first date
+/// with a negative `length` is one long gone. Treating both alike would make a
+/// session with a hugely negative lifetime look unexpired.
+fn has_expired(start: DateTime<Utc>, length: TimeDelta, now: DateTime<Utc>) -> bool {
+    match start.checked_add_signed(length) {
+        Some(expiry) => expiry <= now,
+        None => length < TimeDelta::zero(),
+    }
 }
 
 /// Whether `c` is a legal XML 1.0 character. U+FFFE and U+FFFF are not, and are
@@ -431,10 +443,7 @@ pub fn create_authn_response(
     // by every SP validator, so refuse it here, before anything is stored.
     if let Some(authn_instant) = subject.authn_instant {
         let session_lifetime = engine.decisions.session_lifetime(&processed.sp_entity_id);
-        if authn_instant
-            .checked_add_signed(session_lifetime)
-            .is_some_and(|expiry| expiry <= Utc::now())
-        {
+        if has_expired(authn_instant, session_lifetime, Utc::now()) {
             return denied(engine, params, &Denial::AuthnFailed);
         }
     }

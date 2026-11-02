@@ -40,6 +40,7 @@ use crate::metadata::types::sp::SpSsoDescriptor;
 use crate::crypto::{DigestMethod, SamlSigner, SigningAlgorithms};
 use crate::profiles::error::ProfileError;
 use crate::profiles::sso::web_browser::{ResponseOptions, ResponseTimes};
+use crate::xml::helpers::{checked_wire_add, latest_wire_instant};
 use crate::xml::serialize::SamlSerialize;
 
 /// Result of processing an AuthnRequest on the IdP side.
@@ -335,15 +336,15 @@ pub fn create_response(
     // Everything except AuthnInstant derives from the document issue instant.
     let now = times.issue_instant;
     // The lifetime is the caller's. One that does not fit a duration, or that runs
-    // past the last representable date, saturates at that date, as elsewhere in
-    // this crate, instead of panicking - or, above `i64::MAX`, wrapping negative
-    // into an assertion that is already expired. `idp::orchestrator` refuses such a
-    // lifetime before it gets here.
+    // past the last date an `xs:dateTime` can carry (9999-12-31T23:59:59Z),
+    // saturates at that date instead of panicking - or, above `i64::MAX`, wrapping
+    // negative into an assertion that is already expired. `idp::orchestrator`
+    // refuses such a lifetime before it gets here.
     let not_on_or_after = i64::try_from(options.assertion_lifetime_seconds)
         .ok()
         .and_then(TimeDelta::try_seconds)
-        .and_then(|lifetime| now.checked_add_signed(lifetime))
-        .unwrap_or(DateTime::<Utc>::MAX_UTC);
+        .and_then(|lifetime| checked_wire_add(now, lifetime))
+        .unwrap_or_else(latest_wire_instant);
 
     // Build SubjectConfirmation (bearer)
     let subject_confirmation = SubjectConfirmation {
@@ -1269,7 +1270,7 @@ mod tests {
     }
 
     /// `create_response` is infallible, so a lifetime it cannot add to the issue
-    /// instant saturates at the last representable date. It used to panic, and above
+    /// instant saturates at the last date an xs:dateTime can carry. It used to panic, and above
     /// `i64::MAX` the `as i64` cast wrapped negative, minting an expired assertion.
     #[test]
     fn test_create_response_saturates_an_unrepresentable_lifetime() {
@@ -1299,8 +1300,32 @@ mod tests {
             let conditions = response.assertions[0].conditions.as_ref().unwrap();
             assert_eq!(
                 conditions.not_on_or_after,
-                Some(DateTime::<Utc>::MAX_UTC),
+                Some(latest_wire_instant()),
                 "{seconds} seconds"
+            );
+
+            // The saturated date has to survive the document: chrono's own last date
+            // is written as `+262142-12-31...`, which is not an xs:dateTime and which
+            // this crate's parser rejects.
+            let xml = response.to_xml_string().unwrap();
+            assert!(
+                xml.contains(r#"NotOnOrAfter="9999-12-31T23:59:59Z""#),
+                "{xml}"
+            );
+            let doc = crate::xml::parse_secure(&xml).unwrap();
+            let parsed = crate::xml::deserialize::parse_saml::<
+                crate::core::protocol::response::ResponseRef<'_>,
+            >(&doc)
+            .unwrap()
+            .to_owned();
+            assert_eq!(
+                parsed.assertions[0]
+                    .conditions
+                    .as_ref()
+                    .unwrap()
+                    .not_on_or_after,
+                Some(latest_wire_instant()),
+                "{seconds} seconds, after a round trip"
             );
         }
         // An ordinary lifetime is unaffected.
