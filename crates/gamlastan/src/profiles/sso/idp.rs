@@ -334,8 +334,16 @@ pub fn create_response(
 ) -> Response {
     // Everything except AuthnInstant derives from the document issue instant.
     let now = times.issue_instant;
-    let assertion_lifetime = TimeDelta::seconds(options.assertion_lifetime_seconds as i64);
-    let not_on_or_after = now + assertion_lifetime;
+    // The lifetime is the caller's. One that does not fit a duration, or that runs
+    // past the last representable date, saturates at that date, as elsewhere in
+    // this crate, instead of panicking - or, above `i64::MAX`, wrapping negative
+    // into an assertion that is already expired. `idp::orchestrator` refuses such a
+    // lifetime before it gets here.
+    let not_on_or_after = i64::try_from(options.assertion_lifetime_seconds)
+        .ok()
+        .and_then(TimeDelta::try_seconds)
+        .and_then(|lifetime| now.checked_add_signed(lifetime))
+        .unwrap_or(DateTime::<Utc>::MAX_UTC);
 
     // Build SubjectConfirmation (bearer)
     let subject_confirmation = SubjectConfirmation {
@@ -1258,6 +1266,66 @@ mod tests {
             Err(ProfileError::AuthnRequestSignatureRequired)
         ));
         assert!(process_authn_request(&request, &sp_meta, true).is_ok());
+    }
+
+    /// `create_response` is infallible, so a lifetime it cannot add to the issue
+    /// instant saturates at the last representable date. It used to panic, and above
+    /// `i64::MAX` the `as i64` cast wrapped negative, minting an expired assertion.
+    #[test]
+    fn test_create_response_saturates_an_unrepresentable_lifetime() {
+        let now = Utc::now();
+        let name_id = NameId {
+            value: "user@example.com".to_string(),
+            format: Some(constants::NAMEID_EMAIL.to_string()),
+            name_qualifier: None,
+            sp_name_qualifier: None,
+            sp_provided_id: None,
+        };
+        for seconds in [9_000_000_000_000_u64, i64::MAX as u64, u64::MAX] {
+            let options = ResponseOptions {
+                idp_entity_id: "https://idp.example.com".to_string(),
+                in_response_to: Some("_req123".to_string()),
+                sp_entity_id: "https://sp.example.com".to_string(),
+                acs_url: "https://sp.example.com/acs".to_string(),
+                assertion_lifetime_seconds: seconds,
+                session_index: None,
+                session_not_on_or_after: None,
+                authn_context_class_ref: Some(constants::AUTHN_CONTEXT_PASSWORD.to_string()),
+                client_address: None,
+                attributes: vec![],
+                authenticating_authorities: vec![],
+            };
+            let response = create_response(&options, &name_id, ResponseTimes::at(now));
+            let conditions = response.assertions[0].conditions.as_ref().unwrap();
+            assert_eq!(
+                conditions.not_on_or_after,
+                Some(DateTime::<Utc>::MAX_UTC),
+                "{seconds} seconds"
+            );
+        }
+        // An ordinary lifetime is unaffected.
+        let options = ResponseOptions {
+            idp_entity_id: "https://idp.example.com".to_string(),
+            in_response_to: None,
+            sp_entity_id: "https://sp.example.com".to_string(),
+            acs_url: "https://sp.example.com/acs".to_string(),
+            assertion_lifetime_seconds: 300,
+            session_index: None,
+            session_not_on_or_after: None,
+            authn_context_class_ref: Some(constants::AUTHN_CONTEXT_PASSWORD.to_string()),
+            client_address: None,
+            attributes: vec![],
+            authenticating_authorities: vec![],
+        };
+        let response = create_response(&options, &name_id, ResponseTimes::at(now));
+        assert_eq!(
+            response.assertions[0]
+                .conditions
+                .as_ref()
+                .unwrap()
+                .not_on_or_after,
+            Some(now + TimeDelta::seconds(300))
+        );
     }
 
     #[test]

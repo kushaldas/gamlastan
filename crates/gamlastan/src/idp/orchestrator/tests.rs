@@ -2318,3 +2318,85 @@ fn authn_failed_denial_response_differs_from_cancelled_only_in_message() {
     assert!(failed.xml.contains("Authentication failed"));
     assert!(!failed.xml.contains("Authentication was cancelled"));
 }
+
+// ── lifetimes that cannot be added to a date ───────────────────────────────
+
+/// A lifetime comes from the policy and a start time from the application. When the
+/// two cannot be added, `chrono`'s `+` panics; the engine must refuse with an error
+/// instead, and before a durable NameID is stored.
+#[test]
+fn a_lifetime_too_long_to_add_is_refused_before_a_durable_nameid_is_stored() {
+    use crate::idp::policy::PolicyEntry;
+    // About 285 000 years: a valid `TimeDelta`, past the last date `chrono` has.
+    let too_long = TimeDelta::seconds(9_000_000_000_000);
+    for (what, entry) in [
+        ("assertion", PolicyEntry::new().with_lifetime(too_long)),
+        (
+            "session",
+            PolicyEntry::new().with_session_lifetime(too_long),
+        ),
+    ] {
+        let decisions = ReleasePolicy::with_default(entry);
+        with_engine(&decisions, |engine, idents| {
+            let p = params(processed_with_name_id_policy(
+                Some(constants::NAMEID_PERSISTENT),
+                None,
+                true,
+            ));
+            let err = create_authn_response(engine, &p, &subject_without_mail()).unwrap_err();
+            assert!(err.to_string().contains("too long"), "{what}: {err}");
+            assert!(
+                idents.name_ids_for("alice").unwrap().is_empty(),
+                "{what}: nothing may be stored for a response that is not issued"
+            );
+        });
+    }
+}
+
+#[test]
+fn an_authn_instant_at_the_end_of_time_is_refused_not_a_panic() {
+    use crate::idp::orchestrator::AuthenticatedSubject;
+    let decisions = ReleasePolicy::new();
+    with_engine(&decisions, |engine, idents| {
+        let p = params(processed_with_name_id_policy(
+            Some(constants::NAMEID_PERSISTENT),
+            None,
+            true,
+        ));
+        // The default session lifetime is an hour, so this is half an hour short of
+        // being able to add it: the sum is past the last date `chrono` has. (Exactly
+        // an hour short lands on that date and is issued.)
+        let subject = AuthenticatedSubject {
+            authn_instant: Some(chrono::DateTime::<Utc>::MAX_UTC - TimeDelta::minutes(30)),
+            ..subject_without_mail()
+        };
+        let err = create_authn_response(engine, &p, &subject).unwrap_err();
+        assert!(err.to_string().contains("too long"), "{err}");
+        assert!(idents.name_ids_for("alice").unwrap().is_empty());
+    });
+}
+
+/// `check_request` cannot return an error, and a session whose expiry is too far out
+/// to represent has not reached it: the session is reusable, and issuing reports the
+/// configuration fault.
+#[test]
+fn a_session_lifetime_too_long_to_add_does_not_panic_check_request() {
+    use crate::idp::policy::PolicyEntry;
+    let decisions = ReleasePolicy::with_default(
+        PolicyEntry::new().with_session_lifetime(TimeDelta::seconds(9_000_000_000_000)),
+    );
+    with_engine(&decisions, |engine, _| {
+        let p = params(processed(
+            false,
+            false,
+            vec![PASSWORD],
+            Some(AuthnContextComparison::Exact),
+        ));
+        let s = session(AuthnMethodRef::Inline {
+            class_ref: PASSWORD.to_string(),
+            authn_authority: None,
+        });
+        let d = check_request(engine, &p, Some(&s));
+        assert!(matches!(d, Disposition::ReuseSession { .. }), "{d:?}");
+    });
+}

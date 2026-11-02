@@ -482,6 +482,19 @@ where needed to correct protocol handling.
 
 ### Fixed
 
+- The IdP response engine no longer panics on a lifetime it cannot add to a date.
+  `chrono`'s `+` panics on overflow, and a lifetime (from the policy) plus a start
+  time (from the application, e.g. `authn_instant`) overflowed from about 8.2e12
+  seconds, taking down the request thread. `create_authn_response` now works out
+  the assertion and session expiry dates up front, with checked arithmetic, and
+  returns a `ProfileError` before anything is stored when either cannot be
+  represented. A session whose expiry is too far out to represent has not reached
+  it, so `check_request` treats it as reusable and `create_authn_response` does
+  not refuse it as expired. `profiles::sso::idp::create_response`, which is
+  infallible, now saturates the assertion's `NotOnOrAfter` at the last
+  representable date instead of panicking; and an `assertion_lifetime_seconds`
+  above `i64::MAX`, which the old `as i64` cast wrapped into a negative lifetime
+  and so an already-expired assertion, saturates the same way.
 - `IdentDb::match_local_id` (persistent NameID lookup) now matches only a
   stored identifier whose own format is also `persistent`, not any
   non-transient format. Previously, a persistent-format request for a

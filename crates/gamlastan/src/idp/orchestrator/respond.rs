@@ -6,7 +6,7 @@
 //! test exhaustively. [`create_authn_response`] and
 //! [`create_denial_response`] perform the actual assembly in a fixed order.
 
-use chrono::{TimeDelta, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 
 use crate::core::assertion::name_id::NameId;
 use crate::core::protocol::response::Response;
@@ -103,8 +103,13 @@ pub fn check_request(
     // SessionNotOnOrAfter a *previous* response asserted, which must not
     // extend this), is not defeated by ForceAuthn, and whose establishing
     // method satisfies the requested context.
+    //
+    // An expiry too far out to represent is one that has not been reached;
+    // `create_authn_response` reports the configuration fault when it issues.
     let reusable = session.filter(|s| {
-        now < s.authn_instant + session_lifetime
+        s.authn_instant
+            .checked_add_signed(session_lifetime)
+            .is_none_or(|expiry| now < expiry)
             && !processed.force_authn
             && session_satisfies(engine.broker, requested.as_ref(), s)
     });
@@ -163,6 +168,26 @@ const MAX_AUTHORITY_LEN: usize = 1024;
 /// (a scheme, then something), at most [`MAX_AUTHORITY_LEN`] bytes, with no
 /// whitespace, control or non-XML characters. Anything else is a configuration fault: it
 /// would be signed into the assertion as written.
+/// `start + length`, or a configuration error when the result is not a date this
+/// crate can represent.
+///
+/// A lifetime comes from the policy and a start time from the application, so a
+/// large enough pair cannot be added: `chrono`'s `+` panics on overflow, which
+/// would take down the request thread. This is caught before anything is stored.
+fn expiry(
+    what: &str,
+    start: DateTime<Utc>,
+    length: TimeDelta,
+) -> Result<DateTime<Utc>, ProfileError> {
+    start.checked_add_signed(length).ok_or_else(|| {
+        ProfileError::Other(format!(
+            "the {what} of {} seconds is too long: adding it to {start} does not give a \
+             date that can be represented, so no response is issued",
+            length.num_seconds()
+        ))
+    })
+}
+
 /// Whether `c` is a legal XML 1.0 character. U+FFFE and U+FFFF are not, and are
 /// not `char::is_control`, so they would otherwise be rewritten when serialised.
 fn is_xml_char(c: char) -> bool {
@@ -406,10 +431,38 @@ pub fn create_authn_response(
     // by every SP validator, so refuse it here, before anything is stored.
     if let Some(authn_instant) = subject.authn_instant {
         let session_lifetime = engine.decisions.session_lifetime(&processed.sp_entity_id);
-        if authn_instant + session_lifetime <= Utc::now() {
+        if authn_instant
+            .checked_add_signed(session_lifetime)
+            .is_some_and(|expiry| expiry <= Utc::now())
+        {
             return denied(engine, params, &Denial::AuthnFailed);
         }
     }
+
+    // Assertion and session lifetimes are independent: the assertion's own
+    // validity window is typically short, while the SSO session it establishes is
+    // usually meant to outlive any one assertion (E79). Both expiry dates are
+    // worked out here, before the NameID is stored, so a lifetime that cannot be
+    // added to its start time is refused without leaving a record behind.
+    let now = Utc::now();
+    let lifetime = engine.decisions.lifetime(&processed.sp_entity_id);
+    let assertion_lifetime_seconds = lifetime.num_seconds().max(0) as u64;
+    let session_lifetime = engine.decisions.session_lifetime(&processed.sp_entity_id);
+    let not_on_or_after = expiry(
+        "assertion lifetime",
+        now,
+        TimeDelta::seconds(assertion_lifetime_seconds as i64),
+    )?;
+    // Derived from the subject's actual authn_instant (the original
+    // authentication time for a reused session; "now" for a fresh one), not
+    // from "now" unconditionally - otherwise reusing a session pushes its
+    // absolute expiry further out on every response, turning a fixed cap
+    // into an indefinitely-sliding window.
+    let session_not_on_or_after = Some(expiry(
+        "session lifetime",
+        subject.authn_instant.unwrap_or(now),
+        session_lifetime,
+    )?);
 
     // 5. Construct the NameID, honouring the request's NameIDPolicy and the
     //    IdP's default format. A NameID refusal is a protocol denial.
@@ -421,20 +474,7 @@ pub fn create_authn_response(
         Err(NameIdFailure::Fault(e)) => return Err(e),
     };
 
-    // 6. Build the response options. Assertion and session lifetimes are
-    //    independent: the assertion's own validity window is typically
-    //    short, while the SSO session it establishes is usually meant to
-    //    outlive any one assertion (E79).
-    let now = Utc::now();
-    let lifetime = engine.decisions.lifetime(&processed.sp_entity_id);
-    let assertion_lifetime_seconds = lifetime.num_seconds().max(0) as u64;
-    let session_lifetime = engine.decisions.session_lifetime(&processed.sp_entity_id);
-    // Derived from the subject's actual authn_instant (the original
-    // authentication time for a reused session; "now" for a fresh one), not
-    // from "now" unconditionally - otherwise reusing a session pushes its
-    // absolute expiry further out on every response, turning a fixed cap
-    // into an indefinitely-sliding window.
-    let session_not_on_or_after = Some(subject.authn_instant.unwrap_or(now) + session_lifetime);
+    // 6. Build the response options.
     let options = ResponseOptions {
         idp_entity_id: engine.idp_entity_id.to_string(),
         in_response_to: Some(processed.request_id.clone()),
@@ -493,7 +533,6 @@ pub fn create_authn_response(
     // 9. Return the issued response with its audit identifiers, using the
     //    same normalized (whole-second, non-negative) lifetime that went
     //    into the wire assertion so the two cannot disagree.
-    let not_on_or_after = now + TimeDelta::seconds(assertion_lifetime_seconds as i64);
     let released_attribute_names = released.iter().map(|a| a.name.clone()).collect();
     Ok(super::ResponseOutcome::Issued(IssuedResponse {
         xml: signed_xml,
