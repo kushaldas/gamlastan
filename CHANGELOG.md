@@ -488,7 +488,7 @@ where needed to correct protocol handling.
   seconds, taking down the request thread. `create_authn_response` now works out
   the assertion and session expiry dates up front, with checked arithmetic, and
   returns a `ProfileError` before anything is stored when either is not a date a
-  response can carry. That is years 0000-9999, not `chrono`'s wider range:
+  response can carry. That is years 0001-9999, not `chrono`'s wider range:
   `chrono` writes later dates as `+262142-12-31...`, which is not an `xs:dateTime`
   and which `parse_datetime` rejects. For the session-reuse checks an expiry that
   cannot be held is judged by direction: past the last date it has not been

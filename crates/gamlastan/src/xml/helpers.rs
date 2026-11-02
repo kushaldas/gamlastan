@@ -121,7 +121,7 @@ pub fn format_datetime(dt: &DateTime<Utc>) -> String {
 ///
 /// `chrono` has dates far past year 9999, but it formats them as `+262142-12-31...`,
 /// which is not an `xs:dateTime` and which [`parse_datetime`] rejects. A date that
-/// is going into a document must therefore stay within years 0000-9999.
+/// is going into a document must therefore stay within years 0001-9999.
 pub(crate) fn latest_wire_instant() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(9999, 12, 31, 23, 59, 59)
         .single()
@@ -129,12 +129,12 @@ pub(crate) fn latest_wire_instant() -> DateTime<Utc> {
 }
 
 /// `start + length`, if the result can be written as an `xs:dateTime` (years
-/// 0000-9999). `None` for an overflow, an underflow, or a date `chrono` has but the
-/// wire format cannot carry.
+/// 0001-9999; XML Schema 1.0 has no year zero). `None` for an overflow, an
+/// underflow, or a date `chrono` has but the wire format cannot carry.
 pub(crate) fn checked_wire_add(start: DateTime<Utc>, length: TimeDelta) -> Option<DateTime<Utc>> {
     start
         .checked_add_signed(length)
-        .filter(|date| (0..=9999).contains(&date.year()))
+        .filter(|date| (1..=9999).contains(&date.year()))
 }
 
 /// Parse an optional boolean attribute value.
@@ -324,5 +324,30 @@ mod tests {
         assert_eq!(required_attribute(&doc, root, "ID").unwrap(), "_123");
         assert_eq!(required_attribute(&doc, root, "Version").unwrap(), "2.0");
         assert!(required_attribute(&doc, root, "Missing").is_err());
+    }
+
+    #[test]
+    fn checked_wire_add_stays_within_years_1_to_9999() {
+        let first = Utc.with_ymd_and_hms(1, 1, 1, 0, 0, 0).single().unwrap();
+        let last = latest_wire_instant();
+        let one = TimeDelta::seconds(1);
+
+        // Both edges are writable; one step outside either is not.
+        assert_eq!(checked_wire_add(first, TimeDelta::zero()), Some(first));
+        assert_eq!(checked_wire_add(last, TimeDelta::zero()), Some(last));
+        assert_eq!(checked_wire_add(last, one), None, "year 10000");
+        // XML Schema 1.0 has no year zero, though `chrono` does.
+        let year_zero = first - one;
+        assert_eq!(year_zero.year(), 0);
+        assert_eq!(checked_wire_add(first, -one), None, "year 0000");
+        // Beyond what `chrono` holds at all.
+        assert_eq!(
+            checked_wire_add(last, TimeDelta::seconds(9_000_000_000_000)),
+            None
+        );
+        assert_eq!(
+            checked_wire_add(first, TimeDelta::seconds(-9_000_000_000_000)),
+            None
+        );
     }
 }

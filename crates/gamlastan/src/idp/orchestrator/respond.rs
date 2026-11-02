@@ -181,7 +181,7 @@ fn expiry(
     checked_wire_add(start, length).ok_or_else(|| {
         ProfileError::Other(format!(
             "the {what} of {} seconds cannot be added to {start}: the result is not a date \
-             a response can carry (years 0000-9999), so no response is issued",
+             a response can carry (years 0001-9999), so no response is issued",
             length.num_seconds()
         ))
     })

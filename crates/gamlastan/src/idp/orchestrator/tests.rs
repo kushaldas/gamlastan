@@ -2344,7 +2344,7 @@ fn a_lifetime_too_long_to_add_is_refused_before_a_durable_nameid_is_stored() {
                 true,
             ));
             let err = create_authn_response(engine, &p, &subject_without_mail()).unwrap_err();
-            assert!(err.to_string().contains("years 0000-9999"), "{what}: {err}");
+            assert!(err.to_string().contains("years 0001-9999"), "{what}: {err}");
             assert!(
                 idents.name_ids_for("alice").unwrap().is_empty(),
                 "{what}: nothing may be stored for a response that is not issued"
@@ -2371,7 +2371,7 @@ fn an_authn_instant_at_the_end_of_time_is_refused_not_a_panic() {
             ..subject_without_mail()
         };
         let err = create_authn_response(engine, &p, &subject).unwrap_err();
-        assert!(err.to_string().contains("years 0000-9999"), "{err}");
+        assert!(err.to_string().contains("years 0001-9999"), "{err}");
         assert!(idents.name_ids_for("alice").unwrap().is_empty());
     });
 }
@@ -2418,7 +2418,7 @@ fn an_expiry_past_year_9999_is_refused_though_chrono_can_hold_it() {
             true,
         ));
         let err = create_authn_response(engine, &p, &subject_without_mail()).unwrap_err();
-        assert!(err.to_string().contains("years 0000-9999"), "{err}");
+        assert!(err.to_string().contains("years 0001-9999"), "{err}");
         assert!(idents.name_ids_for("alice").unwrap().is_empty());
     });
     // A long but writable lifetime is issued.
@@ -2490,6 +2490,33 @@ fn a_reused_session_with_a_hugely_negative_lifetime_is_refused_as_expired() {
                 ..
             }
         ));
+        assert!(idents.name_ids_for("alice").unwrap().is_empty());
+    });
+}
+
+/// XML Schema 1.0 has no year zero, though `chrono` does: a fresh login whose negative
+/// session lifetime lands in year 0000 must be refused, not written as an invalid
+/// `SessionNotOnOrAfter`.
+#[test]
+fn a_negative_session_lifetime_landing_in_year_zero_is_refused() {
+    use crate::idp::policy::PolicyEntry;
+    use chrono::TimeZone;
+    let year_zero = Utc
+        .with_ymd_and_hms(0, 12, 31, 23, 59, 59)
+        .single()
+        .unwrap();
+    let decisions = ReleasePolicy::with_default(
+        PolicyEntry::new().with_session_lifetime(year_zero - Utc::now()),
+    );
+    with_engine(&decisions, |engine, idents| {
+        let p = params(processed_with_name_id_policy(
+            Some(constants::NAMEID_PERSISTENT),
+            None,
+            true,
+        ));
+        // No authn_instant: a fresh login, so the expiry is "now" + the lifetime.
+        let err = create_authn_response(engine, &p, &subject_without_mail()).unwrap_err();
+        assert!(err.to_string().contains("years 0001-9999"), "{err}");
         assert!(idents.name_ids_for("alice").unwrap().is_empty());
     });
 }
