@@ -381,14 +381,18 @@ failure is a real protocol error rather than a silent per-integrator choice.
   directly is not. Cost: one `user_for` per record
   returned, and `user_for` must see the store's own writes.
 
-- `Eptid` shape-checks a value read from its cache (`<idp>!<sp>!<opaque>` with no `!` in the opaque part, on by
-  default, `Eptid::with_store_verification(false)` to skip), and
+- `Eptid` shape-checks a value read from its cache (`<idp>!<sp>!<opaque>` with
+  no `!` in the opaque part, on by default,
+  `Eptid::with_store_verification(false)` to skip), and
   `idp::ident::kv_conformance` checks a `KeyValueStore` backend: read-your-writes,
   exact keys, scoped removal, no eviction, and sound concurrent writes. The cache
   exists so a later change of secret or digest cannot change what an SP already
   knows, so a cache that loses or lags behind its own writes silently issues a
-  different identifier. It is trusted by design, so the check catches operational
-  faults, not forgery: the cache must be private to the IdP and must not evict.
+  different identifier. It is trusted by design, so the check catches a value of the
+  wrong shape (another IdP's or SP's, a wrong key), not one of the right shape from
+  another origin: a deployment sharing the entity ID, a restored backup and a forged
+  value are accepted, and a flush is a miss. The cache must be private to this IdP
+  and this secret, and must not evict.
 
 - The engine takes the authentication method the application reports on trust.
   `check_request` offers the methods that would satisfy the request and

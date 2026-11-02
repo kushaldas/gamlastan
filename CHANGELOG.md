@@ -555,14 +555,17 @@ where needed to correct protocol handling.
   binds the answer to the NameID value asked about; it does not authorize the
   requester, which stays with the responder.
 - `Eptid` checks the shape of a value it reads from its cache: it must be
-  `<idp>!<sp>!<opaque>` where the opaque part has no `!` (an entity ID may, so a longer SP ID could otherwise pass for this one), otherwise a `StoreError`. The cache is trusted to return
-  what was issued, which is its purpose, but a value of the wrong shape was not
-  issued for this IdP and SP, and the realistic causes (a cache shared with another
-  IdP or tenant, a key written by the wrong code, a restored or flushed cache)
-  would otherwise hand the SP a permanently wrong identifier and remember it. A
-  forged value of the right shape (including another user's value for the same
-  IdP and SP) is not detected, so the cache must still be
-  private to this IdP and this secret, and must not evict. On by default;
+  `<idp>!<sp>!<opaque>` where the opaque part has no `!` (an entity ID may, so a
+  longer SP ID could otherwise pass for this one), otherwise a `StoreError`. The
+  cache is trusted to return what was issued, which is its purpose, but a value of
+  the wrong shape was not issued for this IdP and SP, and would otherwise be
+  handed to the SP and remembered. This rejects another IdP's or SP's value and a
+  key written by the wrong code. It cannot tell two right-shaped values apart: a
+  cache shared with another deployment that uses the same IdP entity ID, a backup
+  restored from one, and a forged value (including another user's value for the
+  same IdP and SP) are not detected, and a flush is a miss, after which a changed
+  secret or digest issues a different value. So the cache must still be private
+  to this IdP and this secret, and must not evict. On by default;
   `Eptid::with_store_verification(false)` for a cache whose values were issued
   under an earlier IdP entity ID, or one you fully trust.
 - `IdentDb` no longer trusts what its `IdentityStore` returns. Each record a
