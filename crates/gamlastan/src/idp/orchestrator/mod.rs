@@ -62,6 +62,13 @@
 //! The `gamlastan-actix` `AuthnSubjectCallback` receives the parsed request for
 //! this reason.
 //!
+//! And one thing the engine takes on trust: **the authentication method the
+//! application reports** in [`AuthenticatedSubject::authn_method`]. It is checked
+//! against the request, not against what really happened, so report what the login
+//! flow did. In particular never build an [`AuthnMethodRef::Inline`] class ref from
+//! the `AuthnRequest`: for an `exact` request it would match the request by
+//! construction and a context that was never established would be signed.
+//!
 //! # Example
 //!
 //! ```

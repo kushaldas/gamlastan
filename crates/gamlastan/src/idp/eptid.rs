@@ -139,6 +139,9 @@ pub struct Eptid<S: KeyValueStore = InMemoryKeyValueStore> {
     secret: String,
     store: S,
     options: EptidOptions,
+    /// Check the shape of a cached value (on by default; see
+    /// [`with_store_verification`](Self::with_store_verification)).
+    verify_cache: bool,
 }
 
 impl Eptid<InMemoryKeyValueStore> {
@@ -164,6 +167,7 @@ impl<S: KeyValueStore> Eptid<S> {
             secret: secret.into(),
             store,
             options: EptidOptions::default(),
+            verify_cache: true,
         }
     }
 
@@ -178,7 +182,29 @@ impl<S: KeyValueStore> Eptid<S> {
             secret: secret.into(),
             store,
             options,
+            verify_cache: true,
         })
+    }
+
+    /// Check the shape of a value read from the cache (default: **on**).
+    ///
+    /// The cache is trusted to return what was issued: that is its purpose, since
+    /// recomputing could give a different value after the secret or digest
+    /// changed. But a value that does not have the shape this type derives,
+    /// `<idp>!<sp>!<opaque>` with a non-empty opaque part that contains no `!` (entity IDs may contain `!`, so `<idp>!<sp>!x!y` could be another SP's), was not issued for this IdP and SP, and the realistic
+    /// causes are operational: a cache shared with another IdP or tenant, a key
+    /// written by the wrong code, a restored or flushed cache. With this on such a
+    /// value is a [`StoreError`] instead of an identifier handed to the SP, and
+    /// then remembered. It cannot detect a deliberately forged value of the right
+    /// shape, so the cache must still be private to this IdP and this secret, and
+    /// must not evict issued values (see
+    /// [`kv_conformance`](crate::idp::ident::kv_conformance)).
+    ///
+    /// Turn it off when the IdP's entity ID has changed since the cached values
+    /// were issued (they carry the old one), or for a cache you fully trust.
+    pub fn with_store_verification(mut self, verify: bool) -> Self {
+        self.verify_cache = verify;
+        self
     }
 
     fn make(&self, idp_entity_id: &str, sp_entity_id: &str, user_id: &str) -> String {
@@ -219,6 +245,19 @@ impl<S: KeyValueStore> Eptid<S> {
     ) -> Result<String, StoreError> {
         let key = Self::cache_key(idp_entity_id, sp_entity_id, user_id);
         if let Some(cached) = self.store.get(&key)? {
+            if self.verify_cache {
+                let prefix = format!("{idp_entity_id}!{sp_entity_id}!");
+                // `!` is legal in an entity ID, so `<idp>!<sp>!x!y` could be another
+                // SP's identifier; `make` always renders the opaque part as hex.
+                let opaque = cached.strip_prefix(&prefix).unwrap_or("");
+                if opaque.is_empty() || opaque.contains('!') {
+                    return Err(StoreError::new(format!(
+                        "the EPTID cache returned a value that does not have the shape of an \
+                         identifier issued for this IdP and SP ({prefix}<opaque>); refusing to \
+                         use it. Is the cache shared with another IdP or tenant?"
+                    )));
+                }
+            }
             return Ok(cached);
         }
         let value = self.make(idp_entity_id, sp_entity_id, user_id);
@@ -319,6 +358,70 @@ mod tests {
         assert!(eptid.get(IDP, SP, "alice").is_err());
         assert!(eptid.name_id(IDP, SP, "alice").is_err());
         assert!(eptid.attribute(IDP, SP, "alice").is_err());
+    }
+
+    /// A cache that answers `value` for every key, as a poisoned or shared one would.
+    struct Answers(&'static str);
+    impl KeyValueStore for Answers {
+        fn get(&self, _: &str) -> Result<Option<String>, StoreError> {
+            Ok(Some(self.0.to_string()))
+        }
+        fn set(&self, _: &str, _: String) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn remove(&self, _: &str) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_cached_value_of_the_wrong_shape_is_refused() {
+        let (idp, sp) = ("https://idp.example", "https://sp.example");
+        for bad in [
+            "ATTACKERCONTROLLEDVALUE",
+            "https://idp.example!https://other.example!abc",
+            "https://other-idp.example!https://sp.example!abc",
+            "https://idp.example!https://sp.example!",
+        ] {
+            let eptid = Eptid::with_store(Answers(bad), "secret");
+            let err = eptid.get(idp, sp, "alice").unwrap_err();
+            assert!(
+                err.to_string().contains("shape of an identifier"),
+                "{bad}: {err}"
+            );
+            assert!(eptid.name_id(idp, sp, "alice").is_err());
+            assert!(eptid.attribute(idp, sp, "alice").is_err());
+        }
+    }
+
+    #[test]
+    fn a_cached_value_of_the_right_shape_is_used_and_verification_can_be_turned_off() {
+        let (idp, sp) = ("https://idp.example", "https://sp.example");
+        let good = "https://idp.example!https://sp.example!abc";
+        let eptid = Eptid::with_store(Answers(good), "secret");
+        assert_eq!(eptid.get(idp, sp, "alice").unwrap(), good);
+
+        // `!` is legal in an entity ID: another SP whose ID extends this one
+        // must not pass for it.
+        for ambiguous in [
+            "https://idp.example!https://sp.example!other!abc",
+            "https://idp.example!https://sp.example!abc!def",
+        ] {
+            assert!(
+                Eptid::with_store(Answers(ambiguous), "secret")
+                    .get(idp, sp, "alice")
+                    .is_err(),
+                "{ambiguous}"
+            );
+        }
+
+        // Values issued under an earlier IdP entity ID carry the old one.
+        let old = "https://old-idp.example!https://sp.example!abc";
+        assert!(Eptid::with_store(Answers(old), "secret")
+            .get(idp, sp, "alice")
+            .is_err());
+        let trusting = Eptid::with_store(Answers(old), "secret").with_store_verification(false);
+        assert_eq!(trusting.get(idp, sp, "alice").unwrap(), old);
     }
 
     #[test]

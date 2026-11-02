@@ -625,6 +625,97 @@ mod orchestrator_attacks {
             .xml
             .contains("The requested authentication context is unavailable"));
     }
+
+    /// An `AuthenticatingAuthority` that is not a URI (an application that built
+    /// it from request data, say) is a configuration fault: refused before
+    /// anything is stored, and the message carries no raw control characters.
+    #[test]
+    fn hostile_authenticating_authority_is_refused_before_anything_is_stored() {
+        let idents = IdentDb::in_memory(IDP);
+        let mut broker = AuthnBroker::new();
+        broker.add(
+            constants::AUTHN_CONTEXT_PASSWORD,
+            "/login/password",
+            1,
+            None,
+        );
+        let decisions = ReleasePolicy::new();
+        let (signer, cert) = super::response_signing_fixture_signer();
+        let engine = ResponseEngine {
+            idp_entity_id: IDP,
+            decisions: &decisions,
+            release: &decisions,
+            idents: &idents,
+            broker: &broker,
+            assertions: None,
+            signer: &signer,
+            cert_der_b64: &cert,
+        };
+        let params = ResponseParams {
+            processed: processed(SP),
+            sp_sso: sp_sso_with_default_service(),
+            sp_entity: None,
+        };
+
+        for hostile in [
+            "<script>alert(1)</script>",
+            "urn:x\0y",
+            "urn:x\u{FFFE}",
+            "no scheme at all",
+        ] {
+            let subject = AuthenticatedSubject {
+                subject_id: "alice".to_string(),
+                attributes: vec![Attribute {
+                    name: "urn:oid:0.9.2342.19200300.100.1.3".to_string(),
+                    name_format: Some(constants::ATTRNAME_FORMAT_URI.to_string()),
+                    friendly_name: Some("mail".to_string()),
+                    values: vec![AttributeValue::String("alice@example.org".to_string())],
+                }],
+                authn_method: AuthnMethodRef::Inline {
+                    class_ref: constants::AUTHN_CONTEXT_PASSWORD.to_string(),
+                    authn_authority: Some(hostile.to_string()),
+                },
+                authn_instant: None,
+                session_index: Some("_sess1".to_string()),
+            };
+            match create_authn_response(&engine, &params, &subject) {
+                Err(e) => assert!(
+                    !e.to_string().chars().any(char::is_control),
+                    "{hostile:?} leaked a control character: {e}"
+                ),
+                Ok(o) => panic!("{hostile:?} was accepted as an authenticating authority: {o:?}"),
+            }
+            assert!(
+                idents.name_ids_for("alice").unwrap().is_empty(),
+                "{hostile:?}: a NameID was stored before the authority was refused"
+            );
+        }
+
+        // A well-formed URI that merely contains markup is allowed, and must be
+        // escaped in the signed response, never spliced in as markup.
+        let subject = AuthenticatedSubject {
+            subject_id: "bob".to_string(),
+            attributes: vec![Attribute {
+                name: "urn:oid:0.9.2342.19200300.100.1.3".to_string(),
+                name_format: Some(constants::ATTRNAME_FORMAT_URI.to_string()),
+                friendly_name: Some("mail".to_string()),
+                values: vec![AttributeValue::String("bob@example.org".to_string())],
+            }],
+            authn_method: AuthnMethodRef::Inline {
+                class_ref: constants::AUTHN_CONTEXT_PASSWORD.to_string(),
+                authn_authority: Some("urn:x]]><saml:Injected/>".to_string()),
+            },
+            authn_instant: None,
+            session_index: Some("_sess2".to_string()),
+        };
+        match create_authn_response(&engine, &params, &subject).expect("a URI is accepted") {
+            ResponseOutcome::Issued(issued) => {
+                assert!(!issued.xml.contains("<saml:Injected"), "{}", issued.xml);
+                assert!(issued.xml.contains("urn:x]]&gt;&lt;saml:Injected/&gt;"));
+            }
+            other => panic!("expected an issued response, got {other:?}"),
+        }
+    }
 }
 
 /// Shared with `orchestrator_attacks`: a signer backed by the repo's fixture

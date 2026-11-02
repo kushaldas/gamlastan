@@ -368,6 +368,50 @@ failure is a real protocol error rather than a silent per-integrator choice.
   above), so `find_local_id` on one finds nothing unless
   `IdentDb::with_persist_transient` is set.
 
+- `IdentDb` verifies what the store returns (on by default,
+  `IdentDb::with_store_verification(false)` to skip): every record a lookup
+  returns for a user must be attributed to that user by the store's `user_for`,
+  and a durable lookup must return the slot that was asked for, else a
+  `StoreError`. The uniqueness constraints stop a backend writing two identifiers
+  for one slot; this stops a backend that *reads* the wrong user's record, which a
+  Rust or Python backend with a lookup that forgot the user can do. It lives in
+  `IdentDb`, not in each store method, so every lookup made through it (including
+  the default `find` / `find_durable` built on `for_user`, and `find_local_id`,
+  which round-trips through `for_user`) is covered; code that reads the store
+  directly is not. Cost: one `user_for` per record
+  returned, and `user_for` must see the store's own writes.
+
+- `Eptid` shape-checks a value read from its cache (`<idp>!<sp>!<opaque>` with no `!` in the opaque part, on by
+  default, `Eptid::with_store_verification(false)` to skip), and
+  `idp::ident::kv_conformance` checks a `KeyValueStore` backend: read-your-writes,
+  exact keys, scoped removal, no eviction, and sound concurrent writes. The cache
+  exists so a later change of secret or digest cannot change what an SP already
+  knows, so a cache that loses or lags behind its own writes silently issues a
+  different identifier. It is trusted by design, so the check catches operational
+  faults, not forgery: the cache must be private to the IdP and must not evict.
+
+- The engine takes the authentication method the application reports on trust.
+  `check_request` offers the methods that would satisfy the request and
+  `create_authn_response` re-checks the one reported against it, but neither can
+  know what really authenticated the user. An `AuthnMethodRef::Inline` class ref
+  therefore satisfies an `exact` request by matching the request, so it must be
+  built from what the login flow did, never from the `AuthnRequest`. Documented on
+  the type and in the module docs; an engine switch to forbid `Inline` was
+  considered and rejected (off by default it protects nobody, on by default it
+  breaks the proxy shape this type exists for).
+- The authenticating authority reported by the application or a broker
+  registration is validated as an absolute URI when the response is built
+  (`AuthenticatingAuthority` is an `xs:anyURI` signed into the assertion), as a
+  `ProfileError` before anything is stored. It is checked at response time, not in
+  `AuthnBroker::add`, so the released signature is unchanged.
+- The AssertionIDRequest / AuthnQuery helpers verify what the `AssertionStore`
+  returns (an assertion for a subject must be that subject's, one for an ID must
+  have that ID), and `idp::assertion_store::conformance` checks a backend for the
+  rest: subject-index exactness, no duplicates, a re-stored ID moving between
+  subjects, removal clearing the index, and concurrent stores. The responders are
+  where assertions leave the IdP for a requester, so that is where a wrongly keyed
+  index must not be believed.
+
 ## Alternatives considered
 
 - **Status quo -- leave orchestration to the integrator (ADR 0008's
@@ -392,6 +436,34 @@ failure is a real protocol error rather than a silent per-integrator choice.
   structure was not.
 
 ## Validation
+
+- `idp/orchestrator/tests.rs`: an authenticating authority that is empty, has no
+  scheme, contains whitespace, control or non-XML characters or is too long is refused, from
+  an inline method and from a broker registration, and leaves no stored NameID;
+  entity IDs and URNs are accepted.
+- `idp/assertion_store.rs`: a store that answers every subject lookup with another
+  subject's assertions, or every ID lookup with another assertion, is refused by
+  `get_authn_statements`, `create_authn_query_response` and
+  `create_assertion_id_request_response`.
+- `idp/assertion_store/conformance.rs`: the suite passes on `InMemoryAssertionStore`
+  and is verified to fail against a stale subject index, a duplicating index, a
+  prefix-matching subject lookup, a `remove` that does nothing, an error on a missing
+  assertion, and a subject index with a lost-update race.
+
+- `idp/eptid.rs`: a cached value of the wrong shape (another SP's, another IdP's,
+  arbitrary, empty opaque part) is refused by `get`, `name_id` and `attribute`; a
+  value of the right shape is used; verification can be turned off for values
+  issued under an earlier entity ID.
+- `idp/ident/kv_conformance.rs`: the suite passes on `InMemoryKeyValueStore` and is
+  verified to fail against a store that errors on a missing key, one that lags
+  behind its writes, one that folds case or matches prefixes, a `remove` that does
+  nothing, an evicting store, and one that merges concurrent values.
+
+- `idp/ident.rs`: a store whose `for_user` forgot the user cannot hand over
+  another user's persistent NameID through `get_nameid`, `match_local_id`,
+  `find_nameid` or `name_ids_for`, and neither can a `get_or_insert_durable` that
+  returns another user's record or the wrong slot; with verification off the leak
+  goes through; an honest store is unaffected.
 
 - `idp/orchestrator/tests.rs`: `Denial::status()` exhaustive; `AttributeRelease`
   impls incl. `ChainedRelease` ordering; the ForceAuthn/IsPassive/

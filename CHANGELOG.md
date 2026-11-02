@@ -9,6 +9,25 @@ where needed to correct protocol handling.
 
 ### Added
 
+- Added `idp::assertion_store::conformance`, a reusable check that an
+  `AssertionStore` backend honours its contract: absent assertions read as absent,
+  stored assertions round-trip (each ID returns its own assertion, and the
+  validity window and authentication statement survive both read paths), a subject lookup is exact and
+  isolated (case sensitive, and every listed assertion carries that subject), storing an
+  ID again does not duplicate it, storing it for another subject moves it (the old
+  subject's lookup must not return an assertion issued to someone else), removal
+  clears the subject index, and concurrent stores lose nothing and leave an ID
+  under one subject. Same shape as the other two suites (`run`, `check`,
+  `check_with`, `check_one`, `CHECKS`), reusing `ConformanceError` and `Options`.
+- Added `idp::ident::kv_conformance`, a reusable check that a `KeyValueStore`
+  backend (the `Eptid` cache) honours its contract: an absent key is `Ok(None)`,
+  values round-trip and are readable immediately after they are set, keys are
+  exact (no case folding or prefix matching), `remove` is scoped, issued values are
+  not evicted, and concurrent writers read their own writes and never leave a
+  merged value. Same shape as `ident::conformance` (`run`, `check`, `check_with`,
+  `check_one`, `CHECKS`), reusing its `ConformanceError` and `Options`. A cache that
+  loses or lags behind its own writes silently issues a different identifier, which
+  an SP maps to a different account.
 - Add a dependency-free `saml_pipeline` benchmark with deterministic signed
   fixtures and separate secure-parse, typed-extraction and verification
   measurements. This establishes a baseline without changing runtime behavior.
@@ -207,6 +226,13 @@ where needed to correct protocol handling.
 
 ### Changed
 
+- **Breaking:** `IdentDb` verifies what its `IdentityStore` returns by default
+  (`with_store_verification`), and `Eptid` shape-checks its cache. A backend whose
+  `user_for` lags its writes (a read replica, an eventually consistent store) now
+  fails the first login that creates a NameID with a `StoreError` instead of
+  silently working. Run `idp::ident::conformance` against the backend, read from
+  the primary, or pass `with_store_verification(false)` for a store you fully
+  trust. See Security below.
 - Reuse one parsed document for enveloped signature policy checks and backend
   verification, eliminating two repeated top-level parses under the default
   policy. Preserve metadata parsing rules, guard order, per-signature results,
@@ -504,6 +530,57 @@ where needed to correct protocol handling.
   callback must return the session's own `subject_id`: a different one is a
   `Configuration` error, not relabelled, since that would sign the session
   user's NameID over another user's attributes.
+
+### Security
+
+- `create_authn_response` validates the authenticating authority it signs into the
+  assertion's `AuthenticatingAuthority` (an `xs:anyURI`): from an
+  `AuthnMethodRef::Inline` or from an `AuthnBroker` registration, it must be an
+  absolute URI - a scheme, nothing after it empty, no whitespace or control
+  characters, at most 1024 bytes - otherwise a `ProfileError` before anything is
+  stored. Before, any string was written into the signed assertion as given. The
+  check is at response time, so the released `AuthnBroker::add` signature is
+  unchanged.
+- Documented that the engine verifies nothing about the authentication method the
+  application reports: an `AuthnMethodRef::Inline` class ref satisfies an `exact`
+  `RequestedAuthnContext` by matching the request, so building it from the request
+  signs a context that was never established. The warning is on `Inline`, on
+  `AuthenticatedSubject::authn_method` and in the `idp::orchestrator` module docs.
+- The AssertionIDRequest and AuthnQuery helpers (`get_authn_statements`,
+  `create_assertion_id_request_response`, `create_authn_query_response`) no longer
+  trust the `AssertionStore` to have scoped its answer. An assertion returned for a
+  subject must be that subject's, and one returned for an ID must have that ID,
+  otherwise a `StoreError`. A stale or wrongly keyed index would otherwise put one
+  subject's authentication statements into a response about another's. The check
+  binds the answer to the NameID value asked about; it does not authorize the
+  requester, which stays with the responder.
+- `Eptid` checks the shape of a value it reads from its cache: it must be
+  `<idp>!<sp>!<opaque>` where the opaque part has no `!` (an entity ID may, so a longer SP ID could otherwise pass for this one), otherwise a `StoreError`. The cache is trusted to return
+  what was issued, which is its purpose, but a value of the wrong shape was not
+  issued for this IdP and SP, and the realistic causes (a cache shared with another
+  IdP or tenant, a key written by the wrong code, a restored or flushed cache)
+  would otherwise hand the SP a permanently wrong identifier and remember it. A
+  forged value of the right shape (including another user's value for the same
+  IdP and SP) is not detected, so the cache must still be
+  private to this IdP and this secret, and must not evict. On by default;
+  `Eptid::with_store_verification(false)` for a cache whose values were issued
+  under an earlier IdP entity ID, or one you fully trust.
+- `IdentDb` no longer trusts what its `IdentityStore` returns. Each record a
+  lookup returns for a user (`name_ids_for`, `find_nameid`, `match_local_id`, and
+  the reads inside `get_nameid`) must be one the store's `user_for` attributes to
+  that user, and a durable lookup must return the `(SPNameQualifier,
+  NameQualifier, format)` slot that was asked for; otherwise the call fails with a
+  `StoreError`. A lookup that forgot the user in its `WHERE`, a wrong index or a
+  stale cache could otherwise hand one user another user's persistent NameID,
+  which is account takeover at every SP that has seen the value, with nothing
+  written to betray it. The check is in `IdentDb`, not in each store method, so
+  every lookup made through it is covered, including the default `find` /
+  `find_durable` that filter `for_user` (the path a minimal backend takes) and
+  `find_local_id`, which the NameIDMapping and ManageNameID handlers act on and
+  which must be confirmed by the owner's own `for_user` listing. It costs one `user_for` per
+  record returned, and needs `user_for` to see the store's own writes. On by
+  default; `IdentDb::with_store_verification(false)` skips it for a store you
+  fully trust.
 
 ## [0.9.1] - 2026-09-29
 

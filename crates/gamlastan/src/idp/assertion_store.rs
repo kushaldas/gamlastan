@@ -24,6 +24,8 @@ use crate::core::protocol::response::{Response, ResponseBase};
 use crate::core::protocol::status::{Status, StatusCode};
 use crate::idp::ident::StoreError;
 
+pub mod conformance;
+
 /// Store of issued assertions, queryable by assertion ID and by subject.
 ///
 /// Implement over Redis/SQL for multi-instance IdPs; the in-memory
@@ -32,6 +34,17 @@ use crate::idp::ident::StoreError;
 /// Every method is fallible: a backend that cannot answer must return
 /// [`StoreError`], not an empty result, so an outage is not mistaken for
 /// "no such assertion".
+///
+/// The query helpers ([`get_authn_statements`],
+/// [`create_assertion_id_request_response`], [`create_authn_query_response`]) do
+/// not trust the answers: an assertion returned for a subject must be that
+/// subject's, and one returned for an ID must have that ID, otherwise the call is
+/// a [`StoreError`]. The subject check binds the answer to the NameID *value*
+/// that was asked about; it does not decide who may ask. Whether the requester
+/// may learn about that subject's assertions is the responder's call. A backend still has to get the rest right - an ID stored
+/// again for another subject must leave the old subject's index, removal must
+/// clear it, and concurrent stores must not lose entries - and [`conformance`]
+/// checks that against a real instance.
 pub trait AssertionStore: Send + Sync {
     /// Record an issued assertion.
     fn store_assertion(&self, assertion: Assertion) -> Result<(), StoreError>;
@@ -137,6 +150,13 @@ impl AssertionStore for InMemoryAssertionStore {
 /// outside their Conditions window, and expired sessions are omitted. Results
 /// can additionally be narrowed by session index and acceptable authentication
 /// context class references (pysaml2 `get_authn_statements()`).
+///
+/// The store is not trusted to have scoped its answer: every assertion it returns
+/// must be for `name_id_value`, otherwise the call fails with a [`StoreError`]. An
+/// index that is stale or keyed wrongly would otherwise put one subject's
+/// authentication statements into an answer about another's. This binds the
+/// answer to the value asked about, not to the requester: authorizing the
+/// requester (for example by SP entity ID) is up to the caller.
 pub fn get_authn_statements(
     store: &dyn AssertionStore,
     name_id_value: &str,
@@ -144,8 +164,17 @@ pub fn get_authn_statements(
     requested_context_class_refs: &[String],
     now: DateTime<Utc>,
 ) -> Result<Vec<AuthnStatement>, StoreError> {
-    Ok(store
-        .assertions_for_subject(name_id_value)?
+    let assertions = store.assertions_for_subject(name_id_value)?;
+    if assertions
+        .iter()
+        .any(|a| subject_value(a).as_deref() != Some(name_id_value))
+    {
+        return Err(StoreError::new(
+            "the store's assertions_for_subject returned an assertion that is not for the \
+             requested subject; refusing to use it",
+        ));
+    }
+    Ok(assertions
         .into_iter()
         .filter(|assertion| {
             assertion.conditions.as_ref().is_some_and(|conditions| {
@@ -242,6 +271,9 @@ fn no_authn_context_response(
 ///
 /// Returns the previously issued assertions; unknown IDs yield a
 /// Requester error response.
+///
+/// The store is not trusted to return the assertion that was asked for: one whose
+/// ID differs from the requested one fails the call with a [`StoreError`].
 pub fn create_assertion_id_request_response(
     store: &dyn AssertionStore,
     request: &AssertionIdRequest,
@@ -251,7 +283,13 @@ pub fn create_assertion_id_request_response(
     let mut assertions = Vec::with_capacity(request.assertion_id_refs.len());
     for id_ref in &request.assertion_id_refs {
         match store.get_assertion(id_ref)? {
-            Some(a) => assertions.push(a),
+            Some(a) if a.id == *id_ref => assertions.push(a),
+            Some(_) => {
+                return Err(StoreError::new(
+                    "the store's get_assertion returned a different assertion than the one \
+                     requested; refusing to use it",
+                ))
+            }
             None => {
                 return Ok(Response {
                     base: ResponseBase {
@@ -583,5 +621,78 @@ mod tests {
         let response = create_authn_query_response(&store, &query, IDP, Utc::now()).unwrap();
         assert!(!response.base.status.is_success());
         assert!(response.assertions.is_empty());
+    }
+
+    /// A backend whose index is keyed wrongly: it answers every subject query with
+    /// one fixed subject's assertions, and every ID lookup with one fixed assertion.
+    struct Misindexed {
+        inner: InMemoryAssertionStore,
+    }
+
+    impl AssertionStore for Misindexed {
+        fn store_assertion(&self, assertion: Assertion) -> Result<(), StoreError> {
+            self.inner.store_assertion(assertion)
+        }
+        fn get_assertion(&self, _: &str) -> Result<Option<Assertion>, StoreError> {
+            self.inner.get_assertion("_victim1")
+        }
+        fn assertions_for_subject(&self, _: &str) -> Result<Vec<Assertion>, StoreError> {
+            self.inner.assertions_for_subject("victim")
+        }
+        fn remove_assertion(&self, id: &str) -> Result<(), StoreError> {
+            self.inner.remove_assertion(id)
+        }
+    }
+
+    fn misindexed() -> Misindexed {
+        let inner = InMemoryAssertionStore::new();
+        inner
+            .store_assertion(assertion(
+                "_victim1",
+                "victim",
+                "_sv",
+                constants::AUTHN_CONTEXT_PASSWORD,
+            ))
+            .unwrap();
+        Misindexed { inner }
+    }
+
+    #[test]
+    fn a_store_that_answers_for_the_wrong_subject_is_refused() {
+        let store = misindexed();
+        let now = Utc::now();
+        let err = get_authn_statements(&store, "mallory", None, &[], now).unwrap_err();
+        assert!(
+            err.to_string().contains("not for the requested subject"),
+            "{err}"
+        );
+
+        // The same through the AuthnQuery responder.
+        let query = create_authn_query(
+            "https://sp.example.com",
+            &name_id("mallory"),
+            None,
+            None,
+            None,
+        );
+        assert!(create_authn_query_response(&store, &query, IDP, now).is_err());
+
+        // The right subject is still answered.
+        assert_eq!(
+            get_authn_statements(&store, "victim", None, &[], now)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_store_that_returns_a_different_assertion_than_requested_is_refused() {
+        let store = misindexed();
+        let request =
+            create_assertion_id_request("https://sp.example.com", vec!["_other".to_string()], None);
+        let err =
+            create_assertion_id_request_response(&store, &request, IDP, Utc::now()).unwrap_err();
+        assert!(err.to_string().contains("different assertion"), "{err}");
     }
 }

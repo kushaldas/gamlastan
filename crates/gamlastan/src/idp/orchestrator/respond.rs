@@ -154,6 +154,47 @@ pub fn check_request(
     Disposition::Authenticate { methods }
 }
 
+/// The longest `AuthenticatingAuthority` accepted, in bytes (the SAML metadata
+/// limit for an entity ID).
+const MAX_AUTHORITY_LEN: usize = 1024;
+
+/// An `AuthenticatingAuthority` is an `xs:anyURI` naming the authority that
+/// authenticated the principal, typically an entity ID. Accept an absolute URI
+/// (a scheme, then something), at most [`MAX_AUTHORITY_LEN`] bytes, with no
+/// whitespace, control or non-XML characters. Anything else is a configuration fault: it
+/// would be signed into the assertion as written.
+/// Whether `c` is a legal XML 1.0 character. U+FFFE and U+FFFF are not, and are
+/// not `char::is_control`, so they would otherwise be rewritten when serialised.
+fn is_xml_char(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}')
+}
+
+fn validate_authenticating_authority(authority: &str) -> Result<(), ProfileError> {
+    let has_scheme = authority.split_once(':').is_some_and(|(scheme, rest)| {
+        !rest.is_empty()
+            && scheme
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    });
+    if authority.len() > MAX_AUTHORITY_LEN
+        || !has_scheme
+        || authority
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || !is_xml_char(c))
+    {
+        return Err(ProfileError::Other(format!(
+            "the authenticating authority {authority:?} (from AuthenticatedSubject or the \
+             AuthnBroker registration) is not a URI: it needs a scheme, no whitespace, control or non-XML \
+             characters, and at most {MAX_AUTHORITY_LEN} bytes"
+        )));
+    }
+    Ok(())
+}
+
 /// Whether the request carries a `RequestedAuthnContext` the engine cannot
 /// match, so it must be refused rather than treated as unconstrained.
 ///
@@ -344,6 +385,13 @@ pub fn create_authn_response(
                 .to_string(),
         )
     })?;
+    // The authority is written into the signed assertion's `AuthenticatingAuthority`
+    // (an `xs:anyURI`) whatever the application, or a broker registration, gave: a
+    // value that is not a URI is a configuration fault, caught before anything is
+    // stored.
+    if let Some(authority) = &authority {
+        validate_authenticating_authority(authority)?;
+    }
     if !class_ref_satisfies(
         engine.broker,
         params.requested_authn_context().as_ref(),

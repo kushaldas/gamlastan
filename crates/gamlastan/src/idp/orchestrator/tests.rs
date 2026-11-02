@@ -1580,6 +1580,112 @@ fn the_default_policy_signs_the_assertion() {
 }
 
 #[test]
+fn an_authenticating_authority_must_be_a_uri_and_nothing_is_stored_otherwise() {
+    use crate::idp::orchestrator::AuthenticatedSubject;
+    let decisions = ReleasePolicy::new();
+    let idents = IdentDb::in_memory(IDP);
+    let broker = AuthnBroker::new();
+    let (signer, cert) = shared_signer();
+    let engine = ResponseEngine {
+        idp_entity_id: IDP,
+        decisions: &decisions,
+        release: &PassThroughRelease,
+        idents: &idents,
+        broker: &broker,
+        assertions: None,
+        signer,
+        cert_der_b64: cert,
+    };
+    let respond = |authority: &str| {
+        // A persistent NameID would be stored if the authority were not checked first.
+        let p = params(processed_with_name_id_policy(
+            Some(constants::NAMEID_PERSISTENT),
+            None,
+            true,
+        ));
+        let subject = AuthenticatedSubject {
+            authn_method: AuthnMethodRef::Inline {
+                class_ref: PASSWORD.to_string(),
+                authn_authority: Some(authority.to_string()),
+            },
+            ..subject_without_mail()
+        };
+        create_authn_response(&engine, &p, &subject)
+    };
+
+    // Entity IDs and URNs are fine.
+    for good in [
+        "https://upstream.example/idp",
+        "urn:example:idp",
+        "x-scheme+1.2:rest",
+    ] {
+        assert!(respond(good).is_ok(), "{good} should be accepted");
+    }
+    idents
+        .remove_local(&subject_without_mail().subject_id)
+        .unwrap();
+
+    let too_long = format!("https://{}", "a".repeat(1100));
+    for bad in [
+        "",
+        " ",
+        "no scheme",
+        "has space:rest",
+        "scheme:",
+        "1scheme:rest",
+        "https://a\nb",
+        "https://a\u{7f}b",
+        too_long.as_str(),
+    ] {
+        let err = respond(bad).unwrap_err();
+        assert!(
+            err.to_string().contains("authenticating authority"),
+            "{bad:?}: {err}"
+        );
+    }
+    assert!(
+        idents
+            .name_ids_for(&subject_without_mail().subject_id)
+            .unwrap()
+            .is_empty(),
+        "a refused authority must not leave a stored NameID behind"
+    );
+}
+
+#[test]
+fn a_broker_registrations_authority_is_validated_too() {
+    let mut broker = AuthnBroker::new();
+    let reference = broker.add(PASSWORD, "/login", 1, Some("not a uri"));
+    let decisions = ReleasePolicy::new();
+    let idents = IdentDb::in_memory(IDP);
+    let (signer, cert) = shared_signer();
+    let engine = ResponseEngine {
+        idp_entity_id: IDP,
+        decisions: &decisions,
+        release: &PassThroughRelease,
+        idents: &idents,
+        broker: &broker,
+        assertions: None,
+        signer,
+        cert_der_b64: cert,
+    };
+    let subject = crate::idp::orchestrator::AuthenticatedSubject {
+        authn_method: AuthnMethodRef::BrokerReference(reference),
+        ..subject_without_mail()
+    };
+    let err = create_authn_response(
+        &engine,
+        &params(processed(false, false, vec![], None)),
+        &subject,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("authenticating authority"),
+        "{err}"
+    );
+}
+
+#[test]
 fn an_empty_broker_defers_an_exact_request_to_the_callback() {
     let broker = AuthnBroker::new();
     let decisions = ReleasePolicy::new();
