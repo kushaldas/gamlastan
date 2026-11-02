@@ -1231,6 +1231,72 @@ mod tests {
         conformance::run(InMemoryIdentityStore::new);
     }
 
+    /// The reference in-memory store with a pushed-down `find` that compares the
+    /// format literally (`WHERE format = ?`), so a record stored with no Format,
+    /// which is `unspecified`, is lost to a filter on that format.
+    struct LiteralFormatFind(InMemoryIdentityStore);
+
+    impl IdentityStore for LiteralFormatFind {
+        fn for_user(&self, user_id: &str) -> Result<Vec<NameId>, StoreError> {
+            self.0.for_user(user_id)
+        }
+        fn user_for(&self, value: &str) -> Result<Option<String>, StoreError> {
+            self.0.user_for(value)
+        }
+        fn find(&self, user_id: &str, filter: &NameIdFilter) -> Result<Vec<NameId>, StoreError> {
+            let rest = NameIdFilter {
+                format: None,
+                ..filter.clone()
+            };
+            Ok(self
+                .0
+                .for_user(user_id)?
+                .into_iter()
+                .filter(|n| {
+                    filter
+                        .format
+                        .as_deref()
+                        .is_none_or(|wanted| n.format.as_deref() == Some(wanted))
+                        && rest.matches(n)
+                })
+                .collect())
+        }
+        fn get_or_insert_durable(
+            &self,
+            user_id: &str,
+            candidate: NameId,
+        ) -> Result<NameId, InsertError> {
+            self.0.get_or_insert_durable(user_id, candidate)
+        }
+        fn insert(&self, user_id: &str, name_id: NameId) -> Result<(), InsertError> {
+            self.0.insert(user_id, name_id)
+        }
+        fn replace(&self, user_id: &str, name_id: NameId) -> Result<(), InsertError> {
+            self.0.replace(user_id, name_id)
+        }
+        fn remove(&self, value: &str) -> Result<(), StoreError> {
+            self.0.remove(value)
+        }
+        fn remove_all(&self, user_id: &str) -> Result<(), StoreError> {
+            self.0.remove_all(user_id)
+        }
+    }
+
+    #[test]
+    fn a_find_that_compares_the_format_literally_is_caught() {
+        let err = conformance::check_one(
+            "find_filters_on_every_field",
+            || LiteralFormatFind(InMemoryIdentityStore::new()),
+            &conformance::Options::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err.check, "find_filters_on_every_field");
+        assert!(
+            err.message.contains("an absent Format is `unspecified`"),
+            "{err}"
+        );
+    }
+
     /// Delegates to a store that does not enforce the persistent tuple on
     /// `insert`/`replace` (the reference in-memory store now does, which would
     /// mask the race these doubles model), except where a test overrides a

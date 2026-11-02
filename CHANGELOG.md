@@ -482,6 +482,12 @@ where needed to correct protocol handling.
 
 ### Fixed
 
+- The `idp::ident::conformance` check `find_filters_on_every_field` now stores a
+  record with no `Format` (and one with `unspecified` spelled out) and filters on
+  `unspecified`. An absent Format is `unspecified`, but a backend that pushes the
+  filter down as `format = ?` compares it literally and loses the record, and
+  nothing in the suite noticed: `IdentDb` verifies the records a `find` returns,
+  not that none were dropped. A backend with that bug now fails the check.
 - The IdP response engine no longer panics on a lifetime it cannot add to a date.
   `chrono`'s `+` panics on overflow, and a lifetime (from the policy) plus a start
   time (from the application, e.g. `authn_instant`) overflowed from about 8.2e12

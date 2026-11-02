@@ -597,10 +597,30 @@ fn find_filters_on_every_field<S: IdentityStore>(s: &S) -> Outcome {
         "insert",
         s.insert("bob", nid("f4", constants::NAMEID_EMAIL, Some(SP_A))),
     )?;
+    // An absent Format is `unspecified`. A backend that pushes the filter down as
+    // `format = ?` loses a record whose column is NULL, so one is stored with no
+    // Format (f5) and one with `unspecified` spelled out (f6).
+    step(
+        "insert",
+        s.insert(
+            "alice",
+            NameId {
+                format: None,
+                ..nid("f5", constants::NAMEID_UNSPECIFIED, Some(SP_B))
+            },
+        ),
+    )?;
+    step(
+        "insert",
+        s.insert(
+            "alice",
+            nid("f6", constants::NAMEID_UNSPECIFIED, Some(SP_A)),
+        ),
+    )?;
 
     ensure_eq!(
         find_values(s, NameIdFilter::default())?,
-        ["f1", "f2", "f3"],
+        ["f1", "f2", "f3", "f5", "f6"],
         "an empty filter matches every record of the user, and no one else's"
     );
     ensure_eq!(
@@ -612,7 +632,31 @@ fn find_filters_on_every_field<S: IdentityStore>(s: &S) -> Outcome {
             }
         )?,
         ["f1", "f2"],
-        "format filters"
+        "format filters, and a record with no Format is not `email`"
+    );
+    ensure_eq!(
+        find_values(
+            s,
+            NameIdFilter {
+                format: Some(constants::NAMEID_UNSPECIFIED.to_string()),
+                ..Default::default()
+            }
+        )?,
+        ["f5", "f6"],
+        "an absent Format is `unspecified`: a filter on that format must find the record \
+         stored without one as well as the one that says so"
+    );
+    ensure_eq!(
+        find_values(
+            s,
+            NameIdFilter {
+                format: Some(constants::NAMEID_UNSPECIFIED.to_string()),
+                sp_name_qualifier: Some(SP_B.to_string()),
+                ..Default::default()
+            }
+        )?,
+        ["f5"],
+        "the `unspecified` format combines with the other fields"
     );
     ensure_eq!(
         find_values(
@@ -622,7 +666,7 @@ fn find_filters_on_every_field<S: IdentityStore>(s: &S) -> Outcome {
                 ..Default::default()
             }
         )?,
-        ["f1", "f3"],
+        ["f1", "f3", "f6"],
         "sp_name_qualifier filters"
     );
     ensure_eq!(
@@ -633,7 +677,7 @@ fn find_filters_on_every_field<S: IdentityStore>(s: &S) -> Outcome {
                 ..Default::default()
             }
         )?,
-        ["f1", "f2", "f3"],
+        ["f1", "f2", "f3", "f5", "f6"],
         "name_qualifier filters"
     );
     ensure_eq!(
