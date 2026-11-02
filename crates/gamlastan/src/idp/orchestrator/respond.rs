@@ -746,3 +746,33 @@ fn construct_name_id(
             _ => NameIdFailure::Denied(Denial::InvalidNameIdPolicy),
         })
 }
+
+#[cfg(test)]
+mod expiry_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    /// `checked_add_signed` is `None` for an underflow as well as an overflow, and
+    /// the two mean opposite things for an expiry: one past the last date has not
+    /// been reached, one before the first date is long gone. (The policy never
+    /// yields a negative lifetime, but a start time is the application's.)
+    #[test]
+    fn has_expired_judges_an_unrepresentable_sum_by_its_direction() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 11, 2, 12, 0, 0)
+            .single()
+            .unwrap();
+        let huge = TimeDelta::seconds(9_000_000_000_000);
+
+        // Ordinary sums compare normally, and the boundary counts as expired.
+        let start = now - TimeDelta::hours(1);
+        assert!(!has_expired(start, TimeDelta::hours(2), now));
+        assert!(has_expired(start, TimeDelta::hours(1), now));
+        assert!(has_expired(start, TimeDelta::minutes(30), now));
+
+        // Past the last date: not reached.
+        assert!(!has_expired(now, huge, now));
+        // Before the first date: long gone.
+        assert!(has_expired(now, -huge, now));
+    }
+}

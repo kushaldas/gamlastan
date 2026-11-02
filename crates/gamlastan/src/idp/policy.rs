@@ -29,6 +29,7 @@ use crate::idp::entity_category::{
 };
 use crate::metadata::types::entity_descriptor::EntityDescriptor;
 use crate::metadata::types::sp::{RequestedAttribute, SpSsoDescriptor};
+use crate::xml::helpers::latest_wire_instant;
 
 /// Errors raised by policy evaluation.
 #[derive(Debug, thiserror::Error)]
@@ -176,7 +177,7 @@ impl PolicyEntry {
     }
 
     /// Set the assertion lifetime (`Conditions`/`SubjectConfirmationData`
-    /// `NotOnOrAfter`).
+    /// `NotOnOrAfter`). A negative value is treated as zero when read.
     pub fn with_lifetime(mut self, lifetime: TimeDelta) -> Self {
         self.lifetime = Some(lifetime);
         self
@@ -185,7 +186,8 @@ impl PolicyEntry {
     /// Set the SSO session lifetime (`AuthnStatement/@SessionNotOnOrAfter`),
     /// independent of the assertion lifetime. When unset, falls back to the
     /// assertion lifetime (see [`ReleasePolicy::session_lifetime`]) rather
-    /// than requiring every deployment to configure both.
+    /// than requiring every deployment to configure both. A negative value is
+    /// treated as zero when read.
     pub fn with_session_lifetime(mut self, lifetime: TimeDelta) -> Self {
         self.session_lifetime = Some(lifetime);
         self
@@ -504,10 +506,13 @@ impl ReleasePolicy {
             .unwrap_or_else(|| constants::ATTRNAME_FORMAT_URI.to_string())
     }
 
-    /// Assertion lifetime for the SP (default: 1 hour).
+    /// Assertion lifetime for the SP (default: 1 hour). A negative configured
+    /// lifetime is treated as zero: it has no meaning, and a negative one would
+    /// mint an assertion that is already expired.
     pub fn lifetime(&self, sp_entity_id: &str) -> TimeDelta {
         self.get(sp_entity_id, |e| e.lifetime)
             .unwrap_or_else(|| TimeDelta::hours(1))
+            .max(TimeDelta::zero())
     }
 
     /// SSO session lifetime for the SP (`AuthnStatement/@SessionNotOnOrAfter`).
@@ -518,14 +523,22 @@ impl ReleasePolicy {
     /// Falls back to [`lifetime`](Self::lifetime) when no session lifetime is
     /// configured, so a deployment that hasn't set one keeps today's
     /// behaviour rather than getting an unexpectedly short session.
+    ///
+    /// A negative configured session lifetime is treated as zero, as for
+    /// [`lifetime`](Self::lifetime).
     pub fn session_lifetime(&self, sp_entity_id: &str) -> TimeDelta {
         self.get(sp_entity_id, |e| e.session_lifetime)
+            .map(|lifetime| lifetime.max(TimeDelta::zero()))
             .unwrap_or_else(|| self.lifetime(sp_entity_id))
     }
 
     /// Assertion NotOnOrAfter for the SP (pysaml2 `not_on_or_after`).
+    ///
+    /// A lifetime too long to add to `now` saturates at 9999-12-31T23:59:59Z, the
+    /// last date an `xs:dateTime` can carry, instead of panicking.
     pub fn not_on_or_after(&self, sp_entity_id: &str, now: DateTime<Utc>) -> DateTime<Utc> {
-        now + self.lifetime(sp_entity_id)
+        now.checked_add_signed(self.lifetime(sp_entity_id))
+            .map_or_else(latest_wire_instant, |date| date.min(latest_wire_instant()))
     }
 
     /// Signing targets for the SP (default: none configured, which
@@ -1891,5 +1904,63 @@ mod tests {
             .with_attribute_restrictions(&[("mail", Some(&["("]))])
             .unwrap_err();
         assert!(matches!(err, PolicyError::InvalidPattern { .. }));
+    }
+}
+
+#[cfg(test)]
+mod lifetime_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    const SP: &str = "https://sp.example.org/sp";
+
+    #[test]
+    fn a_negative_lifetime_is_read_as_zero() {
+        let policy = ReleasePolicy::with_default(
+            PolicyEntry::new()
+                .with_lifetime(TimeDelta::seconds(-60))
+                .with_session_lifetime(TimeDelta::hours(-8)),
+        );
+        assert_eq!(policy.lifetime(SP), TimeDelta::zero());
+        assert_eq!(policy.session_lifetime(SP), TimeDelta::zero());
+    }
+
+    #[test]
+    fn the_session_lifetime_falls_back_to_the_assertion_lifetime_without_going_negative() {
+        let policy =
+            ReleasePolicy::with_default(PolicyEntry::new().with_lifetime(TimeDelta::seconds(-60)));
+        assert_eq!(policy.session_lifetime(SP), TimeDelta::zero());
+        // An ordinary one still falls back unchanged.
+        let policy =
+            ReleasePolicy::with_default(PolicyEntry::new().with_lifetime(TimeDelta::minutes(5)));
+        assert_eq!(policy.session_lifetime(SP), TimeDelta::minutes(5));
+    }
+
+    #[test]
+    fn not_on_or_after_saturates_instead_of_panicking() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 11, 2, 12, 0, 0)
+            .single()
+            .unwrap();
+        let entry =
+            |lifetime| ReleasePolicy::with_default(PolicyEntry::new().with_lifetime(lifetime));
+
+        // Ordinary.
+        assert_eq!(
+            entry(TimeDelta::minutes(5)).not_on_or_after(SP, now),
+            now + TimeDelta::minutes(5)
+        );
+        // Past what `chrono` holds: this used to panic.
+        assert_eq!(
+            entry(TimeDelta::seconds(9_000_000_000_000)).not_on_or_after(SP, now),
+            latest_wire_instant()
+        );
+        // Within `chrono` but past year 9999, which an xs:dateTime cannot carry.
+        assert_eq!(
+            entry(TimeDelta::seconds(300_000_000_000)).not_on_or_after(SP, now),
+            latest_wire_instant()
+        );
+        // A negative lifetime is zero, so the assertion expires at `now`.
+        assert_eq!(entry(TimeDelta::seconds(-60)).not_on_or_after(SP, now), now);
     }
 }
