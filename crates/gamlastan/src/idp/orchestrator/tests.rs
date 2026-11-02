@@ -2318,3 +2318,178 @@ fn authn_failed_denial_response_differs_from_cancelled_only_in_message() {
     assert!(failed.xml.contains("Authentication failed"));
     assert!(!failed.xml.contains("Authentication was cancelled"));
 }
+
+// ── lifetimes that cannot be added to a date ───────────────────────────────
+
+/// A lifetime comes from the policy and a start time from the application. When the
+/// two cannot be added, `chrono`'s `+` panics; the engine must refuse with an error
+/// instead, and before a durable NameID is stored.
+#[test]
+fn a_lifetime_too_long_to_add_is_refused_before_a_durable_nameid_is_stored() {
+    use crate::idp::policy::PolicyEntry;
+    // About 285 000 years: a valid `TimeDelta`, past the last date `chrono` has.
+    let too_long = TimeDelta::seconds(9_000_000_000_000);
+    for (what, entry) in [
+        ("assertion", PolicyEntry::new().with_lifetime(too_long)),
+        (
+            "session",
+            PolicyEntry::new().with_session_lifetime(too_long),
+        ),
+    ] {
+        let decisions = ReleasePolicy::with_default(entry);
+        with_engine(&decisions, |engine, idents| {
+            let p = params(processed_with_name_id_policy(
+                Some(constants::NAMEID_PERSISTENT),
+                None,
+                true,
+            ));
+            let err = create_authn_response(engine, &p, &subject_without_mail()).unwrap_err();
+            assert!(err.to_string().contains("years 0001-9999"), "{what}: {err}");
+            assert!(
+                idents.name_ids_for("alice").unwrap().is_empty(),
+                "{what}: nothing may be stored for a response that is not issued"
+            );
+        });
+    }
+}
+
+#[test]
+fn an_authn_instant_at_the_end_of_time_is_refused_not_a_panic() {
+    use crate::idp::orchestrator::AuthenticatedSubject;
+    let decisions = ReleasePolicy::new();
+    with_engine(&decisions, |engine, idents| {
+        let p = params(processed_with_name_id_policy(
+            Some(constants::NAMEID_PERSISTENT),
+            None,
+            true,
+        ));
+        // The default session lifetime is an hour, so this is half an hour short of
+        // being able to add it: the sum is past the last date `chrono` has. (Exactly
+        // an hour short lands on that date and is issued.)
+        let subject = AuthenticatedSubject {
+            authn_instant: Some(chrono::DateTime::<Utc>::MAX_UTC - TimeDelta::minutes(30)),
+            ..subject_without_mail()
+        };
+        let err = create_authn_response(engine, &p, &subject).unwrap_err();
+        assert!(err.to_string().contains("years 0001-9999"), "{err}");
+        assert!(idents.name_ids_for("alice").unwrap().is_empty());
+    });
+}
+
+/// `check_request` cannot return an error, and a session whose expiry is too far out
+/// to represent has not reached it: the session is reusable, and issuing reports the
+/// configuration fault.
+#[test]
+fn a_session_lifetime_too_long_to_add_does_not_panic_check_request() {
+    use crate::idp::policy::PolicyEntry;
+    let decisions = ReleasePolicy::with_default(
+        PolicyEntry::new().with_session_lifetime(TimeDelta::seconds(9_000_000_000_000)),
+    );
+    with_engine(&decisions, |engine, _| {
+        let p = params(processed(
+            false,
+            false,
+            vec![PASSWORD],
+            Some(AuthnContextComparison::Exact),
+        ));
+        let s = session(AuthnMethodRef::Inline {
+            class_ref: PASSWORD.to_string(),
+            authn_authority: None,
+        });
+        let d = check_request(engine, &p, Some(&s));
+        assert!(matches!(d, Disposition::ReuseSession { .. }), "{d:?}");
+    });
+}
+
+/// `chrono` holds dates far past year 9999 but writes them as `+11526-...`, which is
+/// not an `xs:dateTime`, so a response carrying one could not be read back. The
+/// limit is what a document can hold, not what `chrono` can add.
+#[test]
+fn an_expiry_past_year_9999_is_refused_though_chrono_can_hold_it() {
+    use crate::idp::policy::PolicyEntry;
+    // About 9 500 years: fine for `chrono`, not for the wire.
+    let decisions = ReleasePolicy::with_default(
+        PolicyEntry::new().with_session_lifetime(TimeDelta::seconds(300_000_000_000)),
+    );
+    with_engine(&decisions, |engine, idents| {
+        let p = params(processed_with_name_id_policy(
+            Some(constants::NAMEID_PERSISTENT),
+            None,
+            true,
+        ));
+        let err = create_authn_response(engine, &p, &subject_without_mail()).unwrap_err();
+        assert!(err.to_string().contains("years 0001-9999"), "{err}");
+        assert!(idents.name_ids_for("alice").unwrap().is_empty());
+    });
+    // A long but writable lifetime is issued.
+    let decisions = ReleasePolicy::with_default(
+        PolicyEntry::new().with_session_lifetime(TimeDelta::days(365 * 100)),
+    );
+    with_engine(&decisions, |engine, _| {
+        let p = params(processed(false, false, vec![], None));
+        let outcome = create_authn_response(engine, &p, &subject_without_mail()).unwrap();
+        assert!(matches!(outcome, ResponseOutcome::Issued(_)));
+    });
+}
+
+/// A negative session lifetime has no meaning and is read as zero, so a session is
+/// already over: never reusable, and a passive request that needs it is refused.
+#[test]
+fn a_negative_session_lifetime_is_read_as_zero_so_a_session_is_not_reusable() {
+    use crate::idp::policy::PolicyEntry;
+    let decisions = ReleasePolicy::with_default(
+        PolicyEntry::new().with_session_lifetime(TimeDelta::seconds(-9_000_000_000_000)),
+    );
+    with_engine(&decisions, |engine, _| {
+        let s = session(AuthnMethodRef::Inline {
+            class_ref: PASSWORD.to_string(),
+            authn_authority: None,
+        });
+        // Not reused: a fresh login is asked for...
+        let p = params(processed(false, false, vec![PASSWORD], None));
+        let d = check_request(engine, &p, Some(&s));
+        assert!(matches!(d, Disposition::Authenticate { .. }), "{d:?}");
+        // ...and a passive request that would need the session is refused.
+        let p = params(processed(false, true, vec![PASSWORD], None));
+        let d = check_request(engine, &p, Some(&s));
+        assert!(
+            matches!(
+                d,
+                Disposition::Deny {
+                    denial: crate::idp::orchestrator::Denial::NoPassive
+                }
+            ),
+            "{d:?}"
+        );
+    });
+}
+
+/// The same through issuing: a reused session under a negative lifetime is over.
+#[test]
+fn a_reused_session_under_a_negative_lifetime_is_refused_as_expired() {
+    use crate::idp::orchestrator::AuthenticatedSubject;
+    use crate::idp::policy::PolicyEntry;
+    let decisions = ReleasePolicy::with_default(
+        PolicyEntry::new().with_session_lifetime(TimeDelta::seconds(-9_000_000_000_000)),
+    );
+    with_engine(&decisions, |engine, idents| {
+        let p = params(processed_with_name_id_policy(
+            Some(constants::NAMEID_PERSISTENT),
+            None,
+            true,
+        ));
+        let subject = AuthenticatedSubject {
+            authn_instant: Some(Utc::now()),
+            ..subject_without_mail()
+        };
+        let outcome = create_authn_response(engine, &p, &subject).unwrap();
+        assert!(matches!(
+            outcome,
+            ResponseOutcome::Denied {
+                denial: crate::idp::orchestrator::Denial::AuthnFailed,
+                ..
+            }
+        ));
+        assert!(idents.name_ids_for("alice").unwrap().is_empty());
+    });
+}

@@ -131,7 +131,9 @@ pub struct ResponseOptions {
     /// The ACS URL (Response Destination + assertion Recipient).
     pub acs_url: String,
 
-    /// How long the assertion should be valid (seconds from now).
+    /// How long the assertion should be valid (seconds from now). A value too large
+    /// to add to the issue instant saturates at 9999-12-31T23:59:59Z, the last date
+    /// an `xs:dateTime` can carry.
     pub assertion_lifetime_seconds: u64,
 
     /// Whether to include a SessionIndex.

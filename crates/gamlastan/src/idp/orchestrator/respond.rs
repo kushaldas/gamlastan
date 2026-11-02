@@ -6,7 +6,7 @@
 //! test exhaustively. [`create_authn_response`] and
 //! [`create_denial_response`] perform the actual assembly in a fixed order.
 
-use chrono::{TimeDelta, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 
 use crate::core::assertion::name_id::NameId;
 use crate::core::protocol::response::Response;
@@ -17,6 +17,7 @@ use crate::idp::policy::{sp_attribute_requirements, PolicyError, ReleasePolicy};
 use crate::profiles::error::ProfileError;
 use crate::profiles::sso::idp::{create_error_response, create_response, sign_response_xml_with};
 use crate::profiles::sso::web_browser::{ResponseOptions, ResponseTimes};
+use crate::xml::helpers::checked_wire_add;
 use crate::xml::serialize::SamlSerialize;
 
 use super::denial::Denial;
@@ -103,8 +104,11 @@ pub fn check_request(
     // SessionNotOnOrAfter a *previous* response asserted, which must not
     // extend this), is not defeated by ForceAuthn, and whose establishing
     // method satisfies the requested context.
+    //
+    // An expiry too far out to represent is one that has not been reached;
+    // `create_authn_response` reports the configuration fault when it issues.
     let reusable = session.filter(|s| {
-        now < s.authn_instant + session_lifetime
+        !has_expired(s.authn_instant, session_lifetime, now)
             && !processed.force_authn
             && session_satisfies(engine.broker, requested.as_ref(), s)
     });
@@ -163,6 +167,39 @@ const MAX_AUTHORITY_LEN: usize = 1024;
 /// (a scheme, then something), at most [`MAX_AUTHORITY_LEN`] bytes, with no
 /// whitespace, control or non-XML characters. Anything else is a configuration fault: it
 /// would be signed into the assertion as written.
+/// `start + length`, or a configuration error when the result is not a date this
+/// crate can represent.
+///
+/// A lifetime comes from the policy and a start time from the application, so a
+/// large enough pair cannot be added: `chrono`'s `+` panics on overflow, which
+/// would take down the request thread. This is caught before anything is stored.
+fn expiry(
+    what: &str,
+    start: DateTime<Utc>,
+    length: TimeDelta,
+) -> Result<DateTime<Utc>, ProfileError> {
+    checked_wire_add(start, length).ok_or_else(|| {
+        ProfileError::Other(format!(
+            "the {what} of {} seconds cannot be added to {start}: the result is not a date \
+             a response can carry (years 0001-9999), so no response is issued",
+            length.num_seconds()
+        ))
+    })
+}
+
+/// Whether `start + length` is at or before `now`.
+///
+/// For a sum `chrono` cannot hold, the direction decides: past the last date with a
+/// positive `length` is an expiry that has not been reached; before the first date
+/// with a negative `length` is one long gone. Treating both alike would make a
+/// session with a hugely negative lifetime look unexpired.
+fn has_expired(start: DateTime<Utc>, length: TimeDelta, now: DateTime<Utc>) -> bool {
+    match start.checked_add_signed(length) {
+        Some(expiry) => expiry <= now,
+        None => length < TimeDelta::zero(),
+    }
+}
+
 /// Whether `c` is a legal XML 1.0 character. U+FFFE and U+FFFF are not, and are
 /// not `char::is_control`, so they would otherwise be rewritten when serialised.
 fn is_xml_char(c: char) -> bool {
@@ -406,10 +443,35 @@ pub fn create_authn_response(
     // by every SP validator, so refuse it here, before anything is stored.
     if let Some(authn_instant) = subject.authn_instant {
         let session_lifetime = engine.decisions.session_lifetime(&processed.sp_entity_id);
-        if authn_instant + session_lifetime <= Utc::now() {
+        if has_expired(authn_instant, session_lifetime, Utc::now()) {
             return denied(engine, params, &Denial::AuthnFailed);
         }
     }
+
+    // Assertion and session lifetimes are independent: the assertion's own
+    // validity window is typically short, while the SSO session it establishes is
+    // usually meant to outlive any one assertion (E79). Both expiry dates are
+    // worked out here, before the NameID is stored, so a lifetime that cannot be
+    // added to its start time is refused without leaving a record behind.
+    let now = Utc::now();
+    let lifetime = engine.decisions.lifetime(&processed.sp_entity_id);
+    let assertion_lifetime_seconds = lifetime.num_seconds().max(0) as u64;
+    let session_lifetime = engine.decisions.session_lifetime(&processed.sp_entity_id);
+    let not_on_or_after = expiry(
+        "assertion lifetime",
+        now,
+        TimeDelta::seconds(assertion_lifetime_seconds as i64),
+    )?;
+    // Derived from the subject's actual authn_instant (the original
+    // authentication time for a reused session; "now" for a fresh one), not
+    // from "now" unconditionally - otherwise reusing a session pushes its
+    // absolute expiry further out on every response, turning a fixed cap
+    // into an indefinitely-sliding window.
+    let session_not_on_or_after = Some(expiry(
+        "session lifetime",
+        subject.authn_instant.unwrap_or(now),
+        session_lifetime,
+    )?);
 
     // 5. Construct the NameID, honouring the request's NameIDPolicy and the
     //    IdP's default format. A NameID refusal is a protocol denial.
@@ -421,20 +483,7 @@ pub fn create_authn_response(
         Err(NameIdFailure::Fault(e)) => return Err(e),
     };
 
-    // 6. Build the response options. Assertion and session lifetimes are
-    //    independent: the assertion's own validity window is typically
-    //    short, while the SSO session it establishes is usually meant to
-    //    outlive any one assertion (E79).
-    let now = Utc::now();
-    let lifetime = engine.decisions.lifetime(&processed.sp_entity_id);
-    let assertion_lifetime_seconds = lifetime.num_seconds().max(0) as u64;
-    let session_lifetime = engine.decisions.session_lifetime(&processed.sp_entity_id);
-    // Derived from the subject's actual authn_instant (the original
-    // authentication time for a reused session; "now" for a fresh one), not
-    // from "now" unconditionally - otherwise reusing a session pushes its
-    // absolute expiry further out on every response, turning a fixed cap
-    // into an indefinitely-sliding window.
-    let session_not_on_or_after = Some(subject.authn_instant.unwrap_or(now) + session_lifetime);
+    // 6. Build the response options.
     let options = ResponseOptions {
         idp_entity_id: engine.idp_entity_id.to_string(),
         in_response_to: Some(processed.request_id.clone()),
@@ -493,7 +542,6 @@ pub fn create_authn_response(
     // 9. Return the issued response with its audit identifiers, using the
     //    same normalized (whole-second, non-negative) lifetime that went
     //    into the wire assertion so the two cannot disagree.
-    let not_on_or_after = now + TimeDelta::seconds(assertion_lifetime_seconds as i64);
     let released_attribute_names = released.iter().map(|a| a.name.clone()).collect();
     Ok(super::ResponseOutcome::Issued(IssuedResponse {
         xml: signed_xml,
@@ -697,4 +745,34 @@ fn construct_name_id(
             crate::idp::ident::IdentError::Store(e) => NameIdFailure::Fault(e.into()),
             _ => NameIdFailure::Denied(Denial::InvalidNameIdPolicy),
         })
+}
+
+#[cfg(test)]
+mod expiry_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    /// `checked_add_signed` is `None` for an underflow as well as an overflow, and
+    /// the two mean opposite things for an expiry: one past the last date has not
+    /// been reached, one before the first date is long gone. (The policy never
+    /// yields a negative lifetime, but a start time is the application's.)
+    #[test]
+    fn has_expired_judges_an_unrepresentable_sum_by_its_direction() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 11, 2, 12, 0, 0)
+            .single()
+            .unwrap();
+        let huge = TimeDelta::seconds(9_000_000_000_000);
+
+        // Ordinary sums compare normally, and the boundary counts as expired.
+        let start = now - TimeDelta::hours(1);
+        assert!(!has_expired(start, TimeDelta::hours(2), now));
+        assert!(has_expired(start, TimeDelta::hours(1), now));
+        assert!(has_expired(start, TimeDelta::minutes(30), now));
+
+        // Past the last date: not reached.
+        assert!(!has_expired(now, huge, now));
+        // Before the first date: long gone.
+        assert!(has_expired(now, -huge, now));
+    }
 }

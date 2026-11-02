@@ -482,6 +482,30 @@ where needed to correct protocol handling.
 
 ### Fixed
 
+- The IdP response engine no longer panics on a lifetime it cannot add to a date.
+  `chrono`'s `+` panics on overflow, and a lifetime (from the policy) plus a start
+  time (from the application, e.g. `authn_instant`) overflowed from about 8.2e12
+  seconds, taking down the request thread. `create_authn_response` now works out
+  the assertion and session expiry dates up front, with checked arithmetic, and
+  returns a `ProfileError` before anything is stored when either is not a date a
+  response can carry. That is years 0001-9999, not `chrono`'s wider range:
+  `chrono` writes later dates as `+262142-12-31...`, which is not an `xs:dateTime`
+  and which `parse_datetime` rejects. For the session-reuse checks an expiry that
+  cannot be held is judged by direction: past the last date it has not been
+  reached, so `check_request` treats the session as reusable and
+  `create_authn_response` does not refuse it as expired; before the first date it
+  long ago passed, so the session is not reusable and is refused as expired.
+  `profiles::sso::idp::create_response`, which is
+  infallible, now saturates the assertion's `NotOnOrAfter` at
+  9999-12-31T23:59:59Z instead of panicking; and an `assertion_lifetime_seconds`
+  above `i64::MAX`, which the old `as i64` cast wrapped into a negative lifetime
+  and so an already-expired assertion, saturates the same way.
+- `ReleasePolicy::lifetime` and `session_lifetime` read a negative configured
+  lifetime as zero. It has no meaning, the engine already clamped the assertion
+  lifetime, and the session lifetime (and the fallback to the assertion lifetime)
+  would otherwise have produced a `SessionNotOnOrAfter` before the authentication
+  time. `ReleasePolicy::not_on_or_after`, a public `now + lifetime`, panicked on
+  overflow like the engine did; it now saturates at 9999-12-31T23:59:59Z.
 - `IdentDb::match_local_id` (persistent NameID lookup) now matches only a
   stored identifier whose own format is also `persistent`, not any
   non-transient format. Previously, a persistent-format request for a

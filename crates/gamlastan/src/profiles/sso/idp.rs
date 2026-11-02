@@ -40,6 +40,7 @@ use crate::metadata::types::sp::SpSsoDescriptor;
 use crate::crypto::{DigestMethod, SamlSigner, SigningAlgorithms};
 use crate::profiles::error::ProfileError;
 use crate::profiles::sso::web_browser::{ResponseOptions, ResponseTimes};
+use crate::xml::helpers::{checked_wire_add, latest_wire_instant};
 use crate::xml::serialize::SamlSerialize;
 
 /// Result of processing an AuthnRequest on the IdP side.
@@ -334,8 +335,16 @@ pub fn create_response(
 ) -> Response {
     // Everything except AuthnInstant derives from the document issue instant.
     let now = times.issue_instant;
-    let assertion_lifetime = TimeDelta::seconds(options.assertion_lifetime_seconds as i64);
-    let not_on_or_after = now + assertion_lifetime;
+    // The lifetime is the caller's. One that does not fit a duration, or that runs
+    // past the last date an `xs:dateTime` can carry (9999-12-31T23:59:59Z),
+    // saturates at that date instead of panicking - or, above `i64::MAX`, wrapping
+    // negative into an assertion that is already expired. `idp::orchestrator`
+    // refuses such a lifetime before it gets here.
+    let not_on_or_after = i64::try_from(options.assertion_lifetime_seconds)
+        .ok()
+        .and_then(TimeDelta::try_seconds)
+        .and_then(|lifetime| checked_wire_add(now, lifetime))
+        .unwrap_or_else(latest_wire_instant);
 
     // Build SubjectConfirmation (bearer)
     let subject_confirmation = SubjectConfirmation {
@@ -1258,6 +1267,90 @@ mod tests {
             Err(ProfileError::AuthnRequestSignatureRequired)
         ));
         assert!(process_authn_request(&request, &sp_meta, true).is_ok());
+    }
+
+    /// `create_response` is infallible, so a lifetime it cannot add to the issue
+    /// instant saturates at the last date an xs:dateTime can carry. It used to panic, and above
+    /// `i64::MAX` the `as i64` cast wrapped negative, minting an expired assertion.
+    #[test]
+    fn test_create_response_saturates_an_unrepresentable_lifetime() {
+        let now = Utc::now();
+        let name_id = NameId {
+            value: "user@example.com".to_string(),
+            format: Some(constants::NAMEID_EMAIL.to_string()),
+            name_qualifier: None,
+            sp_name_qualifier: None,
+            sp_provided_id: None,
+        };
+        for seconds in [9_000_000_000_000_u64, i64::MAX as u64, u64::MAX] {
+            let options = ResponseOptions {
+                idp_entity_id: "https://idp.example.com".to_string(),
+                in_response_to: Some("_req123".to_string()),
+                sp_entity_id: "https://sp.example.com".to_string(),
+                acs_url: "https://sp.example.com/acs".to_string(),
+                assertion_lifetime_seconds: seconds,
+                session_index: None,
+                session_not_on_or_after: None,
+                authn_context_class_ref: Some(constants::AUTHN_CONTEXT_PASSWORD.to_string()),
+                client_address: None,
+                attributes: vec![],
+                authenticating_authorities: vec![],
+            };
+            let response = create_response(&options, &name_id, ResponseTimes::at(now));
+            let conditions = response.assertions[0].conditions.as_ref().unwrap();
+            assert_eq!(
+                conditions.not_on_or_after,
+                Some(latest_wire_instant()),
+                "{seconds} seconds"
+            );
+
+            // The saturated date has to survive the document: chrono's own last date
+            // is written as `+262142-12-31...`, which is not an xs:dateTime and which
+            // this crate's parser rejects.
+            let xml = response.to_xml_string().unwrap();
+            assert!(
+                xml.contains(r#"NotOnOrAfter="9999-12-31T23:59:59Z""#),
+                "{xml}"
+            );
+            let doc = crate::xml::parse_secure(&xml).unwrap();
+            let parsed = crate::xml::deserialize::parse_saml::<
+                crate::core::protocol::response::ResponseRef<'_>,
+            >(&doc)
+            .unwrap()
+            .to_owned();
+            assert_eq!(
+                parsed.assertions[0]
+                    .conditions
+                    .as_ref()
+                    .unwrap()
+                    .not_on_or_after,
+                Some(latest_wire_instant()),
+                "{seconds} seconds, after a round trip"
+            );
+        }
+        // An ordinary lifetime is unaffected.
+        let options = ResponseOptions {
+            idp_entity_id: "https://idp.example.com".to_string(),
+            in_response_to: None,
+            sp_entity_id: "https://sp.example.com".to_string(),
+            acs_url: "https://sp.example.com/acs".to_string(),
+            assertion_lifetime_seconds: 300,
+            session_index: None,
+            session_not_on_or_after: None,
+            authn_context_class_ref: Some(constants::AUTHN_CONTEXT_PASSWORD.to_string()),
+            client_address: None,
+            attributes: vec![],
+            authenticating_authorities: vec![],
+        };
+        let response = create_response(&options, &name_id, ResponseTimes::at(now));
+        assert_eq!(
+            response.assertions[0]
+                .conditions
+                .as_ref()
+                .unwrap()
+                .not_on_or_after,
+            Some(now + TimeDelta::seconds(300))
+        );
     }
 
     #[test]
