@@ -191,13 +191,19 @@ impl<S: KeyValueStore> Eptid<S> {
     /// The cache is trusted to return what was issued: that is its purpose, since
     /// recomputing could give a different value after the secret or digest
     /// changed. But a value that does not have the shape this type derives,
-    /// `<idp>!<sp>!<opaque>` with a non-empty opaque part that contains no `!` (entity IDs may contain `!`, so `<idp>!<sp>!x!y` could be another SP's), was not issued for this IdP and SP, and the realistic
-    /// causes are operational: a cache shared with another IdP or tenant, a key
-    /// written by the wrong code, a restored or flushed cache. With this on such a
-    /// value is a [`StoreError`] instead of an identifier handed to the SP, and
-    /// then remembered. It cannot detect a deliberately forged value of the right
-    /// shape, so the cache must still be private to this IdP and this secret, and
-    /// must not evict issued values (see
+    /// `<idp>!<sp>!<opaque>` with a non-empty opaque part that contains no `!`
+    /// (entity IDs may contain `!`, so `<idp>!<sp>!x!y` could be another SP's),
+    /// was not issued for this IdP and SP. With this on, such a value is a
+    /// [`StoreError`] instead of an identifier handed to the SP, and then
+    /// remembered.
+    ///
+    /// What it catches: another IdP's or SP's value, and a key written by the wrong
+    /// code. What it cannot: it cannot tell two right-shaped values apart, so a
+    /// cache shared with another deployment that uses the same IdP entity ID, a
+    /// backup restored from one, and a forged value are all accepted; and it cannot
+    /// see a flush, which is a miss, after which a changed secret or digest issues
+    /// a different value. The cache must therefore be private to this IdP and this
+    /// secret, and must not evict issued values (see
     /// [`kv_conformance`](crate::idp::ident::kv_conformance)).
     ///
     /// Turn it off when the IdP's entity ID has changed since the cached values
