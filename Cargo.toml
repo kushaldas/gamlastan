@@ -14,7 +14,7 @@ edition = "2021"
 repository = "https://github.com/kushaldas/gamlastan"
 readme = "README.md"
 license = "BSD-2-Clause"
-rust-version = "1.88"
+rust-version = "1.89"
 
 [workspace.dependencies]
 # Internal crates

@@ -5,6 +5,12 @@ on:
     # Daily at 06:17 UTC. Offset from :00 to avoid the GitHub cron rush.
     - cron: "17 6 * * *"
   push:
+    # Branches only. A release tag points at a commit the branch audit has already
+    # covered, and a red run on a tag only repeats advisories the daily run tracks as
+    # issues. Defining only `branches` leaves tags out, whereas defining only
+    # `tags-ignore` would also stop every branch push from triggering the audit.
+    branches:
+      - "**"
     paths:
       - "**/Cargo.toml"
       - "Cargo.lock"
@@ -28,6 +34,6 @@ jobs:
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          # actix-http 3.18.12 still pins h2 0.3.27; remove when Actix migrates
+          # actix-http 3.x still pins h2 0.3.27; remove when Actix migrates
           # to the patched h2 0.4.16+ line (actix/actix-web#4199).
           ignore: RUSTSEC-2026-0258

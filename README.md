@@ -10,7 +10,7 @@ The plan is to become Rust equivalent of
 not be 100% compatible, but will try to close the gap. We thank the amazing
 maintainers of the `pysaml2` project for maintaining the stack for the community.
 
-The workspace requires Rust 1.88 or later.
+The workspace requires Rust 1.89 or later.
 
 The unreleased 0.10 series uses uppsala 0.12, bergshamra 0.11 and kryptering
 0.7. Consumers that exchange XML documents, keys or signers with gamlastan
