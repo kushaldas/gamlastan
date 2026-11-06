@@ -36,4 +36,11 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           # actix-http 3.18.12 still pins h2 0.3.27; remove when Actix migrates
           # to the patched h2 0.4.16+ line (actix/actix-web#4199).
-          ignore: RUSTSEC-2026-0258
+          #
+          # actix-http 3.18.12 and actix-web 4.15.0 carry RUSTSEC-2026-0446, -0447 and
+          # -0448 (chunked-trailer request smuggling, unbounded decompression). The
+          # patched releases (actix-http 3.20.x, actix-web 4.18.x) need Rust 1.89, above
+          # the workspace rust-version of 1.88. Actix is used only by gamlastan-actix
+          # and the example-idp demo, and consumers resolve their own versions. Remove
+          # these when the MSRV moves to 1.89.
+          ignore: RUSTSEC-2026-0258,RUSTSEC-2026-0446,RUSTSEC-2026-0447,RUSTSEC-2026-0448
