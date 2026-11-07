@@ -5,6 +5,14 @@ All notable changes to this repository will be documented in this file.
 The project is still pre-1.0, so minor releases may include behavior changes
 where needed to correct protocol handling.
 
+## [Unreleased]
+
+### Changed
+
+- Raised the minimum supported Rust version from 1.88 to 1.89. The patched
+  actix-http (3.20.x) and actix-web (4.18.x), which fix RUSTSEC-2026-0446, -0447
+  and -0448, require it; the lockfile now resolves them.
+
 ## [0.10.0] - 2026-11-06
 
 This release adds the IdP response engine (`idp::orchestrator`) and reshapes the

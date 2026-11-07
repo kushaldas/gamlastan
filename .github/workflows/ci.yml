@@ -62,6 +62,39 @@ jobs:
       - name: SAML benchmark smoke checks
         run: cargo test -p gamlastan --bench saml_pipeline --locked -- --self-test
 
+  # The workspace `rust-version` is a promise to users, and only a build on that
+  # exact toolchain proves it. The main job above uses stable, so this one reads
+  # the declared version from Cargo.toml (one place to change) and type-checks
+  # every target against the committed lockfile on that toolchain.
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout gamlastan
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Read the declared MSRV
+        id: msrv
+        run: echo "version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -n1)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust ${{ steps.msrv.outputs.version }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      # The same fixture the main job downloads: unit tests `include_str!` it.
+      - name: Download eduGAIN metadata fixture
+        run: just _ensure-edugain
+
+      - name: Check all targets on the MSRV
+        run: cargo check --workspace --all-targets --locked
+
   # HSM / PKCS#11 signing is exercised against a real SoftHSM2 token. The
   # integration test is `#[ignore]`d (it needs a provisioned token), so it is
   # invisible to the main `cargo test --workspace` run above; this job
