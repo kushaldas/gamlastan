@@ -9,7 +9,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 repository = "https://github.com/kushaldas/gamlastan"
 readme = "README.md"
@@ -18,30 +18,30 @@ rust-version = "1.89"
 
 [workspace.dependencies]
 # Internal crates
-gamlastan = { version = "0.10.0", path = "crates/gamlastan" }
-gamlastan-actix = { version = "0.10.0", path = "crates/gamlastan-actix" }
-gamlastan-mdq = { version = "0.10.0", path = "crates/gamlastan-mdq" }
+gamlastan = { version = "0.11.0", path = "crates/gamlastan" }
+gamlastan-actix = { version = "0.11.0", path = "crates/gamlastan-actix" }
+gamlastan-mdq = { version = "0.11.0", path = "crates/gamlastan-mdq" }
 
 # XML parsing
-uppsala = "0.12.0"
+uppsala = "0.12.1"
 
 # XML security
-# 0.11 tracks uppsala 0.12 and the kryptering 0.7 backend. Keep the stack on
+# 0.12 tracks uppsala 0.12 and the kryptering 0.7 backend. Keep the stack on
 # one bergshamra minor to avoid duplicate XML security crates in the lockfile.
-bergshamra = "0.11.0"
-bergshamra-core = "0.11.0"
-bergshamra-dsig = "0.11.0"
-bergshamra-enc = "0.11.0"
-bergshamra-c14n = "0.11.0"
-bergshamra-crypto = "0.11.0"
-bergshamra-keys = "0.11.0"
+bergshamra = "0.12.0"
+bergshamra-core = "0.12.0"
+bergshamra-dsig = "0.12.0"
+bergshamra-enc = "0.12.0"
+bergshamra-c14n = "0.12.0"
+bergshamra-crypto = "0.12.0"
+bergshamra-keys = "0.12.0"
 
 # HSM / PKCS#11 signing backend (the low-level crypto provider beneath
 # bergshamra). This direct dependency exists so gamlastan can re-export the
 # shared `kryptering::Signer` trait/types without version drift from the
 # bergshamra stack. Features mirror bergshamra's kryptering dependency so the
 # crate resolves to a single instance with a unified feature set.
-kryptering = { version = "0.7.0", default-features = false, features = ["rustcrypto", "legacy", "post-quantum", "pkcs11"] }
+kryptering = { version = "0.7.1", default-features = false, features = ["rustcrypto", "legacy", "post-quantum", "pkcs11"] }
 
 # Date/time
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }

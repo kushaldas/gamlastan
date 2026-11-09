@@ -12,12 +12,15 @@ maintainers of the `pysaml2` project for maintaining the stack for the community
 
 The workspace requires Rust 1.89 or later.
 
-The unreleased 0.10 series uses uppsala 0.12, bergshamra 0.11 and kryptering
-0.7. Consumers that exchange XML documents, keys or signers with gamlastan
+Version 0.11.0 uses uppsala 0.12.1, bergshamra 0.12 and kryptering
+0.7.1. Consumers that exchange XML documents, keys or signers with gamlastan
 must use matching versions, or use the re-exports in `gamlastan::xml` and
 `gamlastan::crypto`. The crypto stack uses the RustCrypto provider with legacy,
 post-quantum and PKCS#11 support; the SAML algorithm policy still controls
 which algorithms are accepted.
+
+The Actix integration retains HTTP/2 support. Its current h2 dependency has
+RUSTSEC-2026-0258; see the temporary exception in `.cargo/audit.toml`.
 
 ## Workspace Structure
 

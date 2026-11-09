@@ -7,11 +7,19 @@ where needed to correct protocol handling.
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-09
+
 ### Changed
 
 - Raised the minimum supported Rust version from 1.88 to 1.89. The patched
-  actix-http (3.20.x) and actix-web (4.18.x), which fix RUSTSEC-2026-0446, -0447
-  and -0448, require it; the lockfile now resolves them.
+  actix-http 3.20+ and actix-web 4.18+, which fix RUSTSEC-2026-0446, -0447
+  and -0448, require it; the lockfile now resolves newer releases.
+- Updated the XML security stack to bergshamra 0.12.0, uppsala 0.12.1,
+  kryptering 0.7.1, and transitive tsp-ltv 0.6.1, along with compatible
+  workspace dependencies.
+- Retained Actix Web HTTP/2 support and recorded the transitive h2 0.3.27
+  advisory (RUSTSEC-2026-0258) as a temporary audit exception until Actix
+  adopts a patched h2 release.
 
 ## [0.10.0] - 2026-11-06
 
