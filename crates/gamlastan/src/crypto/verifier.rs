@@ -458,6 +458,10 @@ impl SamlVerifier {
 mod document_tests;
 
 #[cfg(test)]
+#[path = "transform_policy_tests.rs"]
+mod transform_policy_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
