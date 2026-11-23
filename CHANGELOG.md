@@ -7,6 +7,27 @@ where needed to correct protocol handling.
 
 ## [Unreleased]
 
+### Added
+
+- `profiles::sso::idp::verify_request_signatures`: verify every signature on an
+  inbound SP request (an HTTP-Redirect query signature and any enveloped XML
+  signatures) and return whether the request was authenticated, for use as
+  `process_authn_request`'s `request_signature_verified`. Each XML signature
+  must verify with every reference digest computed locally and must reference
+  the consumed message (a `#id` reference or the document root), so a valid
+  signature over a sibling object does not authorize it (ADR 0028). An
+  unsigned request is `Ok(false)`, not an error. Integrators no longer need to
+  re-implement this binding check.
+
+### Changed
+
+- `gamlastan-actix`: the IdP handlers' request and `ArtifactResolve` signature
+  checks now use `verify_request_signatures`. They additionally require every
+  reference digest to be verified locally, and verify an XML signature that the
+  message markup did not flag; a markup flag with no signature found is
+  refused. Error messages keep their `AuthnRequest` / `LogoutRequest` /
+  `ArtifactResolve` prefix.
+
 ## [0.11.0] - 2026-11-09
 
 ### Changed

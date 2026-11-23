@@ -1009,46 +1009,34 @@ fn verify_sp_message_signature(
         ))
     })?;
 
-    let results = verifier.verify_all_enveloped(xml_str).map_err(|e| {
-        SamlActixError::Profile(gamlastan::profiles::ProfileError::AssertionValidation(
-            format!("{what} signature verification failed: {e}"),
-        ))
-    })?;
-    if results.is_empty() {
-        return Err(SamlActixError::Profile(
+    // The shared core check verifies every signature, binds each to the parsed
+    // message, and reports whether any signature was present.
+    match gamlastan::profiles::sso::idp::verify_request_signatures(
+        &verifier,
+        None,
+        xml_str,
+        expected_id,
+    ) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(SamlActixError::Profile(
             gamlastan::profiles::ProfileError::AssertionValidation(format!(
                 "{what} contains no XML signature"
             )),
-        ));
+        )),
+        Err(e) => Err(relabel_signature_error(what, e)),
     }
+}
 
-    for result in results {
-        match result {
-            gamlastan::crypto::VerifyResult::Valid { references, .. } => {
-                // Bind every signature to the parsed message. This also keeps
-                // a second unbound-but-valid signature from hiding behind a
-                // valid first signature.
-                if !references.iter().any(|reference| {
-                    reference.uri.is_empty() || reference.uri.strip_prefix('#') == Some(expected_id)
-                }) {
-                    return Err(SamlActixError::Profile(
-                        gamlastan::profiles::ProfileError::AssertionValidation(format!(
-                            "{what} signature did not reference the message (XML Signature Wrapping)"
-                        )),
-                    ));
-                }
-            }
-            gamlastan::crypto::VerifyResult::Invalid { reason } => {
-                return Err(SamlActixError::Profile(
-                    gamlastan::profiles::ProfileError::AssertionValidation(format!(
-                        "{what} signature invalid: {reason}"
-                    )),
-                ));
-            }
-        }
-    }
-
-    Ok(())
+/// Prefix a core signature-verification error with the message kind, keeping
+/// the 403-mapped [`ProfileError::AssertionValidation`] shape.
+fn relabel_signature_error(what: &str, error: gamlastan::profiles::ProfileError) -> SamlActixError {
+    let detail = match error {
+        gamlastan::profiles::ProfileError::AssertionValidation(detail) => detail,
+        other => other.to_string(),
+    };
+    SamlActixError::Profile(gamlastan::profiles::ProfileError::AssertionValidation(
+        format!("{what} {detail}"),
+    ))
 }
 
 /// Verify every signature representation present on an SP request and return
@@ -1070,41 +1058,47 @@ fn verify_sp_request_signatures(
     has_xml_signature: bool,
     what: &str,
 ) -> Result<bool, SamlActixError> {
-    let mut verified = false;
-
-    if let Some(signature) = redirect_signature {
-        let verifier = config.verifier_for(sp).ok_or_else(|| {
-            SamlActixError::Profile(gamlastan::profiles::ProfileError::AssertionValidation(
-                format!("{what} issuer has no usable signing certificate in metadata"),
-            ))
-        })?;
-        let valid = verifier
-            .verify_redirect_query(
-                signature.signature_input.as_bytes(),
-                &signature.signature,
-                &signature.sig_alg,
-            )
-            .map_err(|e| {
-                SamlActixError::Profile(gamlastan::profiles::ProfileError::AssertionValidation(
-                    format!("{what} redirect signature verification failed: {e}"),
-                ))
-            })?;
-        if !valid {
-            return Err(SamlActixError::Profile(
-                gamlastan::profiles::ProfileError::AssertionValidation(format!(
-                    "{what} redirect signature is invalid"
-                )),
-            ));
-        }
-        verified = true;
+    // Nothing signed: no key material is needed and the request is simply
+    // unauthenticated; the caller decides whether that is acceptable.
+    if redirect_signature.is_none() && !has_xml_signature {
+        return Ok(false);
     }
 
-    if has_xml_signature {
-        verify_sp_message_signature(config, sp, xml, request_id, what)?;
-        verified = true;
-    }
+    let verifier = config.verifier_for(sp).ok_or_else(|| {
+        SamlActixError::Profile(gamlastan::profiles::ProfileError::AssertionValidation(
+            format!("{what} issuer has no usable signing certificate in metadata"),
+        ))
+    })?;
 
-    Ok(verified)
+    // The Redirect signature fields are all the core check reads.
+    let redirect =
+        redirect_signature.map(|signature| gamlastan::bindings::redirect::RedirectDecoded {
+            saml_xml: Vec::new(),
+            is_request: true,
+            relay_state: None,
+            sig_alg: Some(signature.sig_alg.clone()),
+            signature: Some(signature.signature.clone()),
+            signature_input: Some(signature.signature_input.clone()),
+        });
+
+    let verified = gamlastan::profiles::sso::idp::verify_request_signatures(
+        &verifier,
+        redirect.as_ref(),
+        xml,
+        request_id,
+    )
+    .map_err(|e| relabel_signature_error(what, e))?;
+
+    // The message markup claimed an XML signature but none was found: the two
+    // parses disagree, so refuse rather than treat the request as unsigned.
+    if !verified {
+        return Err(SamlActixError::Profile(
+            gamlastan::profiles::ProfileError::AssertionValidation(format!(
+                "{what} contains no XML signature"
+            )),
+        ));
+    }
+    Ok(true)
 }
 
 /// Resolve trusted SP metadata for `entity_id`: the static

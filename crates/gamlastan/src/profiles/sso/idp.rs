@@ -851,6 +851,125 @@ pub fn create_signed_response(
     )
 }
 
+/// Verify every signature on an inbound SP request and say whether the request
+/// was authenticated.
+///
+/// An SP request can carry a signature in two places: a query-string signature
+/// of the HTTP-Redirect binding (`redirect`), and an enveloped XML signature in
+/// the message (`xml`). This checks **each representation that is present**:
+///
+/// - the Redirect signature must verify against the verifier's keys (a
+///   `Signature` without `SigAlg`, or the reverse, is an error);
+/// - every XML signature must verify, have every reference digest computed
+///   locally, and have a reference that covers `message_id` (a `#message_id`
+///   same-document reference, or the document root through an empty `URI`), so a
+///   valid signature over a sibling object cannot authorize this one (XML
+///   Signature Wrapping, ADR 0028). A second valid signature that covers
+///   something else does not hide behind a valid first one.
+///
+/// Returns `Ok(true)` when at least one representation is present and all that
+/// are present verify, and `Ok(false)` when the request carries no signature at
+/// all, which is not an error here: the caller decides whether a signature is
+/// required (see [`process_authn_request`]'s `request_signature_verified`).
+/// Pass the result of this function as that argument.
+///
+/// `verifier` carries the SP's signing keys, usually built from its metadata. A
+/// caller with no usable key must refuse the request instead of calling this.
+/// `message_id` is the `ID` of the parsed request, not an attacker-supplied
+/// string from elsewhere.
+///
+/// # Errors
+///
+/// [`ProfileError::AssertionValidation`] when a signature is invalid, malformed,
+/// unbound, or cannot be verified.
+pub fn verify_request_signatures(
+    verifier: &crate::crypto::SamlVerifier,
+    redirect: Option<&crate::bindings::redirect::RedirectDecoded>,
+    xml: &str,
+    message_id: &str,
+) -> Result<bool, ProfileError> {
+    let mut authenticated = false;
+
+    if let Some(decoded) = redirect {
+        if decoded.signature.is_some() || decoded.sig_alg.is_some() {
+            match crate::bindings::redirect::redirect_verify_signature(decoded, verifier) {
+                Ok(true) => authenticated = true,
+                Ok(false) => {
+                    return Err(ProfileError::AssertionValidation(
+                        "redirect signature is invalid".to_string(),
+                    ))
+                }
+                Err(e) => {
+                    return Err(ProfileError::AssertionValidation(format!(
+                        "redirect signature verification failed: {e}"
+                    )))
+                }
+            }
+        }
+    }
+
+    // The verifier reports "no signature" as an error, which would be
+    // indistinguishable from a broken one. Look for a `ds:Signature` with the
+    // parse the verifier itself uses, so both see the same document.
+    if !contains_xml_signature(xml)? {
+        return Ok(authenticated);
+    }
+    let results = verifier.verify_all_enveloped(xml).map_err(|e| {
+        ProfileError::AssertionValidation(format!("signature verification failed: {e}"))
+    })?;
+    for result in &results {
+        match result {
+            crate::crypto::VerifyResult::Valid { references, .. } => {
+                if !result.all_reference_digests_verified() {
+                    return Err(ProfileError::AssertionValidation(
+                        "signature has a reference whose digest was not verified".to_string(),
+                    ));
+                }
+                // Bind every signature to the parsed message, not only one.
+                if !references
+                    .iter()
+                    .any(|reference| reference_uri_covers(&reference.uri, message_id))
+                {
+                    return Err(ProfileError::AssertionValidation(
+                        "signature did not reference the message (XML Signature Wrapping)"
+                            .to_string(),
+                    ));
+                }
+            }
+            crate::crypto::VerifyResult::Invalid { reason } => {
+                return Err(ProfileError::AssertionValidation(format!(
+                    "signature invalid: {reason}"
+                )));
+            }
+        }
+    }
+    if !results.is_empty() {
+        authenticated = true;
+    }
+
+    Ok(authenticated)
+}
+
+/// Whether `xml` contains a `ds:Signature` element, under the same comment- and
+/// PI-tolerant parse that [`crate::crypto::SamlVerifier`] uses. A document that
+/// cannot be parsed is an error, never "unsigned".
+fn contains_xml_signature(xml: &str) -> Result<bool, ProfileError> {
+    let doc = crate::xml::parse_secure_metadata(xml).map_err(|e| {
+        ProfileError::AssertionValidation(format!(
+            "cannot parse the request to look for a signature: {e}"
+        ))
+    })?;
+    Ok(!doc
+        .get_elements_by_tag_name_ns(namespace::XMLDSIG_NS, "Signature")
+        .is_empty())
+}
+
+/// Whether a verified reference `uri` covers the object with `id`: a `#id`
+/// same-document reference, or the document root through an empty `URI`.
+fn reference_uri_covers(uri: &str, id: &str) -> bool {
+    uri.is_empty() || uri.strip_prefix('#') == Some(id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1776,5 +1895,209 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("cannot find <Assertion>"));
+    }
+}
+
+#[cfg(test)]
+mod request_signature_tests {
+    use super::*;
+    use crate::bindings::redirect::{
+        redirect_decode, redirect_encode, RedirectDecoded, RedirectEncodeParams,
+    };
+    use crate::bindings::traits::HttpRequest;
+    use crate::crypto::{keys::loader, KeyUsage, KeysManager, SamlSigner, SamlVerifier};
+
+    const CERT: &str = include_str!("../../../tests/fixtures/enc-cert.pem");
+    const KEY: &str = include_str!("../../../tests/fixtures/enc-key.pem");
+    const REQUEST_ID: &str = "_req1";
+    const SIG_ALG: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
+
+    fn signer() -> SamlSigner {
+        let mut key = loader::load_pem_auto(KEY.as_bytes(), None).unwrap();
+        key.usage = KeyUsage::Sign;
+        let mut keys = KeysManager::new();
+        keys.add_key(key);
+        SamlSigner::new(keys)
+    }
+
+    fn verifier_for(cert_pem: &str) -> SamlVerifier {
+        let mut key = loader::load_pem_auto(cert_pem.as_bytes(), None).unwrap();
+        key.usage = KeyUsage::Verify;
+        let mut keys = KeysManager::new();
+        keys.add_key(key);
+        let mut verifier = SamlVerifier::new(keys);
+        verifier.set_skip_time_checks(true);
+        verifier
+    }
+
+    fn cert_b64() -> String {
+        CERT.lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect()
+    }
+
+    fn unsigned_request(extra: &str) -> String {
+        format!(
+            r#"<samlp:AuthnRequest xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="{REQUEST_ID}" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"><saml:Issuer>https://sp.example.test</saml:Issuer>{extra}</samlp:AuthnRequest>"#
+        )
+    }
+
+    /// An AuthnRequest with an enveloped signature over `reference_id`.
+    fn signed_request(reference_id: &str, extra_after: &str) -> String {
+        let sig = signature_template(reference_id, &cert_b64(), SIG_ALG);
+        let xml = unsigned_request(&format!("{sig}{extra_after}"));
+        signer().sign_enveloped(&xml).unwrap()
+    }
+
+    struct RedirectRequest(String);
+
+    impl HttpRequest for RedirectRequest {
+        fn method(&self) -> &str {
+            "GET"
+        }
+        fn url(&self) -> &str {
+            &self.0
+        }
+        fn query_param(&self, name: &str) -> Option<&str> {
+            let (_, query) = self.0.split_once('?')?;
+            query
+                .split('&')
+                .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))
+        }
+        fn form_param(&self, _name: &str) -> Option<&str> {
+            None
+        }
+        fn header(&self, _name: &str) -> Option<&str> {
+            None
+        }
+        fn body(&self) -> &[u8] {
+            &[]
+        }
+        fn remote_addr(&self) -> Option<&str> {
+            None
+        }
+    }
+
+    fn redirect_request(xml: &str, sign: bool) -> RedirectDecoded {
+        let signer = signer();
+        let url = redirect_encode(&RedirectEncodeParams {
+            saml_xml: xml.as_bytes(),
+            is_request: true,
+            destination: "https://idp.example.test/sso",
+            relay_state: None,
+            signer: sign.then_some((&signer, SIG_ALG)),
+        })
+        .unwrap();
+        redirect_decode(&RedirectRequest(url)).unwrap()
+    }
+
+    #[test]
+    fn unsigned_request_is_not_authenticated_but_not_an_error() {
+        let xml = unsigned_request("");
+        let verified = verify_request_signatures(&verifier_for(CERT), None, &xml, REQUEST_ID);
+        assert!(!verified.unwrap());
+    }
+
+    #[test]
+    fn enveloped_signature_over_the_request_authenticates() {
+        let xml = signed_request(REQUEST_ID, "");
+        let verified = verify_request_signatures(&verifier_for(CERT), None, &xml, REQUEST_ID);
+        assert!(verified.unwrap());
+    }
+
+    #[test]
+    fn tampered_signed_request_is_rejected() {
+        let xml = signed_request(REQUEST_ID, "").replace("sp.example.test", "evil.example.test");
+        assert!(verify_request_signatures(&verifier_for(CERT), None, &xml, REQUEST_ID).is_err());
+    }
+
+    #[test]
+    fn signature_by_another_key_is_rejected() {
+        let other = include_str!("../../../tests/fixtures/ec256-cert.pem");
+        let xml = signed_request(REQUEST_ID, "");
+        assert!(verify_request_signatures(&verifier_for(other), None, &xml, REQUEST_ID).is_err());
+    }
+
+    #[test]
+    fn valid_signature_over_a_different_id_than_the_consumed_one_is_rejected() {
+        // The signature is valid and covers `_req1`, but the caller consumes a
+        // request whose ID is `_other`: the binding check must refuse it.
+        let xml = signed_request(REQUEST_ID, "");
+        let err = verify_request_signatures(&verifier_for(CERT), None, &xml, "_other")
+            .expect_err("a signature over another ID must not authenticate");
+        assert!(
+            err.to_string().contains("did not reference the message"),
+            "rejected for the wrong reason: {err}"
+        );
+    }
+
+    #[test]
+    fn signature_over_a_sibling_object_is_rejected() {
+        // A real signature over `_other`, a sibling of the Signature, while the
+        // consumed request is `_req1`.
+        let xml = signed_request("_other", r#"<x ID="_other"/>"#);
+        let verified = verify_request_signatures(&verifier_for(CERT), None, &xml, REQUEST_ID);
+        assert!(verified.is_err(), "unbound signature must not authenticate");
+    }
+
+    #[test]
+    fn signed_redirect_authenticates() {
+        let decoded = redirect_request(&unsigned_request(""), true);
+        let verified = verify_request_signatures(
+            &verifier_for(CERT),
+            Some(&decoded),
+            &unsigned_request(""),
+            REQUEST_ID,
+        );
+        assert!(verified.unwrap());
+    }
+
+    #[test]
+    fn unsigned_redirect_is_not_authenticated() {
+        let decoded = redirect_request(&unsigned_request(""), false);
+        let verified = verify_request_signatures(
+            &verifier_for(CERT),
+            Some(&decoded),
+            &unsigned_request(""),
+            REQUEST_ID,
+        );
+        assert!(!verified.unwrap());
+    }
+
+    #[test]
+    fn tampered_redirect_signature_is_rejected() {
+        let mut decoded = redirect_request(&unsigned_request(""), true);
+        let signature = decoded.signature.as_mut().unwrap();
+        signature[0] ^= 0xff;
+        let verified = verify_request_signatures(
+            &verifier_for(CERT),
+            Some(&decoded),
+            &unsigned_request(""),
+            REQUEST_ID,
+        );
+        assert!(verified.is_err());
+    }
+
+    #[test]
+    fn redirect_signature_without_sig_alg_is_rejected() {
+        let mut decoded = redirect_request(&unsigned_request(""), true);
+        decoded.sig_alg = None;
+        let verified = verify_request_signatures(
+            &verifier_for(CERT),
+            Some(&decoded),
+            &unsigned_request(""),
+            REQUEST_ID,
+        );
+        assert!(verified.is_err());
+    }
+
+    #[test]
+    fn valid_redirect_does_not_excuse_an_invalid_xml_signature() {
+        let decoded = redirect_request(&unsigned_request(""), true);
+        let tampered =
+            signed_request(REQUEST_ID, "").replace("sp.example.test", "evil.example.test");
+        let verified =
+            verify_request_signatures(&verifier_for(CERT), Some(&decoded), &tampered, REQUEST_ID);
+        assert!(verified.is_err());
     }
 }
