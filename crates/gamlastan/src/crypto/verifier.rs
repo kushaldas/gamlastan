@@ -193,9 +193,18 @@ fn validate_signature_transforms(
             ));
         }
 
+        // bergshamra executes every child of `ds:Transforms` whose *local name*
+        // is `Transform`, in any namespace or none (`verify.rs`, both the fast
+        // path and the generic pipeline). Select them the same way, so a
+        // namespace-less or foreign-namespace transform cannot slip past the
+        // allowlist or the count limit, and refuse one that is not in the
+        // XML-DSig namespace: a SAML signature never has one.
         for (index, transform) in doc
             .children_iter(transforms)
-            .filter(|child| is_dsig_element(doc, *child, "Transform"))
+            .filter(|child| {
+                doc.element(*child)
+                    .is_some_and(|element| element.name.local_name == "Transform")
+            })
             .enumerate()
         {
             if policy
@@ -205,6 +214,17 @@ fn validate_signature_transforms(
                 return Err(CryptoError::VerificationFailed(format!(
                     "Reference has more than {} transforms; that is the transform policy limit",
                     policy.max_transforms_per_reference().unwrap_or_default()
+                )));
+            }
+            if !is_dsig_element(doc, transform, "Transform") {
+                let namespace = doc
+                    .element(transform)
+                    .and_then(|element| element.name.namespace_uri.as_deref())
+                    .unwrap_or("");
+                return Err(CryptoError::VerificationFailed(format!(
+                    "Reference has a Transform element in the namespace {} instead of the \
+                     XML-DSig namespace; the transform policy does not allow it",
+                    quoted_for_error(namespace)
                 )));
             }
             let algorithm = algorithm_attribute(doc, transform, "Transform")?;

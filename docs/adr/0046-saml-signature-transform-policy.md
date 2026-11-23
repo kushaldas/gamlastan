@@ -43,6 +43,12 @@ error differed between an existing and a missing file.
    references per signature and 8 transforms per reference. Every signature the
    verifier would consume is checked, using the same selection as the algorithm
    policy.
+   Transforms are selected the way bergshamra selects them: every child of
+   `ds:Transforms` whose local name is `Transform`, in any namespace or none
+   (bergshamra's fast path and generic pipeline both do this, while it finds
+   `Signature`, `SignedInfo`, `Reference` and `Transforms` by namespace). A
+   `Transform` outside the XML-DSig namespace is refused, since a SAML
+   signature never has one and bergshamra would otherwise run it unseen.
 3. Make it configurable rather than fixed: `permissive()` restores the previous
    behavior, `with_transforms` and `with_any_transform` change the transform
    allowlist, `with_reference_uris(ReferenceUris::Any)` allows other URIs,

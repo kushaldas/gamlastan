@@ -352,3 +352,63 @@ fn every_signature_in_the_message_is_checked() {
     );
     assert!(message(&error).contains("transform"), "{error}");
 }
+
+// -- elements the backend treats as transforms, whatever their namespace -----------
+
+/// bergshamra executes any child of `ds:Transforms` whose *local name* is
+/// `Transform`, in any namespace or none. The policy must see the same ones.
+const UNQUALIFIED_XPATH: &str = r##"<Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>not(ancestor-or-self::ds:Signature) and not(ancestor-or-self::saml:Issuer)</ds:XPath></Transform><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"##;
+const FOREIGN_XPATH: &str = r##"<x:Transform xmlns:x="urn:example:other" Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>not(ancestor-or-self::ds:Signature) and not(ancestor-or-self::saml:Issuer)</ds:XPath></x:Transform><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"##;
+
+#[test]
+fn an_unqualified_xpath_transform_is_refused_like_a_qualified_one() {
+    let xml = request_with_transforms(UNQUALIFIED_XPATH);
+    let tampered = xml.replace("sp.example.test", "evil.example.test");
+    let error = refused(
+        verifier().verify_all_enveloped(&tampered),
+        "an unqualified XPath transform",
+    );
+    assert!(message(&error).contains("transform"), "{error}");
+}
+
+#[test]
+fn a_foreign_namespace_xpath_transform_is_refused_like_a_qualified_one() {
+    let xml = request_with_transforms(FOREIGN_XPATH);
+    let tampered = xml.replace("sp.example.test", "evil.example.test");
+    let error = refused(
+        verifier().verify_all_enveloped(&tampered),
+        "a foreign-namespace XPath transform",
+    );
+    assert!(message(&error).contains("transform"), "{error}");
+}
+
+#[test]
+fn many_unqualified_transforms_cannot_dodge_the_limit() {
+    // Nine namespace-less transforms must not slip past the count limit; they
+    // are refused at the first one, for being outside the XML-DSig namespace.
+    let transform = format!(r##"<Transform Algorithm="{ENVELOPED_URI}"/>"##);
+    let reference = format!(
+        r##"<ds:Reference URI="#{ID}"><ds:Transforms>{}</ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>AAAA</ds:DigestValue></ds:Reference>"##,
+        transform.repeat(9)
+    );
+    let xml = signature_with_references(&reference);
+    let error = refused(
+        verifier().verify_all_enveloped(&xml),
+        "nine unqualified transforms",
+    );
+    assert!(message(&error).contains("namespace"), "{error}");
+}
+
+#[test]
+fn an_unqualified_standard_transform_is_not_accepted_as_profile_compliant() {
+    // Even a transform that would be allowed by its URI is refused when it is
+    // not in the XML-DSig namespace: a SAML signature never has one.
+    let xml = request_with_transforms(&format!(
+        r##"<Transform Algorithm="{ENVELOPED_URI}"/><ds:Transform Algorithm="{EXC_C14N}"/>"##
+    ));
+    let error = refused(
+        verifier().verify_all_enveloped(&xml),
+        "an unqualified transform",
+    );
+    assert!(message(&error).contains("namespace"), "{error}");
+}
