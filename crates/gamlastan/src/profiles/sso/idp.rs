@@ -2122,6 +2122,41 @@ mod request_signature_tests {
         assert!(verified.is_err());
     }
 
+    /// A request signed over its own ID *and* an external `cid:` reference, whose
+    /// digest the verifier does not compute itself.
+    fn signed_request_with_unverified_cid_reference() -> String {
+        let sig = signature_template(REQUEST_ID, &cert_b64(), SIG_ALG).replace(
+            "</ds:SignedInfo>",
+            r##"<ds:Reference URI="cid:attachment"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>AAAA</ds:DigestValue></ds:Reference></ds:SignedInfo>"##,
+        );
+        signer().sign_enveloped(&unsigned_request(&sig)).unwrap()
+    }
+
+    #[test]
+    fn a_signature_with_an_unverified_reference_digest_is_rejected() {
+        // By default the verifier refuses such a signature itself.
+        let xml = signed_request_with_unverified_cid_reference();
+        assert!(
+            verify_request_signatures(Some(&verifier_for(CERT)), None, &xml, REQUEST_ID).is_err()
+        );
+
+        // A caller can relax that on its verifier (other protocols need to). This
+        // function must still refuse the request: first show that the relaxed
+        // verifier accepts the document, so the case really reaches our own check.
+        let mut relaxed = verifier_for(CERT);
+        relaxed.set_require_reference_digests(false);
+        let results = relaxed.verify_all_enveloped(&xml).unwrap();
+        assert!(results.iter().all(|r| r.is_valid()));
+        assert!(results.iter().any(|r| r.has_unverified_references()));
+
+        let err = verify_request_signatures(Some(&relaxed), None, &xml, REQUEST_ID)
+            .expect_err("an unverified reference digest must not authenticate a request");
+        assert!(
+            err.to_string().contains("digest was not verified"),
+            "rejected for the wrong reason: {err}"
+        );
+    }
+
     #[test]
     fn without_a_key_an_unsigned_request_is_not_authenticated() {
         let xml = unsigned_request("");
