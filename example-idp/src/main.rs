@@ -59,12 +59,12 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
 
-use gamlastan::bindings::redirect::{redirect_decode, redirect_verify_signature, RedirectDecoded};
+use gamlastan::bindings::redirect::{redirect_decode, RedirectDecoded};
 use gamlastan::bindings::relay_state::RelayState;
 use gamlastan::core::assertion::attribute::{Attribute, AttributeValue};
 use gamlastan::core::constants;
 use gamlastan::core::identifiers::SamlId;
-use gamlastan::crypto::{KeysManager, SamlSigner, SamlVerifier, VerifyResult};
+use gamlastan::crypto::{KeysManager, SamlSigner, SamlVerifier};
 use gamlastan::idp::authn_broker::AuthnBroker;
 use gamlastan::idp::ident::IdentDb;
 use gamlastan::idp::orchestrator::{
@@ -76,6 +76,7 @@ use gamlastan::idp::policy::{PolicyEntry, ReleasePolicy, SignTargets};
 use gamlastan::metadata::types::entity_descriptor::EntityDescriptorRef;
 use gamlastan::profiles::error::ProfileError;
 use gamlastan::profiles::sso::idp as idp_profile;
+use gamlastan::profiles::sso::idp::verify_request_signatures;
 use gamlastan::xml::deserialize::parse_saml;
 use gamlastan::xml::serialize::SamlSerialize;
 use gamlastan_actix::{ActixHttpRequest, IdpConfig, IdpSigningContext};
@@ -926,26 +927,6 @@ fn get_session_from_cookie(req: &HttpRequest, state: &web::Data<AppState>) -> Op
     None
 }
 
-/// Returns `true` if a verified XML-DSig reference URI covers the AuthnRequest
-/// identified by `request_id`.
-///
-/// A same-document reference is `"#id"`; an empty URI signs the document root,
-/// which for a POSTed AuthnRequest is the request element itself. Any other
-/// target (a sibling element, an external URI) does not protect the parsed
-/// request and so must not count as a valid signature over it — this is the XML
-/// Signature Wrapping (XSW) guard applied in [`validate_authn_request`].
-///
-/// # Examples
-///
-/// ```ignore
-/// assert!(request_reference_covers("#_req-123", "_req-123"));
-/// assert!(request_reference_covers("", "_req-123")); // signs the root
-/// assert!(!request_reference_covers("#_other", "_req-123"));
-/// ```
-fn request_reference_covers(uri: &str, request_id: &str) -> bool {
-    uri.is_empty() || uri.strip_prefix('#') == Some(request_id)
-}
-
 /// Validate an incoming `AuthnRequest` against the trusted-SP registry and the
 /// IdP's signing policy, returning the processed request on success.
 ///
@@ -954,7 +935,7 @@ fn request_reference_covers(uri: &str, request_id: &str) -> bool {
 /// 2. If the request is signed (HTTP-Redirect detached signature or an enveloped
 ///    XML-DSig signature), the signature must verify against that SP's key.
 /// 3. For enveloped signatures, the verified reference must cover the parsed
-///    request (see [`request_reference_covers`]) — defeating XML Signature
+///    request (done by [`verify_request_signatures`]) — defeating XML Signature
 ///    Wrapping where a valid signature protects a different object.
 /// 4. If IdP policy requires signed requests, an unsigned request is rejected.
 /// 5. The request is processed against the SP's metadata so the
@@ -979,47 +960,17 @@ fn validate_authn_request(
         .get(&issuer.value)
         .ok_or_else(|| format!("untrusted Service Provider {:?}", issuer.value))?;
 
-    let mut signed = false;
-
-    if let Some(decoded) = redirect_binding {
-        let has_redirect_signature = decoded.signature.is_some()
-            || decoded.sig_alg.is_some()
-            || decoded.signature_input.is_some();
-        if has_redirect_signature {
-            let valid = redirect_verify_signature(decoded, &sp.request_verifier)
-                .map_err(|e| format!("redirect signature verification failed: {e}"))?;
-            if !valid {
-                return Err("redirect signature verification failed".to_string());
-            }
-            signed = true;
-        }
-    }
-
-    if authn_request.base.has_signature {
-        match sp.request_verifier.verify_enveloped(xml_str) {
-            Ok(VerifyResult::Valid { references, .. }) => {
-                // Bind the signature to the parsed request: a valid signature over
-                // a sibling object in the same document (XML Signature Wrapping)
-                // must not authorize the AuthnRequest whose fields (ACS URL,
-                // issuer, request ID) we then consume. Require a verified
-                // reference targeting the request root (empty URI) or its ID.
-                let bound = references
-                    .iter()
-                    .any(|r| request_reference_covers(&r.uri, &authn_request.base.id));
-                if !bound {
-                    return Err(
-                        "AuthnRequest signature did not reference the request (XML Signature Wrapping)"
-                            .to_string(),
-                    );
-                }
-                signed = true;
-            }
-            Ok(VerifyResult::Invalid { reason }) => {
-                return Err(format!("XML signature verification failed: {reason}"));
-            }
-            Err(e) => return Err(format!("XML signature verification failed: {e}")),
-        }
-    }
+    // Verify every signature the request carries (the Redirect query signature
+    // and any enveloped XML signatures), each bound to this request's ID so a
+    // valid signature over a sibling object cannot authorize it (XML Signature
+    // Wrapping, ADR 0028). `signed` is false for an unsigned request.
+    let signed = verify_request_signatures(
+        &sp.request_verifier,
+        redirect_binding,
+        xml_str,
+        &authn_request.base.id,
+    )
+    .map_err(|e| e.to_string())?;
 
     if sp.require_signed_authn_requests && !signed {
         return Err("unsigned AuthnRequest rejected by IdP policy".to_string());
@@ -1509,20 +1460,6 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[test]
-    fn test_request_reference_covers() {
-        // Finding #17 regression: only a verified reference targeting the parsed
-        // request (its ID or the document root) counts as signing it.
-        assert!(request_reference_covers("#_req-123", "_req-123"));
-        assert!(request_reference_covers("", "_req-123"));
-        // A signature over a sibling object must not bind the request.
-        assert!(!request_reference_covers("#_other-object", "_req-123"));
-        assert!(!request_reference_covers(
-            "https://attacker.example/signed",
-            "_req-123"
-        ));
-    }
-
     fn write_temp_metadata(contents: &str) -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1629,6 +1566,17 @@ mod tests {
         }
     }
 
+    /// Validate a parsed request the way the handler does: with its real XML,
+    /// which `validate_authn_request` parses to look for signatures.
+    fn validate_request(
+        state: &AppState,
+        request: &AuthnRequest,
+    ) -> Result<idp_profile::ProcessedAuthnRequest, String> {
+        use gamlastan::xml::serialize::SamlSerialize;
+        let xml = request.to_xml_string().expect("serialize the test request");
+        validate_authn_request(state, request, &xml, None)
+    }
+
     fn unsigned_request(issuer: &str) -> AuthnRequest {
         AuthnRequest {
             base: RequestBase {
@@ -1680,7 +1628,7 @@ mod tests {
         request.protocol_binding = None;
         request.assertion_consumer_service_index = Some(9);
 
-        let err = validate_authn_request(&state, &request, "", None).unwrap_err();
+        let err = validate_request(&state, &request).unwrap_err();
         assert!(err.contains("HTTP-POST only"), "{err}");
     }
 
@@ -1702,20 +1650,15 @@ mod tests {
             ),
             subject_confirmations: vec![],
         });
-        let err = validate_authn_request(&state, &request, "", None).unwrap_err();
+        let err = validate_request(&state, &request).unwrap_err();
         assert!(err.contains("requested Subject"), "{err}");
     }
 
     /// Build a validated request for helper-level policy and state tests.
     fn processed_request() -> idp_profile::ProcessedAuthnRequest {
         let state = test_state(false, &["https://sp.example.se/metadata"]);
-        validate_authn_request(
-            &state,
-            &unsigned_request("https://sp.example.se/metadata"),
-            "",
-            None,
-        )
-        .expect("test request should be valid")
+        validate_request(&state, &unsigned_request("https://sp.example.se/metadata"))
+            .expect("test request should be valid")
     }
 
     /// The engine issues whatever NameID format is requested (or the default,
@@ -1938,7 +1881,7 @@ mod tests {
     fn test_validate_authn_request_rejects_untrusted_sp() {
         let state = test_state(true, &["https://sp.example.se/metadata"]);
         let request = unsigned_request("https://evil.example.se/metadata");
-        let err = validate_authn_request(&state, &request, "<AuthnRequest/>", None).unwrap_err();
+        let err = validate_request(&state, &request).unwrap_err();
         assert!(err.contains("untrusted Service Provider"));
     }
 
@@ -1946,7 +1889,7 @@ mod tests {
     fn test_validate_authn_request_rejects_unsigned_when_required() {
         let state = test_state(true, &["https://sp.example.se/metadata"]);
         let request = unsigned_request("https://sp.example.se/metadata");
-        let err = validate_authn_request(&state, &request, "<AuthnRequest/>", None).unwrap_err();
+        let err = validate_request(&state, &request).unwrap_err();
         assert!(err.contains("unsigned AuthnRequest rejected"));
     }
 
@@ -1962,11 +1905,9 @@ mod tests {
             ],
         );
 
-        let processed_one = validate_authn_request(
+        let processed_one = validate_request(
             &state,
             &unsigned_request("https://sp-one.example.se/metadata"),
-            "",
-            None,
         )
         .expect("first SP should be trusted");
         assert_eq!(
@@ -1974,11 +1915,9 @@ mod tests {
             "https://sp-one.example.se/metadata"
         );
 
-        let processed_two = validate_authn_request(
+        let processed_two = validate_request(
             &state,
             &unsigned_request("https://sp-two.example.se/metadata"),
-            "",
-            None,
         )
         .expect("second SP should be trusted");
         assert_eq!(
@@ -1986,11 +1925,9 @@ mod tests {
             "https://sp-two.example.se/metadata"
         );
 
-        let err = validate_authn_request(
+        let err = validate_request(
             &state,
             &unsigned_request("https://sp-three.example.se/metadata"),
-            "",
-            None,
         )
         .unwrap_err();
         assert!(err.contains("untrusted Service Provider"));
