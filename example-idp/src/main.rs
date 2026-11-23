@@ -965,7 +965,7 @@ fn validate_authn_request(
     // valid signature over a sibling object cannot authorize it (XML Signature
     // Wrapping, ADR 0028). `signed` is false for an unsigned request.
     let signed = verify_request_signatures(
-        &sp.request_verifier,
+        Some(&sp.request_verifier),
         redirect_binding,
         xml_str,
         &authn_request.base.id,

@@ -524,7 +524,6 @@ async fn idp_sso(
         &sp_sso,
         xml_str,
         &authn_request.base.id,
-        authn_request.base.has_signature,
         "AuthnRequest",
     )?;
 
@@ -997,22 +996,14 @@ fn verify_sp_message_signature(
     expected_id: &str,
     what: &str,
 ) -> Result<(), SamlActixError> {
-    // Missing signing material for an inbound request is an authentication
-    // failure on attacker-controllable traffic, not a server fault: map it to
-    // 403 (via ProfileError) rather than 500.
-    let verifier = config.verifier_for(sp).ok_or_else(|| {
-        SamlActixError::Profile(gamlastan::profiles::ProfileError::AssertionValidation(
-            format!(
-                "{what} issuer has no usable signing certificate in its metadata; \
-                 refusing unauthenticated request"
-            ),
-        ))
-    })?;
-
     // The shared core check verifies every signature, binds each to the parsed
-    // message, and reports whether any signature was present.
+    // message, and reports whether any signature was present. Missing signing
+    // material for an inbound request is an authentication failure on
+    // attacker-controllable traffic, not a server fault: it surfaces as a 403
+    // (via ProfileError) rather than a 500.
+    let verifier = config.verifier_for(sp);
     match gamlastan::profiles::sso::idp::verify_request_signatures(
-        &verifier,
+        verifier.as_ref(),
         None,
         xml_str,
         expected_id,
@@ -1055,21 +1046,8 @@ fn verify_sp_request_signatures(
     sp: &gamlastan::metadata::types::sp::SpSsoDescriptor,
     xml: &str,
     request_id: &str,
-    has_xml_signature: bool,
     what: &str,
 ) -> Result<bool, SamlActixError> {
-    // Nothing signed: no key material is needed and the request is simply
-    // unauthenticated; the caller decides whether that is acceptable.
-    if redirect_signature.is_none() && !has_xml_signature {
-        return Ok(false);
-    }
-
-    let verifier = config.verifier_for(sp).ok_or_else(|| {
-        SamlActixError::Profile(gamlastan::profiles::ProfileError::AssertionValidation(
-            format!("{what} issuer has no usable signing certificate in metadata"),
-        ))
-    })?;
-
     // The Redirect signature fields are all the core check reads.
     let redirect =
         redirect_signature.map(|signature| gamlastan::bindings::redirect::RedirectDecoded {
@@ -1081,24 +1059,17 @@ fn verify_sp_request_signatures(
             signature_input: Some(signature.signature_input.clone()),
         });
 
-    let verified = gamlastan::profiles::sso::idp::verify_request_signatures(
-        &verifier,
+    // The core check finds a signature anywhere in the message, not only where
+    // the parser's `has_signature` flag looks, and refuses a signed request when
+    // the SP has no usable key. An unsigned request is `Ok(false)`.
+    let verifier = config.verifier_for(sp);
+    gamlastan::profiles::sso::idp::verify_request_signatures(
+        verifier.as_ref(),
         redirect.as_ref(),
         xml,
         request_id,
     )
-    .map_err(|e| relabel_signature_error(what, e))?;
-
-    // The message markup claimed an XML signature but none was found: the two
-    // parses disagree, so refuse rather than treat the request as unsigned.
-    if !verified {
-        return Err(SamlActixError::Profile(
-            gamlastan::profiles::ProfileError::AssertionValidation(format!(
-                "{what} contains no XML signature"
-            )),
-        ));
-    }
-    Ok(true)
+    .map_err(|e| relabel_signature_error(what, e))
 }
 
 /// Resolve trusted SP metadata for `entity_id`: the static
@@ -1242,7 +1213,6 @@ fn authorize_slo_request(
         sp,
         xml_str,
         &logout_req.id,
-        logout_req.has_signature,
         "LogoutRequest",
     )?;
     if !authenticated {
@@ -1631,6 +1601,27 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("redirect signature"));
+    }
+
+    #[test]
+    fn a_nested_signature_is_not_accepted_as_an_unsigned_request() {
+        // `has_signature` only looks for a direct-child signature. A malformed
+        // `ds:Signature` inside `Extensions` must still reach the verifier and
+        // fail, not pass as an unsigned request when policy allows those.
+        let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso");
+        let sp = signing_sp_sso();
+        let xml = r#"<samlp:AuthnRequest xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" ID="_req1" Version="2.0" IssueInstant="2026-09-03T00:00:00Z"><saml:Issuer>https://sp.example.com</saml:Issuer><samlp:Extensions><ds:Signature/></samlp:Extensions></samlp:AuthnRequest>"#;
+
+        let error = verify_sp_request_signatures(None, &config, &sp, xml, "_req1", "AuthnRequest")
+            .unwrap_err();
+        assert!(error.to_string().contains("signature"), "{error}");
+
+        // The same request without the nested signature is simply unsigned.
+        let unsigned = xml.replace("<samlp:Extensions><ds:Signature/></samlp:Extensions>", "");
+        let verified =
+            verify_sp_request_signatures(None, &config, &sp, &unsigned, "_req1", "AuthnRequest")
+                .unwrap();
+        assert!(!verified);
     }
 
     #[test]

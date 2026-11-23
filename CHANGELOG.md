@@ -15,18 +15,24 @@ where needed to correct protocol handling.
   `process_authn_request`'s `request_signature_verified`. Each XML signature
   must verify with every reference digest computed locally and must reference
   the consumed message (a `#id` reference or the document root), so a valid
-  signature over a sibling object does not authorize it (ADR 0028). An
-  unsigned request is `Ok(false)`, not an error. Integrators no longer need to
-  re-implement this binding check.
+  signature over a sibling object does not authorize it (ADR 0028). A
+  signature anywhere in the document counts as present, not only a direct
+  child, so a malformed signature nested in `Extensions` is verified and
+  fails instead of passing as unsigned. An unsigned request is `Ok(false)`,
+  not an error; the verifier is `None` when the SP has no usable key, which
+  refuses a signed request and leaves an unsigned one unauthenticated.
+  Integrators no longer need to re-implement this binding check.
 
 ### Changed
 
-- `gamlastan-actix`: the IdP handlers' request and `ArtifactResolve` signature
-  checks now use `verify_request_signatures`. They additionally require every
-  reference digest to be verified locally, and verify an XML signature that the
-  message markup did not flag; a markup flag with no signature found is
-  refused. Error messages keep their `AuthnRequest` / `LogoutRequest` /
-  `ArtifactResolve` prefix.
+- `gamlastan-actix` and `example-idp`: the request and `ArtifactResolve`
+  signature checks now use `verify_request_signatures`. They additionally
+  require every reference digest to be verified locally, and look for a
+  signature anywhere in the message instead of trusting the parser's
+  `has_signature` flag, so a signature the flag missed is verified (or
+  refused) rather than ignored. `example-idp` also checks every XML
+  signature, not only the first. Actix error messages keep their
+  `AuthnRequest` / `LogoutRequest` / `ArtifactResolve` prefix.
 
 ## [0.11.0] - 2026-11-09
 
