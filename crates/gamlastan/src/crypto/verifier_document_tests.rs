@@ -74,6 +74,14 @@ fn legacy(
             selection,
         )?;
     }
+    if !verifier.transform_policy.is_permissive() {
+        let doc = crate::xml::parse_secure_metadata(xml).map_err(|error| {
+            CryptoError::VerificationFailed(format!(
+                "could not parse XML for transform policy check: {error}"
+            ))
+        })?;
+        validate_enveloped_transform_policy(&doc, &verifier.transform_policy, selection)?;
+    }
     let ctx = verifier.dsig_context();
     Ok(match selection {
         SignatureSelection::First => vec![bergshamra_dsig::verify::verify(&ctx, xml)?],
@@ -206,7 +214,10 @@ fn generic_xpath_transform_keeps_original_source_and_rejects_tampering() {
         xml.replace_range(start..end, "");
     }
     let xml = signer().sign_enveloped(&xml).unwrap();
-    let verifier = verifier();
+    // The SAML default refuses an XPath transform; this test exercises the
+    // generic transform pipeline, so it opts in explicitly.
+    let mut verifier = verifier();
+    verifier.set_transform_policy(TransformPolicy::permissive());
     assert!(verifier
         .verify_enveloped(&xml)
         .unwrap()

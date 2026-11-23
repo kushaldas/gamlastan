@@ -7,6 +7,33 @@ where needed to correct protocol handling.
 
 ## [Unreleased]
 
+### Added
+
+- `crypto::TransformPolicy` and `crypto::ReferenceUris`, with
+  `SamlVerifier::set_transform_policy`, `with_transform_policy` and
+  `transform_policy`: a local policy for the `Reference` elements of a
+  signature, enforced before the signature is processed (ADR 0046). The
+  default, `TransformPolicy::saml()`, allows only the `enveloped-signature`
+  and exclusive-c14n transforms (with and without comments),
+  same-document reference URIs (`""` or `#id`), and at most 8 references per
+  signature and 8 transforms per reference. `permissive()` restores the old
+  behavior; `with_transforms`, `with_any_transform`, `with_reference_uris`,
+  `with_require_single_reference`, `with_max_references` and
+  `with_max_transforms_per_reference` adjust one setting at a time.
+
+### Changed
+
+- **Signature verification is stricter by default.** `SamlVerifier` now refuses
+  a signature whose `Reference` uses a transform outside the SAML profile
+  (for example an XPath filter, which can narrow what is signed while the
+  reference URI and digest still check out) or a URI other than `""` or
+  `#id`. This also stops the underlying verifier from reading a relative file
+  named by a `Reference URI` from the working directory, and the refusal is
+  the same whether or not the file exists. Deployments that sign with other
+  transforms (for example inclusive c14n as a transform) must allow them with
+  `TransformPolicy::with_transforms`, or opt out with
+  `TransformPolicy::permissive()`.
+
 ## [0.11.0] - 2026-11-09
 
 ### Changed

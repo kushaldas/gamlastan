@@ -62,6 +62,7 @@ pub mod encryptor;
 pub mod error;
 pub mod keys;
 pub mod signer;
+pub mod transform_policy;
 pub mod verifier;
 
 // Re-export the primary types for convenience.
@@ -71,6 +72,7 @@ pub use decryptor::SamlDecryptor;
 pub use encryptor::SamlEncryptor;
 pub use error::CryptoError;
 pub use signer::SamlSigner;
+pub use transform_policy::{ReferenceUris, TransformPolicy};
 pub use verifier::SamlVerifier;
 
 // Re-export the HSM/PKCS#11 signing backend so consumers can build a
