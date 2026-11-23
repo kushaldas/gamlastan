@@ -33,6 +33,9 @@ where needed to correct protocol handling.
   refused) rather than ignored. `example-idp` also checks every XML
   signature, not only the first. Actix error messages keep their
   `AuthnRequest` / `LogoutRequest` / `ArtifactResolve` prefix.
+- `gamlastan-actix`: a Redirect-binding request carrying some signature
+  parameters but not a complete set (for example `SigAlg` without `Signature`)
+  is now refused with a 400 instead of being treated as unsigned.
 
 ## [0.11.0] - 2026-11-09
 
