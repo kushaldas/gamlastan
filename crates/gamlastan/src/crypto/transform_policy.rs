@@ -43,6 +43,7 @@ pub struct TransformPolicy {
     max_references: Option<usize>,
     max_transforms_per_reference: Option<usize>,
     allow_key_retrieval: bool,
+    require_profile_transforms: bool,
 }
 
 /// Default limit on `Reference` elements per signature and on `Transform`
@@ -71,6 +72,7 @@ impl TransformPolicy {
             max_references: Some(DEFAULT_LIMIT),
             max_transforms_per_reference: Some(DEFAULT_LIMIT),
             allow_key_retrieval: false,
+            require_profile_transforms: true,
         }
     }
 
@@ -85,6 +87,7 @@ impl TransformPolicy {
             max_references: None,
             max_transforms_per_reference: None,
             allow_key_retrieval: true,
+            require_profile_transforms: false,
         }
     }
 
@@ -134,6 +137,21 @@ impl TransformPolicy {
             allowed.sort_unstable();
             allowed.dedup();
         }
+        self
+    }
+
+    /// Require the SAML profile transform structure on every reference: exactly one
+    /// `enveloped-signature` transform and exactly one canonicalization transform.
+    /// On by default.
+    ///
+    /// The allowlist only constrains the transforms that are *present*. A
+    /// reference with no `ds:Transforms`, or with only an enveloped-signature
+    /// transform, passes it, and the backend then canonicalizes the referenced
+    /// nodes with inclusive c14n, the thing the default allowlist refuses. This
+    /// closes that: leaving the transforms out is no way round the allowlist. Turn
+    /// it off only for signers that omit the canonicalization transform.
+    pub fn with_require_profile_transforms(mut self, require: bool) -> Self {
+        self.require_profile_transforms = require;
         self
     }
 
@@ -200,6 +218,26 @@ impl TransformPolicy {
     /// Whether exactly one `Reference` is required per signature.
     pub fn requires_single_reference(&self) -> bool {
         self.require_single_reference
+    }
+
+    /// Whether every reference must have exactly one `enveloped-signature` and
+    /// exactly one canonicalization transform.
+    pub fn requires_profile_transforms(&self) -> bool {
+        self.require_profile_transforms
+    }
+
+    /// Whether a transform algorithm URI is one of the six canonicalization
+    /// algorithms (inclusive, exclusive and 1.1, each with or without comments).
+    pub(crate) fn is_canonicalization_transform(uri: &str) -> bool {
+        [
+            algorithm::C14N,
+            algorithm::C14N_WITH_COMMENTS,
+            algorithm::C14N11,
+            algorithm::C14N11_WITH_COMMENTS,
+            algorithm::EXC_C14N,
+            algorithm::EXC_C14N_WITH_COMMENTS,
+        ]
+        .contains(&uri)
     }
 
     /// Whether `RetrievalMethod` and `KeyInfoReference` are allowed in a
@@ -302,6 +340,31 @@ mod tests {
         assert!(policy.allows_reference_uri("Cargo.toml"));
         assert_eq!(policy.max_references(), None);
         assert_eq!(policy.max_transforms_per_reference(), None);
+    }
+
+    #[test]
+    fn the_profile_transform_requirement_is_on_by_default_and_off_when_permissive() {
+        assert!(TransformPolicy::saml().requires_profile_transforms());
+        assert!(!TransformPolicy::permissive().requires_profile_transforms());
+        assert!(!TransformPolicy::saml()
+            .with_require_profile_transforms(false)
+            .requires_profile_transforms());
+        for uri in [
+            algorithm::C14N,
+            algorithm::C14N_WITH_COMMENTS,
+            algorithm::C14N11,
+            algorithm::C14N11_WITH_COMMENTS,
+            algorithm::EXC_C14N,
+            algorithm::EXC_C14N_WITH_COMMENTS,
+        ] {
+            assert!(TransformPolicy::is_canonicalization_transform(uri), "{uri}");
+        }
+        assert!(!TransformPolicy::is_canonicalization_transform(
+            algorithm::ENVELOPED_SIGNATURE
+        ));
+        assert!(!TransformPolicy::is_canonicalization_transform(
+            algorithm::XPATH
+        ));
     }
 
     #[test]

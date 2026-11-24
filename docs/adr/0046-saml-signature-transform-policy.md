@@ -56,6 +56,13 @@ error differed between an existing and a missing file.
    deployment whose signers use one adds it with `with_additional_transforms`
    (which keeps the SAML set) rather than `with_transforms` (which replaces it).
    A `#xpointer(...)` fragment is likewise refused as a reference URI.
+   The allowlist only constrains transforms that are present, so the profile
+   structure is required as well: every reference must have exactly one
+   `enveloped-signature` transform and exactly one canonicalization transform.
+   Without that, a reference with no `ds:Transforms`, or with only
+   `enveloped-signature`, passes and the backend canonicalizes it with inclusive
+   c14n, the thing the default allowlist refuses; leaving the transforms out would
+   be a way round it. `with_require_profile_transforms(false)` relaxes it.
    Key retrieval in a signature's `KeyInfo` is refused too: a `ds:RetrievalMethod`
    (which makes bergshamra read a certificate from a file named by the message,
    relative or absolute, with none of the guards the `Reference` URI path has)
@@ -96,6 +103,21 @@ error differed between an existing and a missing file.
 - No logging dependency is added, so there is no warn-only mode; the explicit
   `permissive()` opt-out is the escape hatch. A warn-only mode would need a
   logging or callback decision.
+
+## Evidence from signatures in the workspace
+
+The default was run over every XML file with a signature in the neighbouring
+checkouts (pysaml2 and its fork, gamlastan, tunnelbana test data, SATOSA, grindvakt:
+169 XML files, 49 with a `ds:Signature` that parses). 40 are accepted and 9 are
+refused; all 9 are gamlastan's own `attacks/` corpus (an unknown transform, an
+absolute-URI reference, a missing canonicalization or enveloped transform, multiple
+`SignedInfo`), which is meant to be rejected. Every other signature, including the
+eIDAS response, InCommon, SWAMID and AAI metadata, a SimpleSAMLphp response and the
+xmlsec1 samples, uses exactly one `enveloped-signature` and one exclusive c14n
+transform. This is test data, not captured traffic: per-entity signatures from live
+MDQ responses and IdP responses from the QA release-check are still to be checked
+before a deployment relies on the default (the `edugain-v2.xml` aggregate holds a
+single signature and says nothing about per-entity signers).
 
 ## Alternatives considered
 

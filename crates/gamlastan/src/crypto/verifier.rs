@@ -184,14 +184,17 @@ fn validate_signature_transforms(
         let mut transforms_elements = doc
             .children_iter(reference)
             .filter(|child| is_dsig_element(doc, *child, "Transforms"));
-        let Some(transforms) = transforms_elements.next() else {
-            continue;
-        };
+        let transforms = transforms_elements.next();
         if transforms_elements.next().is_some() {
             return Err(CryptoError::VerificationFailed(
                 "Reference has more than one ds:Transforms element".to_string(),
             ));
         }
+
+        // Counted as the loop below checks each transform, for the profile
+        // structure check afterwards. A reference with no `ds:Transforms` has none.
+        let mut enveloped = 0usize;
+        let mut canonicalization = 0usize;
 
         // bergshamra executes every child of `ds:Transforms` whose *local name*
         // is `Transform`, in any namespace or none (`verify.rs`, both the fast
@@ -199,8 +202,9 @@ fn validate_signature_transforms(
         // namespace-less or foreign-namespace transform cannot slip past the
         // allowlist or the count limit, and refuse one that is not in the
         // XML-DSig namespace: a SAML signature never has one.
-        for (index, transform) in doc
-            .children_iter(transforms)
+        for (index, transform) in transforms
+            .into_iter()
+            .flat_map(|transforms| doc.children_iter(transforms))
             .filter(|child| {
                 doc.element(*child)
                     .is_some_and(|element| element.name.local_name == "Transform")
@@ -232,6 +236,29 @@ fn validate_signature_transforms(
                 return Err(CryptoError::VerificationFailed(format!(
                     "Reference transform {} is not allowed by the transform policy",
                     quoted_for_error(algorithm)
+                )));
+            }
+            if algorithm == bergshamra_core::algorithm::ENVELOPED_SIGNATURE {
+                enveloped += 1;
+            } else if TransformPolicy::is_canonicalization_transform(algorithm) {
+                canonicalization += 1;
+            }
+        }
+
+        // The allowlist constrains the transforms that are present. Without this,
+        // a reference that leaves them out is canonicalized by the backend with
+        // inclusive c14n, which is what the allowlist refuses by default.
+        if policy.requires_profile_transforms() {
+            if enveloped != 1 {
+                return Err(CryptoError::VerificationFailed(format!(
+                    "Reference has {enveloped} enveloped-signature transforms; the transform \
+                     policy requires exactly one"
+                )));
+            }
+            if canonicalization != 1 {
+                return Err(CryptoError::VerificationFailed(format!(
+                    "Reference has {canonicalization} canonicalization transforms; the transform \
+                     policy requires exactly one"
                 )));
             }
         }

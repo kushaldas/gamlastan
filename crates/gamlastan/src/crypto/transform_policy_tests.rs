@@ -41,10 +41,19 @@ fn cert_b64() -> String {
         .collect()
 }
 
-/// An `AuthnRequest` signed over `#_req1` with `transforms_xml` replacing the
-/// template's enveloped-signature transform.
+/// An `AuthnRequest` signed over `#_req1` whose reference carries exactly the
+/// transforms in `transforms_xml` (the content of `ds:Transforms`; the template's
+/// own transforms are replaced, so none are left over).
 fn request_with_transforms(transforms_xml: &str) -> String {
-    let signature = signature_template(ID, &cert_b64(), SIG_ALG).replace(ENVELOPED, transforms_xml);
+    let template = signature_template(ID, &cert_b64(), SIG_ALG);
+    let start = template.find("<ds:Transforms>").unwrap() + "<ds:Transforms>".len();
+    let end = template.find("</ds:Transforms>").unwrap();
+    let signature = format!(
+        "{}{}{}",
+        &template[..start],
+        transforms_xml,
+        &template[end..]
+    );
     let xml = format!(
         r#"<samlp:AuthnRequest xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="{ID}" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"><saml:Issuer>https://sp.example.test</saml:Issuer>{signature}</samlp:AuthnRequest>"#
     );
@@ -188,7 +197,11 @@ fn the_permissive_policy_restores_the_old_behavior() {
 #[test]
 fn a_transform_can_be_allowed_explicitly() {
     let xml = request_with_transforms(XPATH_NARROWING);
-    let policy = TransformPolicy::saml().with_transforms([ENVELOPED_URI, EXC_C14N, XPATH]);
+    // An XPath filter replaces the enveloped-signature transform, so allowing it
+    // also means relaxing the profile structure.
+    let policy = TransformPolicy::saml()
+        .with_transforms([ENVELOPED_URI, EXC_C14N, XPATH])
+        .with_require_profile_transforms(false);
     let verifier = verifier().with_transform_policy(policy);
     assert!(verifier.verify_all_enveloped(&xml).unwrap()[0].is_valid());
 }
@@ -240,7 +253,9 @@ fn other_uri_forms_are_refused() {
 #[test]
 fn any_uri_policy_lets_the_verifier_resolve_the_reference_again() {
     // Only for explicit non-SAML interoperability: the file is read again.
-    let policy = TransformPolicy::saml().with_reference_uris(ReferenceUris::Any);
+    let policy = TransformPolicy::saml()
+        .with_reference_uris(ReferenceUris::Any)
+        .with_require_profile_transforms(false);
     let verifier = verifier().with_transform_policy(policy);
     let results = verifier
         .verify_all_enveloped(&request_with_reference_uri("Cargo.toml"))
@@ -277,6 +292,13 @@ fn signature_with_references(references: &str) -> String {
     )
 }
 
+/// A reference with exactly the profile transforms (enveloped-signature, one c14n).
+fn profile_reference() -> String {
+    format!(
+        r##"<ds:Reference URI="#{ID}"><ds:Transforms><ds:Transform Algorithm="{ENVELOPED_URI}"/><ds:Transform Algorithm="{EXC_C14N}"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>AAAA</ds:DigestValue></ds:Reference>"##
+    )
+}
+
 fn reference(transforms: usize) -> String {
     let transform = format!(r##"<ds:Transform Algorithm="{ENVELOPED_URI}"/>"##);
     format!(
@@ -287,7 +309,7 @@ fn reference(transforms: usize) -> String {
 
 #[test]
 fn too_many_references_are_refused() {
-    let xml = signature_with_references(&reference(1).repeat(9));
+    let xml = signature_with_references(&profile_reference().repeat(9));
     let error = refused(verifier().verify_all_enveloped(&xml), "nine references");
     assert!(message(&error).contains("references"), "{error}");
 
@@ -310,7 +332,7 @@ fn too_many_transforms_are_refused() {
 
 #[test]
 fn a_single_reference_can_be_required() {
-    let xml = signature_with_references(&format!("{}{}", reference(1), reference(1)));
+    let xml = signature_with_references(&format!("{}{}", profile_reference(), profile_reference()));
     // Off by default: the policy lets two references through.
     let outcome = verifier().verify_all_enveloped(&xml);
     assert!(
@@ -652,4 +674,90 @@ fn the_embedded_certificate_key_info_is_unaffected() {
     ));
     assert!(xml.contains("<ds:X509Certificate>"));
     assert!(verifier().verify_all_enveloped(&xml).unwrap()[0].is_valid());
+}
+
+// -- the profile transform structure: enveloped-signature and one c14n ----------------
+
+/// A request signed by the fixture key whose reference uses exactly `transforms`
+/// (the whole `ds:Transforms` element, or nothing).
+fn request_with_transforms_element(transforms_element: &str) -> String {
+    let template = signature_template(ID, &cert_b64(), SIG_ALG);
+    let start = template.find("<ds:Transforms>").unwrap();
+    let end = template.find("</ds:Transforms>").unwrap() + "</ds:Transforms>".len();
+    let signature = format!(
+        "{}{}{}",
+        &template[..start],
+        transforms_element,
+        &template[end..]
+    );
+    let xml = format!(
+        r#"<samlp:AuthnRequest xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="{ID}" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"><saml:Issuer>https://sp.example.test</saml:Issuer>{signature}</samlp:AuthnRequest>"#
+    );
+    signer().sign_enveloped(&xml).unwrap()
+}
+
+#[test]
+fn a_reference_with_no_transforms_is_refused_by_default() {
+    // The backend would digest it under inclusive c14n, the thing the default
+    // refuses: omitting the transforms must not be a way round the allowlist.
+    let xml = request_with_transforms_element("");
+    let error = refused(verifier().verify_all_enveloped(&xml), "no ds:Transforms");
+    assert!(message(&error).contains("enveloped-signature"), "{error}");
+}
+
+#[test]
+fn an_empty_transforms_element_is_refused_by_default() {
+    let xml = request_with_transforms_element("<ds:Transforms/>");
+    let error = refused(
+        verifier().verify_all_enveloped(&xml),
+        "an empty ds:Transforms",
+    );
+    assert!(message(&error).contains("enveloped-signature"), "{error}");
+}
+
+#[test]
+fn enveloped_signature_without_a_c14n_transform_is_refused_by_default() {
+    let xml = request_with_transforms_element(&format!(
+        r##"<ds:Transforms>{ENVELOPED}</ds:Transforms>"##
+    ));
+    let error = refused(verifier().verify_all_enveloped(&xml), "no c14n transform");
+    assert!(message(&error).contains("canonicalization"), "{error}");
+}
+
+#[test]
+fn a_c14n_transform_without_enveloped_signature_is_refused_by_default() {
+    // Not signed by us: such a signature would cover itself. The policy runs first.
+    let reference = format!(
+        r##"<ds:Reference URI="#{ID}"><ds:Transforms><ds:Transform Algorithm="{EXC_C14N}"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>AAAA</ds:DigestValue></ds:Reference>"##
+    );
+    let error = refused(
+        verifier().verify_all_enveloped(&signature_with_references(&reference)),
+        "c14n without enveloped-signature",
+    );
+    assert!(message(&error).contains("enveloped-signature"), "{error}");
+}
+
+#[test]
+fn two_canonicalization_transforms_are_refused_by_default() {
+    let reference = format!(
+        r##"<ds:Reference URI="#{ID}"><ds:Transforms><ds:Transform Algorithm="{ENVELOPED_URI}"/><ds:Transform Algorithm="{EXC_C14N}"/><ds:Transform Algorithm="{EXC_C14N}WithComments"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>AAAA</ds:DigestValue></ds:Reference>"##
+    );
+    let error = refused(
+        verifier().verify_all_enveloped(&signature_with_references(&reference)),
+        "two c14n transforms",
+    );
+    assert!(message(&error).contains("canonicalization"), "{error}");
+}
+
+#[test]
+fn the_profile_transform_requirement_can_be_turned_off() {
+    // Enveloped-signature alone verifies; only the one-c14n requirement refuses it.
+    let xml = request_with_transforms_element(&format!(
+        r##"<ds:Transforms>{ENVELOPED}</ds:Transforms>"##
+    ));
+    let error = refused(verifier().verify_all_enveloped(&xml), "the default");
+    assert!(message(&error).contains("canonicalization"), "{error}");
+    let verifier = verifier()
+        .with_transform_policy(TransformPolicy::saml().with_require_profile_transforms(false));
+    assert!(verifier.verify_all_enveloped(&xml).unwrap()[0].is_valid());
 }

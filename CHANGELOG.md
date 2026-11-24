@@ -22,7 +22,8 @@ where needed to correct protocol handling.
   `with_require_single_reference`, `with_max_references` and
   `with_max_transforms_per_reference` adjust one setting at a time. `with_allow_key_retrieval` allows
   `ds:RetrievalMethod` and `dsig11:KeyInfoReference` in a signature's `KeyInfo`, which
-  are refused by default.
+  are refused by default. `with_require_profile_transforms` controls
+  the structure requirement below (on by default).
 
 ### Changed
 
@@ -39,7 +40,11 @@ where needed to correct protocol handling.
   inclusive c14n URI `http://www.w3.org/TR/2001/REC-xml-c14n-20010315`), or opt
   out with `TransformPolicy::permissive()`. `with_transforms` replaces the whole
   list, so it must then also list `enveloped-signature` and the exclusive c14n
-  URIs. The policy also refuses key retrieval in a
+  URIs. Every reference must also carry exactly one
+  `enveloped-signature` and exactly one canonicalization transform, so a reference
+  with no transforms (which the backend would canonicalize with inclusive c14n) is
+  refused; `with_require_profile_transforms(false)` relaxes this. The policy also
+  refuses key retrieval in a
   signature's `KeyInfo` (`RetrievalMethod`, `KeyInfoReference`): with
   `trusted_keys_only` off the verifier would otherwise read a certificate from a
   path named in the message and trust it.
