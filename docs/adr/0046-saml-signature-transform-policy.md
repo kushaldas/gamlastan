@@ -77,7 +77,8 @@ error differed between an existing and a missing file.
    `with_allow_key_retrieval(true)` allows them.
 3. Make it configurable rather than fixed: `permissive()` restores the previous
    behavior, `with_transforms` and `with_any_transform` change the transform
-   allowlist, `with_reference_uris(ReferenceUris::Any)` allows other URIs,
+   allowlist, `with_reference_uris(ReferenceUris::AnyIncludingLocalFiles)` allows other URIs (and so
+   the working-directory file read, hence the long name),
    `with_require_single_reference` enforces SAML Core 5.4.2, `with_allow_key_retrieval` allows
    `RetrievalMethod` and `KeyInfoReference`, and the limits can
    be changed or lifted.

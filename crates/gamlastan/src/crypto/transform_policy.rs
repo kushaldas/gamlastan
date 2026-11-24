@@ -12,9 +12,12 @@ pub enum ReferenceUris {
     /// (`#xpointer(...)`), external URIs, schemes and file names are refused
     /// before the verifier reads anything.
     SameDocument,
-    /// Any URI bergshamra can resolve, including relative file names resolved
-    /// against the working directory. For explicit non-SAML interoperability.
-    Any,
+    /// Any URI bergshamra can resolve, **including relative file names, which the
+    /// verifier reads from the process's working directory**. A message can then make
+    /// the verifier open a file it names, and the error differs for an existing and a
+    /// missing one. The long name is deliberate: this is the behavior the default
+    /// policy exists to stop, for explicit non-SAML interoperability only.
+    AnyIncludingLocalFiles,
 }
 
 /// Local policy for the `Reference` elements of a signature, checked before the
@@ -82,7 +85,7 @@ impl TransformPolicy {
     pub fn permissive() -> Self {
         Self {
             allowed_transforms: None,
-            reference_uris: ReferenceUris::Any,
+            reference_uris: ReferenceUris::AnyIncludingLocalFiles,
             require_single_reference: false,
             max_references: None,
             max_transforms_per_reference: None,
@@ -260,7 +263,7 @@ impl TransformPolicy {
     /// (`#xpointer(...)`) is not accepted.
     pub fn allows_reference_uri(&self, uri: &str) -> bool {
         match self.reference_uris {
-            ReferenceUris::Any => true,
+            ReferenceUris::AnyIncludingLocalFiles => true,
             ReferenceUris::SameDocument => {
                 uri.is_empty()
                     || uri
@@ -278,8 +281,30 @@ impl TransformPolicy {
         self.max_transforms_per_reference
     }
 
+    /// Whether every setting is at its unrestricted value, so the guard has nothing
+    /// to check and is skipped.
+    ///
+    /// The struct is destructured **without `..`** on purpose: adding a field to
+    /// `TransformPolicy` is then a compile error here, so its unrestricted value must
+    /// be decided and counted, instead of silently changing who skips the guard
+    /// (struct equality with `permissive()` would have done that).
     pub(crate) fn is_permissive(&self) -> bool {
-        *self == Self::permissive()
+        let Self {
+            allowed_transforms,
+            reference_uris,
+            require_single_reference,
+            max_references,
+            max_transforms_per_reference,
+            allow_key_retrieval,
+            require_profile_transforms,
+        } = self;
+        allowed_transforms.is_none()
+            && *reference_uris == ReferenceUris::AnyIncludingLocalFiles
+            && !require_single_reference
+            && max_references.is_none()
+            && max_transforms_per_reference.is_none()
+            && *allow_key_retrieval
+            && !require_profile_transforms
     }
 }
 
@@ -343,6 +368,40 @@ mod tests {
     }
 
     #[test]
+    fn tightening_any_single_setting_makes_a_policy_not_permissive() {
+        // `permissive()` is the unrestricted policy; each setting, tightened on its
+        // own, must make the guard run. (A new field must be added here: see
+        // `is_permissive`, which destructures the struct so that forgetting it is a
+        // compile error.)
+        assert!(TransformPolicy::permissive().is_permissive());
+        let tightened = [
+            TransformPolicy::permissive().with_transforms([algorithm::EXC_C14N]),
+            TransformPolicy::permissive().with_reference_uris(ReferenceUris::SameDocument),
+            TransformPolicy::permissive().with_require_single_reference(true),
+            TransformPolicy::permissive().with_max_references(Some(8)),
+            TransformPolicy::permissive().with_max_transforms_per_reference(Some(8)),
+            TransformPolicy::permissive().with_allow_key_retrieval(false),
+            TransformPolicy::permissive().with_require_profile_transforms(true),
+        ];
+        for (index, policy) in tightened.iter().enumerate() {
+            assert!(!policy.is_permissive(), "setting #{index} did not count");
+        }
+    }
+
+    #[test]
+    fn a_policy_built_up_to_the_unrestricted_one_is_permissive() {
+        let built = TransformPolicy::saml()
+            .with_any_transform()
+            .with_reference_uris(ReferenceUris::AnyIncludingLocalFiles)
+            .with_max_references(None)
+            .with_max_transforms_per_reference(None)
+            .with_allow_key_retrieval(true)
+            .with_require_profile_transforms(false);
+        assert!(built.is_permissive());
+        assert_eq!(built, TransformPolicy::permissive());
+    }
+
+    #[test]
     fn the_profile_transform_requirement_is_on_by_default_and_off_when_permissive() {
         assert!(TransformPolicy::saml().requires_profile_transforms());
         assert!(!TransformPolicy::permissive().requires_profile_transforms());
@@ -398,7 +457,8 @@ mod tests {
         assert!(!any.allows_reference_uri("Cargo.toml"));
         assert!(!any.is_permissive());
 
-        let files = TransformPolicy::saml().with_reference_uris(ReferenceUris::Any);
+        let files =
+            TransformPolicy::saml().with_reference_uris(ReferenceUris::AnyIncludingLocalFiles);
         assert!(files.allows_reference_uri("Cargo.toml"));
         assert!(!files.allows_transform(algorithm::XPATH));
     }

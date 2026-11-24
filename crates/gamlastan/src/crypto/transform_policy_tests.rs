@@ -254,7 +254,7 @@ fn other_uri_forms_are_refused() {
 fn any_uri_policy_lets_the_verifier_resolve_the_reference_again() {
     // Only for explicit non-SAML interoperability: the file is read again.
     let policy = TransformPolicy::saml()
-        .with_reference_uris(ReferenceUris::Any)
+        .with_reference_uris(ReferenceUris::AnyIncludingLocalFiles)
         .with_require_profile_transforms(false);
     let verifier = verifier().with_transform_policy(policy);
     let results = verifier
