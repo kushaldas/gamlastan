@@ -240,6 +240,43 @@ fn validate_signature_transforms(
     Ok(())
 }
 
+/// Refuse key retrieval in a signature's `KeyInfo` unless the policy allows it.
+///
+/// bergshamra finds the signature's `KeyInfo` by namespace, then treats a
+/// `RetrievalMethod` child in the XML-DSig namespace or in none as a key to read
+/// from a file, and follows a `dsig11:KeyInfoReference` to *any* element of the
+/// document with that ID as the effective `KeyInfo`. Scan every `KeyInfo`-named
+/// child by local name, and refuse both constructs by local name too, so neither
+/// a namespace-less element nor a reference to a `KeyInfo` placed elsewhere can
+/// hide a `RetrievalMethod`.
+fn validate_signature_key_info(
+    doc: &Document<'_>,
+    signature: NodeId,
+    policy: &TransformPolicy,
+) -> Result<(), CryptoError> {
+    if policy.allows_key_retrieval() {
+        return Ok(());
+    }
+    for key_info in doc.children_iter(signature).filter(|child| {
+        doc.element(*child)
+            .is_some_and(|element| element.name.local_name == "KeyInfo")
+    }) {
+        for child in doc.children_iter(key_info) {
+            let Some(element) = doc.element(child) else {
+                continue;
+            };
+            let local = &*element.name.local_name;
+            if local == "RetrievalMethod" || local == "KeyInfoReference" {
+                return Err(CryptoError::VerificationFailed(format!(
+                    "KeyInfo contains a {local}; the transform policy does not allow key \
+                     retrieval (a signature's key comes from metadata or an embedded certificate)"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Check every selected signature's `Reference` URIs and transforms against the
 /// policy, on the document the verifier is about to process, before it does.
 fn validate_enveloped_transform_policy(
@@ -260,6 +297,7 @@ fn validate_enveloped_transform_policy(
         .filter(|node| is_dsig_element(doc, *node, "Signature"))
     {
         validate_signature_transforms(doc, signature, policy)?;
+        validate_signature_key_info(doc, signature, policy)?;
         if matches!(selection, SignatureSelection::First) {
             break;
         }

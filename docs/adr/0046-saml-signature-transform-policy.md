@@ -56,10 +56,23 @@ error differed between an existing and a missing file.
    deployment whose signers use one adds it with `with_additional_transforms`
    (which keeps the SAML set) rather than `with_transforms` (which replaces it).
    A `#xpointer(...)` fragment is likewise refused as a reference URI.
+   Key retrieval in a signature's `KeyInfo` is refused too: a `ds:RetrievalMethod`
+   (which makes bergshamra read a certificate from a file named by the message,
+   relative or absolute, with none of the guards the `Reference` URI path has)
+   and a `dsig11:KeyInfoReference` (which makes it treat *any* element of the
+   document, found by ID, as the signature's `KeyInfo`, so a `RetrievalMethod`
+   could hide elsewhere). Both are matched by local name, because the backend
+   accepts a `RetrievalMethod` in the XML-DSig namespace or in none. With
+   `trusted_keys_only` on, the default, the verifier ignores them; an integrator
+   that turned it off would otherwise let a message supply its own trust anchor
+   (reproduced: a signature verified with no configured keys under a certificate
+   read from a path in the message). SAML signatures never need either.
+   `with_allow_key_retrieval(true)` allows them.
 3. Make it configurable rather than fixed: `permissive()` restores the previous
    behavior, `with_transforms` and `with_any_transform` change the transform
    allowlist, `with_reference_uris(ReferenceUris::Any)` allows other URIs,
-   `with_require_single_reference` enforces SAML Core 5.4.2, and the limits can
+   `with_require_single_reference` enforces SAML Core 5.4.2, `with_allow_key_retrieval` allows
+   `RetrievalMethod` and `KeyInfoReference`, and the limits can
    be changed or lifted.
 4. Report refusals as `CryptoError::VerificationFailed` with a message that
    quotes the offending value escaped and cut to 64 characters, and gives the

@@ -20,7 +20,9 @@ where needed to correct protocol handling.
   behavior; `with_transforms` (replaces the list), `with_additional_transforms`
   (adds to it), `with_any_transform`, `with_reference_uris`,
   `with_require_single_reference`, `with_max_references` and
-  `with_max_transforms_per_reference` adjust one setting at a time.
+  `with_max_transforms_per_reference` adjust one setting at a time. `with_allow_key_retrieval` allows
+  `ds:RetrievalMethod` and `dsig11:KeyInfoReference` in a signature's `KeyInfo`, which
+  are refused by default.
 
 ### Changed
 
@@ -37,7 +39,10 @@ where needed to correct protocol handling.
   inclusive c14n URI `http://www.w3.org/TR/2001/REC-xml-c14n-20010315`), or opt
   out with `TransformPolicy::permissive()`. `with_transforms` replaces the whole
   list, so it must then also list `enveloped-signature` and the exclusive c14n
-  URIs.
+  URIs. The policy also refuses key retrieval in a
+  signature's `KeyInfo` (`RetrievalMethod`, `KeyInfoReference`): with
+  `trusted_keys_only` off the verifier would otherwise read a certificate from a
+  path named in the message and trust it.
 
 ## [0.11.0] - 2026-11-09
 

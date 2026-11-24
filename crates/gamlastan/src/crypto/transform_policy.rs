@@ -42,6 +42,7 @@ pub struct TransformPolicy {
     require_single_reference: bool,
     max_references: Option<usize>,
     max_transforms_per_reference: Option<usize>,
+    allow_key_retrieval: bool,
 }
 
 /// Default limit on `Reference` elements per signature and on `Transform`
@@ -69,6 +70,7 @@ impl TransformPolicy {
             require_single_reference: false,
             max_references: Some(DEFAULT_LIMIT),
             max_transforms_per_reference: Some(DEFAULT_LIMIT),
+            allow_key_retrieval: false,
         }
     }
 
@@ -82,6 +84,7 @@ impl TransformPolicy {
             require_single_reference: false,
             max_references: None,
             max_transforms_per_reference: None,
+            allow_key_retrieval: true,
         }
     }
 
@@ -134,6 +137,21 @@ impl TransformPolicy {
         self
     }
 
+    /// Allow `ds:RetrievalMethod` and `dsig11:KeyInfoReference` in a signature's
+    /// `KeyInfo` (key retrieval). Refused by default.
+    ///
+    /// A `RetrievalMethod` makes the underlying verifier read a certificate from a
+    /// file named in the message (relative or absolute), and a `KeyInfoReference`
+    /// makes it use any element of the document, found by ID, as the signature's
+    /// `KeyInfo`. With `trusted_keys_only` on (the default) the verifier ignores
+    /// both, but an integrator that turned it off would let a message supply its
+    /// own trust anchor. SAML signatures carry an embedded certificate or rely on
+    /// keys from metadata and never need either.
+    pub fn with_allow_key_retrieval(mut self, allow: bool) -> Self {
+        self.allow_key_retrieval = allow;
+        self
+    }
+
     /// Allow any transform (the transform allowlist is lifted; the URI rule and
     /// the limits are unchanged).
     pub fn with_any_transform(mut self) -> Self {
@@ -182,6 +200,12 @@ impl TransformPolicy {
     /// Whether exactly one `Reference` is required per signature.
     pub fn requires_single_reference(&self) -> bool {
         self.require_single_reference
+    }
+
+    /// Whether `RetrievalMethod` and `KeyInfoReference` are allowed in a
+    /// signature's `KeyInfo`.
+    pub fn allows_key_retrieval(&self) -> bool {
+        self.allow_key_retrieval
     }
 
     /// Return whether a transform algorithm URI is accepted by this policy.
@@ -278,6 +302,18 @@ mod tests {
         assert!(policy.allows_reference_uri("Cargo.toml"));
         assert_eq!(policy.max_references(), None);
         assert_eq!(policy.max_transforms_per_reference(), None);
+    }
+
+    #[test]
+    fn key_retrieval_is_refused_by_default_and_allowed_when_permissive() {
+        assert!(!TransformPolicy::saml().allows_key_retrieval());
+        assert!(TransformPolicy::permissive().allows_key_retrieval());
+        let allowed = TransformPolicy::saml().with_allow_key_retrieval(true);
+        assert!(allowed.allows_key_retrieval());
+        assert!(
+            !allowed.is_permissive(),
+            "the rest of the profile still applies"
+        );
     }
 
     #[test]

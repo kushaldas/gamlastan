@@ -499,3 +499,157 @@ fn with_additional_transforms_keeps_the_profile_and_adds_the_extra_one() {
     assert!(verifier.verify_all_enveloped(&standard).unwrap()[0].is_valid());
     assert!(verifier.verify_all_enveloped(&inclusive).unwrap()[0].is_valid());
 }
+
+// -- structure the backend tolerates today, pinned ---------------------------------
+
+#[test]
+fn more_than_one_transforms_element_in_a_reference_is_refused() {
+    let reference = format!(
+        r##"<ds:Reference URI="#{ID}"><ds:Transforms><ds:Transform Algorithm="{ENVELOPED_URI}"/></ds:Transforms><ds:Transforms><ds:Transform Algorithm="{EXC_C14N}"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>AAAA</ds:DigestValue></ds:Reference>"##
+    );
+    let error = verifier()
+        .verify_all_enveloped(&signature_with_references(&reference))
+        .expect_err("two ds:Transforms elements must be refused");
+    assert!(message(&error).contains("more than one"), "{error}");
+}
+
+#[test]
+fn a_transform_without_an_algorithm_is_refused() {
+    let reference = format!(
+        r##"<ds:Reference URI="#{ID}"><ds:Transforms><ds:Transform/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>AAAA</ds:DigestValue></ds:Reference>"##
+    );
+    let error = verifier()
+        .verify_all_enveloped(&signature_with_references(&reference))
+        .expect_err("a transform with no Algorithm must be refused");
+    assert!(message(&error).contains("algorithm"), "{error}");
+}
+
+// -- key retrieval inside a signature's KeyInfo --------------------------------------
+
+/// A request signed by the fixture key whose `KeyInfo` is `key_info` instead of
+/// the template's embedded certificate.
+fn request_with_key_info(key_info: &str, trailer: &str) -> String {
+    let template = signature_template(ID, &cert_b64(), SIG_ALG);
+    let start = template
+        .find("<ds:KeyInfo")
+        .expect("template has a KeyInfo");
+    let end = template
+        .find("</ds:KeyInfo>")
+        .expect("template has a KeyInfo")
+        + "</ds:KeyInfo>".len();
+    let signature = format!("{}{}{}", &template[..start], key_info, &template[end..]);
+    let xml = format!(
+        r#"<samlp:AuthnRequest xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="{ID}" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"><saml:Issuer>https://sp.example.test</saml:Issuer>{signature}{trailer}</samlp:AuthnRequest>"#
+    );
+    signer().sign_enveloped(&xml).unwrap()
+}
+
+/// The fixture certificate as a DER file the verifier could be told to read.
+struct CertFile(std::path::PathBuf);
+
+impl CertFile {
+    fn new(tag: &str) -> Self {
+        use base64::Engine as _;
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(cert_b64())
+            .unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "gamlastan-retrieval-{tag}-{}-{}.der",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, der).unwrap();
+        Self(path)
+    }
+
+    fn retrieval_method(&self) -> String {
+        format!(
+            r##"<ds:KeyInfo><ds:RetrievalMethod URI="{}" Type="http://www.w3.org/2000/09/xmldsig#rawX509Certificate"/></ds:KeyInfo>"##,
+            self.0.display()
+        )
+    }
+}
+
+impl Drop for CertFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// A verifier with **no keys at all** that has turned off `trusted_keys_only`,
+/// the one setting under which a message can supply its own key.
+fn keyless_verifier_trusting_the_message() -> SamlVerifier {
+    let mut verifier = SamlVerifier::new(KeysManager::new());
+    verifier.set_trusted_keys_only(false);
+    verifier.set_skip_time_checks(true);
+    verifier
+}
+
+#[test]
+fn a_retrieval_method_in_key_info_is_refused_by_default() {
+    // Without the policy this authenticates under a key read from a path named by
+    // the message: the trust anchor came from the attacker.
+    let file = CertFile::new("default");
+    let xml = request_with_key_info(&file.retrieval_method(), "");
+    let error = refused(
+        keyless_verifier_trusting_the_message().verify_all_enveloped(&xml),
+        "a RetrievalMethod",
+    );
+    assert!(message(&error).contains("retrievalmethod"), "{error}");
+}
+
+#[test]
+fn an_unqualified_retrieval_method_is_refused_too() {
+    // bergshamra accepts a RetrievalMethod in the XML-DSig namespace or in none.
+    let file = CertFile::new("unqualified");
+    let key_info = file
+        .retrieval_method()
+        .replace("ds:RetrievalMethod", "RetrievalMethod");
+    let xml = request_with_key_info(&key_info, "");
+    let error = refused(
+        keyless_verifier_trusting_the_message().verify_all_enveloped(&xml),
+        "an unqualified RetrievalMethod",
+    );
+    assert!(message(&error).contains("retrievalmethod"), "{error}");
+}
+
+#[test]
+fn a_key_info_reference_is_refused_by_default() {
+    // dsig11:KeyInfoReference makes the verifier use *any* element of the
+    // document, found by ID, as the signature's KeyInfo, so a RetrievalMethod
+    // could hide there from a scan of the signature's own KeyInfo.
+    let file = CertFile::new("reference");
+    let key_info = r##"<ds:KeyInfo><dsig11:KeyInfoReference xmlns:dsig11="http://www.w3.org/2009/xmldsig11#" URI="#hidden"/></ds:KeyInfo>"##;
+    let hidden = file.retrieval_method().replace(
+        "<ds:KeyInfo>",
+        r##"<ds:KeyInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#" ID="hidden">"##,
+    );
+    let xml = request_with_key_info(key_info, &hidden);
+    let error = refused(
+        keyless_verifier_trusting_the_message().verify_all_enveloped(&xml),
+        "a KeyInfoReference",
+    );
+    assert!(message(&error).contains("keyinforeference"), "{error}");
+}
+
+#[test]
+fn key_retrieval_can_be_allowed_explicitly() {
+    // Documents what the opt-in means: the verifier then reads the file.
+    let file = CertFile::new("allowed");
+    let xml = request_with_key_info(&file.retrieval_method(), "");
+    let verifier = keyless_verifier_trusting_the_message()
+        .with_transform_policy(TransformPolicy::saml().with_allow_key_retrieval(true));
+    assert!(verifier.verify_all_enveloped(&xml).unwrap()[0].is_valid());
+}
+
+#[test]
+fn the_embedded_certificate_key_info_is_unaffected() {
+    let xml = request_with_transforms(&format!(
+        r##"{ENVELOPED}<ds:Transform Algorithm="{EXC_C14N}"/>"##
+    ));
+    assert!(xml.contains("<ds:X509Certificate>"));
+    assert!(verifier().verify_all_enveloped(&xml).unwrap()[0].is_valid());
+}
