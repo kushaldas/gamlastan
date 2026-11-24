@@ -17,7 +17,8 @@ where needed to correct protocol handling.
   and exclusive-c14n transforms (with and without comments),
   same-document reference URIs (`""` or `#id`), and at most 8 references per
   signature and 8 transforms per reference. `permissive()` restores the old
-  behavior; `with_transforms`, `with_any_transform`, `with_reference_uris`,
+  behavior; `with_transforms` (replaces the list), `with_additional_transforms`
+  (adds to it), `with_any_transform`, `with_reference_uris`,
   `with_require_single_reference`, `with_max_references` and
   `with_max_transforms_per_reference` adjust one setting at a time.
 
@@ -27,12 +28,16 @@ where needed to correct protocol handling.
   a signature whose `Reference` uses a transform outside the SAML profile
   (for example an XPath filter, which can narrow what is signed while the
   reference URI and digest still check out) or a URI other than `""` or
-  `#id`. This also stops the underlying verifier from reading a relative file
-  named by a `Reference URI` from the working directory, and the refusal is
-  the same whether or not the file exists. Deployments that sign with other
-  transforms (for example inclusive c14n as a transform) must allow them with
-  `TransformPolicy::with_transforms`, or opt out with
-  `TransformPolicy::permissive()`.
+  `#id`; an `#xpointer(...)` fragment is refused too. This also stops the
+  underlying verifier from reading a relative file named by a `Reference URI`
+  from the working directory, and the refusal is the same whether or not the
+  file exists. Inclusive c14n and c14n 1.1 are not in the default set.
+  Deployments that sign with other transforms add them to the SAML set with
+  `TransformPolicy::saml().with_additional_transforms([...])` (for example the
+  inclusive c14n URI `http://www.w3.org/TR/2001/REC-xml-c14n-20010315`), or opt
+  out with `TransformPolicy::permissive()`. `with_transforms` replaces the whole
+  list, so it must then also list `enveloped-signature` and the exclusive c14n
+  URIs.
 
 ## [0.11.0] - 2026-11-09
 

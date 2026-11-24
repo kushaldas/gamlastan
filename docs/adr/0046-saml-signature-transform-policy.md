@@ -49,6 +49,13 @@ error differed between an existing and a missing file.
    `Signature`, `SignedInfo`, `Reference` and `Transforms` by namespace). A
    `Transform` outside the XML-DSig namespace is refused, since a SAML
    signature never has one and bergshamra would otherwise run it unseen.
+   Inclusive canonicalization (`REC-xml-c14n-20010315`) and canonical XML 1.1
+   (`REC-xml-c14n11`), with or without comments, are deliberately **not** in
+   the default set: SAML Core 5.4 names exclusive canonicalization only, and
+   bergshamra supports the others (so this is a decision, not an omission). A
+   deployment whose signers use one adds it with `with_additional_transforms`
+   (which keeps the SAML set) rather than `with_transforms` (which replaces it).
+   A `#xpointer(...)` fragment is likewise refused as a reference URI.
 3. Make it configurable rather than fixed: `permissive()` restores the previous
    behavior, `with_transforms` and `with_any_transform` change the transform
    allowlist, `with_reference_uris(ReferenceUris::Any)` allows other URIs,

@@ -88,6 +88,13 @@ impl TransformPolicy {
     /// Replace the transform allowlist with exactly the supplied algorithm
     /// URIs. An empty iterator denies every transform. Order and duplicates are
     /// ignored.
+    ///
+    /// This **replaces** the list, it does not extend it: to allow one more
+    /// transform alongside the SAML profile, list the whole set, or use
+    /// [`with_additional_transforms`](Self::with_additional_transforms).
+    /// `TransformPolicy::saml().with_transforms([INCLUSIVE_C14N])` refuses every
+    /// ordinary signature, because `enveloped-signature` and exclusive c14n are
+    /// no longer allowed.
     pub fn with_transforms<I, T>(mut self, transforms: I) -> Self
     where
         I: IntoIterator<Item = T>,
@@ -97,6 +104,33 @@ impl TransformPolicy {
         transforms.sort_unstable();
         transforms.dedup();
         self.allowed_transforms = Some(transforms);
+        self
+    }
+
+    /// Add transform algorithm URIs to the current allowlist, keeping what is
+    /// already allowed. If the policy currently allows any transform
+    /// ([`with_any_transform`](Self::with_any_transform) or
+    /// [`permissive`](Self::permissive)), it stays unrestricted.
+    ///
+    /// ```
+    /// use gamlastan::crypto::TransformPolicy;
+    ///
+    /// // The SAML profile plus inclusive c14n 1.0 as a Reference transform.
+    /// let policy = TransformPolicy::saml()
+    ///     .with_additional_transforms(["http://www.w3.org/TR/2001/REC-xml-c14n-20010315"]);
+    /// assert!(policy.allows_transform("http://www.w3.org/TR/2001/REC-xml-c14n-20010315"));
+    /// assert!(policy.allows_transform("http://www.w3.org/2001/10/xml-exc-c14n#"));
+    /// ```
+    pub fn with_additional_transforms<I, T>(mut self, transforms: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
+        if let Some(allowed) = self.allowed_transforms.as_mut() {
+            allowed.extend(transforms.into_iter().map(Into::into));
+            allowed.sort_unstable();
+            allowed.dedup();
+        }
         self
     }
 

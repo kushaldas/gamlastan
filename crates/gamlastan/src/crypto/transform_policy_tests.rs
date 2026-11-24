@@ -412,3 +412,90 @@ fn an_unqualified_standard_transform_is_not_accepted_as_profile_compliant() {
     );
     assert!(message(&error).contains("namespace"), "{error}");
 }
+
+// -- the single-signature path (`verify_enveloped`), used by SLO and MDQ ----------------
+
+#[test]
+fn verify_enveloped_refuses_a_first_signature_with_an_xpath_transform() {
+    let xml = request_with_transforms(XPATH_NARROWING);
+    let tampered = xml.replace("sp.example.test", "evil.example.test");
+    let error = verifier()
+        .verify_enveloped(&tampered)
+        .expect_err("the single-signature path must apply the transform policy");
+    assert!(message(&error).contains("transform policy"), "{error}");
+}
+
+#[test]
+fn verify_enveloped_accepts_the_standard_signature() {
+    let xml = request_with_transforms(&format!(
+        r##"{ENVELOPED}<ds:Transform Algorithm="{EXC_C14N}"/>"##
+    ));
+    let result = verifier().verify_enveloped(&xml).unwrap();
+    assert!(result.is_valid() && result.all_reference_digests_verified());
+}
+
+#[test]
+fn single_and_all_verification_inspect_the_same_signatures_as_the_backend() {
+    // A clean first signature and a second one with an XPath transform. The
+    // backend's single-signature path verifies only the first, so the policy
+    // checks only the first there; the all-signatures path checks both. This
+    // mirrors the algorithm-policy test of the same name and pins the symmetry.
+    let clean = signature_template(ID, &cert_b64(), SIG_ALG);
+    let narrowing = signature_template(ID, &cert_b64(), SIG_ALG).replace(
+        ENVELOPED,
+        r##"<ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>true()</ds:XPath></ds:Transform>"##,
+    );
+    let xml = format!(
+        r#"<samlp:AuthnRequest xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="{ID}" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"><saml:Issuer>https://sp.example.test</saml:Issuer>{clean}{narrowing}</samlp:AuthnRequest>"#
+    );
+    let signed = signer().sign_enveloped(&xml).unwrap();
+
+    assert!(
+        verifier().verify_enveloped(&signed).unwrap().is_valid(),
+        "the single-signature path consumes only the first signature"
+    );
+    let error = refused(
+        verifier().verify_all_enveloped(&signed),
+        "a second signature with an XPath transform",
+    );
+    assert!(message(&error).contains("transform"), "{error}");
+}
+
+// -- `with_transforms` replaces, `with_additional_transforms` extends -----------------
+
+#[test]
+fn with_transforms_replaces_the_allowlist_so_it_must_list_the_profile_too() {
+    // Listing only the extra transform drops enveloped-signature and exclusive
+    // c14n: every ordinary signature is then refused. This is the documented
+    // behavior; `with_additional_transforms` is the safe way to add one.
+    let xml = request_with_transforms(&format!(
+        r##"{ENVELOPED}<ds:Transform Algorithm="{EXC_C14N}"/>"##
+    ));
+    let only_inclusive = TransformPolicy::saml().with_transforms([INCLUSIVE_C14N]);
+    let error = refused(
+        verifier()
+            .with_transform_policy(only_inclusive)
+            .verify_all_enveloped(&xml),
+        "an allowlist without the profile",
+    );
+    assert!(message(&error).contains("transform"), "{error}");
+}
+
+#[test]
+fn with_additional_transforms_keeps_the_profile_and_adds_the_extra_one() {
+    let policy = TransformPolicy::saml().with_additional_transforms([INCLUSIVE_C14N]);
+    assert!(policy.allows_transform(INCLUSIVE_C14N));
+    assert!(policy.allows_transform(ENVELOPED_URI));
+    assert!(policy.allows_transform(EXC_C14N));
+    assert!(!policy.allows_transform(XPATH));
+
+    let standard = request_with_transforms(&format!(
+        r##"{ENVELOPED}<ds:Transform Algorithm="{EXC_C14N}"/>"##
+    ));
+    let inclusive = request_with_transforms(&format!(
+        r##"{ENVELOPED}<ds:Transform Algorithm="{INCLUSIVE_C14N}"/>"##
+    ));
+    let verifier = verifier().with_transform_policy(policy);
+    assert!(verifier.verify_all_enveloped(&standard).unwrap()[0].is_valid());
+    assert!(verifier.verify_all_enveloped(&inclusive).unwrap()[0].is_valid());
+}
