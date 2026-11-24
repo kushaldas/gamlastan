@@ -36,6 +36,13 @@ where needed to correct protocol handling.
 - `gamlastan-actix`: a Redirect-binding request carrying some signature
   parameters but not a complete set (for example `SigAlg` without `Signature`)
   is now refused with a 400 instead of being treated as unsigned.
+- **Operational note for upgrades:** two fail-closed changes turn traffic that
+  was accepted before into 4xx. A Redirect message with `SigAlg` but no
+  `Signature` is a 400 (the extractor also serves the SP's ACS and logout
+  paths), and a message with several signatures is refused as a whole when any
+  one of them is malformed, because the algorithm-policy scan runs before each
+  signature is checked on its own. A spike of 400/403 after upgrading is most
+  likely malformed traffic or a broken signer, not an attack.
 
 ## [0.11.0] - 2026-11-09
 
