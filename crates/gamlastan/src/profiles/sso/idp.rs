@@ -894,7 +894,11 @@ pub fn verify_request_signatures(
     xml: &str,
     message_id: &str,
 ) -> Result<bool, ProfileError> {
-    let redirect_signed = redirect.filter(|d| d.signature.is_some() || d.sig_alg.is_some());
+    // Any of the three fields means the request is signed. `redirect_decode` only sets
+    // `signature_input` together with `SigAlg`, but a caller may build a
+    // `RedirectDecoded` by hand, and a partial set must be an error, not "unsigned".
+    let redirect_signed = redirect
+        .filter(|d| d.signature.is_some() || d.sig_alg.is_some() || d.signature_input.is_some());
     // The verifier reports "no signature" as an error, which would be
     // indistinguishable from a broken one, so look for a `ds:Signature` first,
     // anywhere in the document, with the parse the verifier itself uses.
@@ -979,6 +983,14 @@ fn contains_xml_signature(xml: &str) -> Result<bool, ProfileError> {
 
 /// Whether a verified reference `uri` covers the object with `id`: a `#id`
 /// same-document reference, or the document root through an empty `URI`.
+///
+/// An empty `URI` is accepted because the verifier resolves it to the **whole
+/// parsed document**, not to the `Signature`'s parent element as XML-DSig 4.2
+/// allows (bergshamra-dsig 0.12: both the fast path and the generic path map it
+/// to every node but comments, and skip the position check for it). If that ever
+/// changed, a signature nested in `Extensions` with `URI=""` would cover only
+/// `Extensions`, so keep this in step with the verifier. `gamlastan-mdq` keeps its
+/// own copy of this one-line rule.
 fn reference_uri_covers(uri: &str, id: &str) -> bool {
     uri.is_empty() || uri.strip_prefix('#') == Some(id)
 }
@@ -2188,5 +2200,56 @@ mod request_signature_tests {
                 "a nested signature must not pass as unsigned"
             );
         }
+    }
+
+    #[test]
+    fn reference_uri_covers_only_the_message_or_the_document_root() {
+        // The three cases the old example-idp `request_reference_covers` test asserted
+        // (finding #17 of the internal security report), plus the neighbours.
+        assert!(reference_uri_covers("#_req-123", "_req-123"));
+        assert!(reference_uri_covers("", "_req-123"), "the document root");
+        assert!(!reference_uri_covers("#_other-object", "_req-123"));
+        // A reference to an absolute URI is a detached reference, never the request.
+        assert!(!reference_uri_covers(
+            "https://attacker.example/signed",
+            "_req-123"
+        ));
+        assert!(!reference_uri_covers("_req-123", "_req-123"), "no # marker");
+        assert!(!reference_uri_covers("cid:attachment", "_req-123"));
+        assert!(!reference_uri_covers("#", "_req-123"));
+    }
+
+    #[test]
+    fn a_signature_with_an_external_reference_does_not_authenticate_the_request() {
+        // The signer refuses to produce one, so use a document that was not signed
+        // by us: the verifier must not authenticate it, whatever the digest setting.
+        let signature = format!(
+            r##"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="{SIG_ALG}"/><ds:Reference URI="https://attacker.example/signed"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>AAAA</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AAAA</ds:SignatureValue></ds:Signature>"##
+        );
+        let xml = unsigned_request(&signature);
+        for require_digests in [true, false] {
+            let mut verifier = verifier_for(CERT);
+            verifier.set_require_reference_digests(require_digests);
+            let outcome = verify_request_signatures(Some(&verifier), None, &xml, REQUEST_ID);
+            assert!(
+                !matches!(outcome, Ok(true)),
+                "an external reference authenticated the request (digests required: {require_digests})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_redirect_with_only_a_signature_input_is_an_error_not_unsigned() {
+        let mut decoded = redirect_request(&unsigned_request(""), false);
+        decoded.signature = None;
+        decoded.sig_alg = None;
+        decoded.signature_input = Some("SAMLRequest=x&SigAlg=y".to_string());
+        let verified = verify_request_signatures(
+            Some(&verifier_for(CERT)),
+            Some(&decoded),
+            &unsigned_request(""),
+            REQUEST_ID,
+        );
+        assert!(verified.is_err(), "{verified:?}");
     }
 }

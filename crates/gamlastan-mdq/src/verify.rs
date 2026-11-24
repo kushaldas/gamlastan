@@ -260,6 +260,13 @@ fn verify_if_configured(
 /// which in MDQ is the EntityDescriptor/EntitiesDescriptor the parser reads. Any
 /// other target (a sibling object, an external URI) does not protect the trusted
 /// element and must be rejected as XML Signature Wrapping.
+///
+/// The same rule exists in `gamlastan::profiles::sso::idp` (private there). Unlike
+/// `verify_request_signatures`, this path does not itself require every reference
+/// digest to be verified locally; it relies on the verifier's default
+/// `require_reference_digests`. Both accept an empty URI because the verifier
+/// resolves it to the whole document. A shared "reference coverage" API would
+/// remove the duplication.
 fn reference_uri_covers(uri: &str, id: &str) -> bool {
     uri.is_empty() || uri.strip_prefix('#') == Some(id)
 }

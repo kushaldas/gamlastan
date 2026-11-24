@@ -1754,6 +1754,54 @@ mod tests {
         assert_eq!(ar_err.status_code(), StatusCode::FORBIDDEN);
     }
 
+    fn trusted_artifact_resolve() -> ArtifactResolve {
+        ArtifactResolve {
+            id: "_ar_1".to_string(),
+            version: SamlVersion::V2_0,
+            issue_instant: Utc::now(),
+            destination: None,
+            consent: None,
+            issuer: Some(Issuer::entity("https://sp.example.com")),
+            has_signature: false,
+            artifact: "AAQAAD...".to_string(),
+        }
+    }
+
+    #[test]
+    fn artifact_resolve_signed_by_its_trusted_sp_is_authorized() {
+        let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso");
+        let sp = signing_sp_sso();
+        let resolve = trusted_artifact_resolve();
+        let template = signature_template(
+            &resolve.id,
+            &cert_b64(SIGN_CERT_PEM),
+            "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
+        );
+        let xml = insert_test_signature_after_issuer(&resolve.to_xml_string().unwrap(), &template);
+        let signed = test_signer().sign_enveloped(&xml).unwrap();
+
+        authorize_artifact_resolve(&config, &resolve, &signed, Some(&sp))
+            .expect("a signed, bound ArtifactResolve from a trusted SP must be authorized");
+    }
+
+    #[test]
+    fn artifact_resolve_without_a_signature_is_refused_even_from_a_trusted_sp() {
+        let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso");
+        let sp = signing_sp_sso();
+        let resolve = trusted_artifact_resolve();
+        let xml = resolve.to_xml_string().unwrap();
+
+        use actix_web::{http::StatusCode, ResponseError};
+        let error = authorize_artifact_resolve(&config, &resolve, &xml, Some(&sp)).unwrap_err();
+        assert_eq!(error.status_code(), StatusCode::FORBIDDEN);
+        assert!(
+            error
+                .to_string()
+                .contains("ArtifactResolve contains no XML signature"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn test_artifact_resolve_rejected_when_no_trusted_sps() {
         // Finding #5 regression: artifact resolution must fail closed without a
