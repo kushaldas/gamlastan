@@ -24,6 +24,19 @@ where needed to correct protocol handling.
   `ds:RetrievalMethod` and `dsig11:KeyInfoReference` in a signature's `KeyInfo`, which
   are refused by default. `with_require_profile_transforms` controls
   the structure requirement below (on by default).
+- `profiles::sso::idp::verify_request_signatures`: verify every signature on an
+  inbound SP request (an HTTP-Redirect query signature and any enveloped XML
+  signatures) and return whether the request was authenticated, for use as
+  `process_authn_request`'s `request_signature_verified`. Each XML signature
+  must verify with every reference digest computed locally and must reference
+  the consumed message (a `#id` reference or the document root), so a valid
+  signature over a sibling object does not authorize it (ADR 0028). A
+  signature anywhere in the document counts as present, not only a direct
+  child, so a malformed signature nested in `Extensions` is verified and
+  fails instead of passing as unsigned. An unsigned request is `Ok(false)`,
+  not an error; the verifier is `None` when the SP has no usable key, which
+  refuses a signed request and leaves an unsigned one unauthenticated.
+  Integrators no longer need to re-implement this binding check.
 
 ### Changed
 
@@ -48,6 +61,24 @@ where needed to correct protocol handling.
   signature's `KeyInfo` (`RetrievalMethod`, `KeyInfoReference`): with
   `trusted_keys_only` off the verifier would otherwise read a certificate from a
   path named in the message and trust it.
+- `gamlastan-actix` and `example-idp`: the request and `ArtifactResolve`
+  signature checks now use `verify_request_signatures`. They additionally
+  require every reference digest to be verified locally, and look for a
+  signature anywhere in the message instead of trusting the parser's
+  `has_signature` flag, so a signature the flag missed is verified (or
+  refused) rather than ignored. `example-idp` also checks every XML
+  signature, not only the first. Actix error messages keep their
+  `AuthnRequest` / `LogoutRequest` / `ArtifactResolve` prefix.
+- `gamlastan-actix`: a Redirect-binding request carrying some signature
+  parameters but not a complete set (for example `SigAlg` without `Signature`)
+  is now refused with a 400 instead of being treated as unsigned.
+- **Operational note for upgrades:** two fail-closed changes turn traffic that
+  was accepted before into 4xx. A Redirect message with `SigAlg` but no
+  `Signature` is a 400 (the extractor also serves the SP's ACS and logout
+  paths), and a message with several signatures is refused as a whole when any
+  one of them is malformed, because the algorithm-policy scan runs before each
+  signature is checked on its own. A spike of 400/403 after upgrading is most
+  likely malformed traffic or a broken signer, not an attack.
 
 ## [0.11.0] - 2026-11-09
 

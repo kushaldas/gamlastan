@@ -524,7 +524,6 @@ async fn idp_sso(
         &sp_sso,
         xml_str,
         &authn_request.base.id,
-        authn_request.base.has_signature,
         "AuthnRequest",
     )?;
 
@@ -997,58 +996,38 @@ fn verify_sp_message_signature(
     expected_id: &str,
     what: &str,
 ) -> Result<(), SamlActixError> {
-    // Missing signing material for an inbound request is an authentication
-    // failure on attacker-controllable traffic, not a server fault: map it to
-    // 403 (via ProfileError) rather than 500.
-    let verifier = config.verifier_for(sp).ok_or_else(|| {
-        SamlActixError::Profile(gamlastan::profiles::ProfileError::AssertionValidation(
-            format!(
-                "{what} issuer has no usable signing certificate in its metadata; \
-                 refusing unauthenticated request"
-            ),
-        ))
-    })?;
-
-    let results = verifier.verify_all_enveloped(xml_str).map_err(|e| {
-        SamlActixError::Profile(gamlastan::profiles::ProfileError::AssertionValidation(
-            format!("{what} signature verification failed: {e}"),
-        ))
-    })?;
-    if results.is_empty() {
-        return Err(SamlActixError::Profile(
+    // The shared core check verifies every signature, binds each to the parsed
+    // message, and reports whether any signature was present. Missing signing
+    // material for an inbound request is an authentication failure on
+    // attacker-controllable traffic, not a server fault: it surfaces as a 403
+    // (via ProfileError) rather than a 500.
+    let verifier = config.verifier_for(sp);
+    match gamlastan::profiles::sso::idp::verify_request_signatures(
+        verifier.as_ref(),
+        None,
+        xml_str,
+        expected_id,
+    ) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(SamlActixError::Profile(
             gamlastan::profiles::ProfileError::AssertionValidation(format!(
                 "{what} contains no XML signature"
             )),
-        ));
+        )),
+        Err(e) => Err(relabel_signature_error(what, e)),
     }
+}
 
-    for result in results {
-        match result {
-            gamlastan::crypto::VerifyResult::Valid { references, .. } => {
-                // Bind every signature to the parsed message. This also keeps
-                // a second unbound-but-valid signature from hiding behind a
-                // valid first signature.
-                if !references.iter().any(|reference| {
-                    reference.uri.is_empty() || reference.uri.strip_prefix('#') == Some(expected_id)
-                }) {
-                    return Err(SamlActixError::Profile(
-                        gamlastan::profiles::ProfileError::AssertionValidation(format!(
-                            "{what} signature did not reference the message (XML Signature Wrapping)"
-                        )),
-                    ));
-                }
-            }
-            gamlastan::crypto::VerifyResult::Invalid { reason } => {
-                return Err(SamlActixError::Profile(
-                    gamlastan::profiles::ProfileError::AssertionValidation(format!(
-                        "{what} signature invalid: {reason}"
-                    )),
-                ));
-            }
-        }
-    }
-
-    Ok(())
+/// Prefix a core signature-verification error with the message kind, keeping
+/// the 403-mapped [`ProfileError::AssertionValidation`] shape.
+fn relabel_signature_error(what: &str, error: gamlastan::profiles::ProfileError) -> SamlActixError {
+    let detail = match error {
+        gamlastan::profiles::ProfileError::AssertionValidation(detail) => detail,
+        other => other.to_string(),
+    };
+    SamlActixError::Profile(gamlastan::profiles::ProfileError::AssertionValidation(
+        format!("{what} {detail}"),
+    ))
 }
 
 /// Verify every signature representation present on an SP request and return
@@ -1067,44 +1046,30 @@ fn verify_sp_request_signatures(
     sp: &gamlastan::metadata::types::sp::SpSsoDescriptor,
     xml: &str,
     request_id: &str,
-    has_xml_signature: bool,
     what: &str,
 ) -> Result<bool, SamlActixError> {
-    let mut verified = false;
+    // The Redirect signature fields are all the core check reads.
+    let redirect =
+        redirect_signature.map(|signature| gamlastan::bindings::redirect::RedirectDecoded {
+            saml_xml: Vec::new(),
+            is_request: true,
+            relay_state: None,
+            sig_alg: Some(signature.sig_alg.clone()),
+            signature: Some(signature.signature.clone()),
+            signature_input: Some(signature.signature_input.clone()),
+        });
 
-    if let Some(signature) = redirect_signature {
-        let verifier = config.verifier_for(sp).ok_or_else(|| {
-            SamlActixError::Profile(gamlastan::profiles::ProfileError::AssertionValidation(
-                format!("{what} issuer has no usable signing certificate in metadata"),
-            ))
-        })?;
-        let valid = verifier
-            .verify_redirect_query(
-                signature.signature_input.as_bytes(),
-                &signature.signature,
-                &signature.sig_alg,
-            )
-            .map_err(|e| {
-                SamlActixError::Profile(gamlastan::profiles::ProfileError::AssertionValidation(
-                    format!("{what} redirect signature verification failed: {e}"),
-                ))
-            })?;
-        if !valid {
-            return Err(SamlActixError::Profile(
-                gamlastan::profiles::ProfileError::AssertionValidation(format!(
-                    "{what} redirect signature is invalid"
-                )),
-            ));
-        }
-        verified = true;
-    }
-
-    if has_xml_signature {
-        verify_sp_message_signature(config, sp, xml, request_id, what)?;
-        verified = true;
-    }
-
-    Ok(verified)
+    // The core check finds a signature anywhere in the message, not only where
+    // the parser's `has_signature` flag looks, and refuses a signed request when
+    // the SP has no usable key. An unsigned request is `Ok(false)`.
+    let verifier = config.verifier_for(sp);
+    gamlastan::profiles::sso::idp::verify_request_signatures(
+        verifier.as_ref(),
+        redirect.as_ref(),
+        xml,
+        request_id,
+    )
+    .map_err(|e| relabel_signature_error(what, e))
 }
 
 /// Resolve trusted SP metadata for `entity_id`: the static
@@ -1248,7 +1213,6 @@ fn authorize_slo_request(
         sp,
         xml_str,
         &logout_req.id,
-        logout_req.has_signature,
         "LogoutRequest",
     )?;
     if !authenticated {
@@ -1640,6 +1604,27 @@ mod tests {
     }
 
     #[test]
+    fn a_nested_signature_is_not_accepted_as_an_unsigned_request() {
+        // `has_signature` only looks for a direct-child signature. A malformed
+        // `ds:Signature` inside `Extensions` must still reach the verifier and
+        // fail, not pass as an unsigned request when policy allows those.
+        let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso");
+        let sp = signing_sp_sso();
+        let xml = r#"<samlp:AuthnRequest xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" ID="_req1" Version="2.0" IssueInstant="2026-09-03T00:00:00Z"><saml:Issuer>https://sp.example.com</saml:Issuer><samlp:Extensions><ds:Signature/></samlp:Extensions></samlp:AuthnRequest>"#;
+
+        let error = verify_sp_request_signatures(None, &config, &sp, xml, "_req1", "AuthnRequest")
+            .unwrap_err();
+        assert!(error.to_string().contains("signature"), "{error}");
+
+        // The same request without the nested signature is simply unsigned.
+        let unsigned = xml.replace("<samlp:Extensions><ds:Signature/></samlp:Extensions>", "");
+        let verified =
+            verify_sp_request_signatures(None, &config, &sp, &unsigned, "_req1", "AuthnRequest")
+                .unwrap();
+        assert!(!verified);
+    }
+
+    #[test]
     fn slo_valid_redirect_cannot_mask_invalid_xml_signature() {
         let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso");
         let mut request = logout_request(Some("https://sp.example.com"));
@@ -1767,6 +1752,54 @@ mod tests {
         let ar_err =
             authorize_artifact_resolve(&config, &resolve, "<ArtifactResolve/>", None).unwrap_err();
         assert_eq!(ar_err.status_code(), StatusCode::FORBIDDEN);
+    }
+
+    fn trusted_artifact_resolve() -> ArtifactResolve {
+        ArtifactResolve {
+            id: "_ar_1".to_string(),
+            version: SamlVersion::V2_0,
+            issue_instant: Utc::now(),
+            destination: None,
+            consent: None,
+            issuer: Some(Issuer::entity("https://sp.example.com")),
+            has_signature: false,
+            artifact: "AAQAAD...".to_string(),
+        }
+    }
+
+    #[test]
+    fn artifact_resolve_signed_by_its_trusted_sp_is_authorized() {
+        let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso");
+        let sp = signing_sp_sso();
+        let resolve = trusted_artifact_resolve();
+        let template = signature_template(
+            &resolve.id,
+            &cert_b64(SIGN_CERT_PEM),
+            "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
+        );
+        let xml = insert_test_signature_after_issuer(&resolve.to_xml_string().unwrap(), &template);
+        let signed = test_signer().sign_enveloped(&xml).unwrap();
+
+        authorize_artifact_resolve(&config, &resolve, &signed, Some(&sp))
+            .expect("a signed, bound ArtifactResolve from a trusted SP must be authorized");
+    }
+
+    #[test]
+    fn artifact_resolve_without_a_signature_is_refused_even_from_a_trusted_sp() {
+        let config = IdpConfig::new("https://idp.example.com", "https://idp.example.com/sso");
+        let sp = signing_sp_sso();
+        let resolve = trusted_artifact_resolve();
+        let xml = resolve.to_xml_string().unwrap();
+
+        use actix_web::{http::StatusCode, ResponseError};
+        let error = authorize_artifact_resolve(&config, &resolve, &xml, Some(&sp)).unwrap_err();
+        assert_eq!(error.status_code(), StatusCode::FORBIDDEN);
+        assert!(
+            error
+                .to_string()
+                .contains("ArtifactResolve contains no XML signature"),
+            "{error}"
+        );
     }
 
     #[test]
