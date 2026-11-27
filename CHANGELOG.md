@@ -9,6 +9,21 @@ where needed to correct protocol handling.
 
 ### Added
 
+- `crypto::TransformPolicy` and `crypto::ReferenceUris`, with
+  `SamlVerifier::set_transform_policy`, `with_transform_policy` and
+  `transform_policy`: a local policy for the `Reference` elements of a
+  signature, enforced before the signature is processed (ADR 0046). The
+  default, `TransformPolicy::saml()`, allows only the `enveloped-signature`
+  and exclusive-c14n transforms (with and without comments),
+  same-document reference URIs (`""` or `#id`), and at most 8 references per
+  signature and 8 transforms per reference. `permissive()` restores the old
+  behavior; `with_transforms` (replaces the list), `with_additional_transforms`
+  (adds to it), `with_any_transform`, `with_reference_uris`,
+  `with_require_single_reference`, `with_max_references` and
+  `with_max_transforms_per_reference` adjust one setting at a time. `with_allow_key_retrieval` allows
+  `ds:RetrievalMethod` and `dsig11:KeyInfoReference` in a signature's `KeyInfo`, which
+  are refused by default. `with_require_profile_transforms` controls
+  the structure requirement below (on by default).
 - `profiles::sso::idp::verify_request_signatures`: verify every signature on an
   inbound SP request (an HTTP-Redirect query signature and any enveloped XML
   signatures) and return whether the request was authenticated, for use as
@@ -25,6 +40,27 @@ where needed to correct protocol handling.
 
 ### Changed
 
+- **Signature verification is stricter by default.** `SamlVerifier` now refuses
+  a signature whose `Reference` uses a transform outside the SAML profile
+  (for example an XPath filter, which can narrow what is signed while the
+  reference URI and digest still check out) or a URI other than `""` or
+  `#id`; an `#xpointer(...)` fragment is refused too. This also stops the
+  underlying verifier from reading a relative file named by a `Reference URI`
+  from the working directory, and the refusal is the same whether or not the
+  file exists. Inclusive c14n and c14n 1.1 are not in the default set.
+  Deployments that sign with other transforms add them to the SAML set with
+  `TransformPolicy::saml().with_additional_transforms([...])` (for example the
+  inclusive c14n URI `http://www.w3.org/TR/2001/REC-xml-c14n-20010315`), or opt
+  out with `TransformPolicy::permissive()`. `with_transforms` replaces the whole
+  list, so it must then also list `enveloped-signature` and the exclusive c14n
+  URIs. Every reference must also carry exactly one
+  `enveloped-signature` and exactly one canonicalization transform, so a reference
+  with no transforms (which the backend would canonicalize with inclusive c14n) is
+  refused; `with_require_profile_transforms(false)` relaxes this. The policy also
+  refuses key retrieval in a
+  signature's `KeyInfo` (`RetrievalMethod`, `KeyInfoReference`): with
+  `trusted_keys_only` off the verifier would otherwise read a certificate from a
+  path named in the message and trust it.
 - `gamlastan-actix` and `example-idp`: the request and `ArtifactResolve`
   signature checks now use `verify_request_signatures`. They additionally
   require every reference digest to be verified locally, and look for a

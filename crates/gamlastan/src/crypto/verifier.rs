@@ -8,6 +8,7 @@ use bergshamra_keys::{KeyUsage, KeysManager};
 
 use crate::crypto::config::AlgorithmPolicy;
 use crate::crypto::error::CryptoError;
+use crate::crypto::transform_policy::TransformPolicy;
 use crate::xml::uppsala::{Document, NodeId};
 
 const DEFAULT_HMAC_MIN_OUT_LEN_BITS: usize = 160;
@@ -126,6 +127,212 @@ fn validate_enveloped_algorithm_policy(
     Ok(())
 }
 
+/// Quote an attacker-controlled attribute value for an error message: escaped,
+/// and cut at 64 characters so a hostile message cannot flood a log.
+fn quoted_for_error(value: &str) -> String {
+    const MAX_CHARS: usize = 64;
+    let mut quoted: String = value.chars().take(MAX_CHARS).collect();
+    if value.chars().count() > MAX_CHARS {
+        quoted.push_str("...");
+    }
+    format!("{quoted:?}")
+}
+
+fn validate_signature_transforms(
+    doc: &Document<'_>,
+    signature: NodeId,
+    policy: &TransformPolicy,
+) -> Result<(), CryptoError> {
+    let signed_info = exactly_one_direct_dsig_child(doc, signature, "SignedInfo")?;
+    let references: Vec<NodeId> = doc
+        .children_iter(signed_info)
+        .filter(|child| is_dsig_element(doc, *child, "Reference"))
+        .collect();
+
+    if policy
+        .max_references()
+        .is_some_and(|max| references.len() > max)
+    {
+        return Err(CryptoError::VerificationFailed(format!(
+            "signature has {} references; the transform policy allows at most {}",
+            references.len(),
+            policy.max_references().unwrap_or_default()
+        )));
+    }
+    if policy.requires_single_reference() && references.len() != 1 {
+        return Err(CryptoError::VerificationFailed(format!(
+            "signature has {} references; the transform policy requires exactly one",
+            references.len()
+        )));
+    }
+
+    for reference in references {
+        // A missing URI attribute is read as "" (the whole document) by the
+        // verifier, so apply the same reading here.
+        let uri = doc
+            .element(reference)
+            .and_then(|element| element.get_attribute("URI"))
+            .unwrap_or("");
+        if !policy.allows_reference_uri(uri) {
+            return Err(CryptoError::VerificationFailed(format!(
+                "Reference URI {} is not allowed by the transform policy \
+                 (only \"\" and \"#id\" are accepted)",
+                quoted_for_error(uri)
+            )));
+        }
+
+        let mut transforms_elements = doc
+            .children_iter(reference)
+            .filter(|child| is_dsig_element(doc, *child, "Transforms"));
+        let transforms = transforms_elements.next();
+        if transforms_elements.next().is_some() {
+            return Err(CryptoError::VerificationFailed(
+                "Reference has more than one ds:Transforms element".to_string(),
+            ));
+        }
+
+        // Counted as the loop below checks each transform, for the profile
+        // structure check afterwards. A reference with no `ds:Transforms` has none.
+        let mut enveloped = 0usize;
+        let mut canonicalization = 0usize;
+
+        // bergshamra executes every child of `ds:Transforms` whose *local name*
+        // is `Transform`, in any namespace or none (`verify.rs`, both the fast
+        // path and the generic pipeline). Select them the same way, so a
+        // namespace-less or foreign-namespace transform cannot slip past the
+        // allowlist or the count limit, and refuse one that is not in the
+        // XML-DSig namespace: a SAML signature never has one.
+        for (index, transform) in transforms
+            .into_iter()
+            .flat_map(|transforms| doc.children_iter(transforms))
+            .filter(|child| {
+                doc.element(*child)
+                    .is_some_and(|element| element.name.local_name == "Transform")
+            })
+            .enumerate()
+        {
+            if policy
+                .max_transforms_per_reference()
+                .is_some_and(|max| index >= max)
+            {
+                return Err(CryptoError::VerificationFailed(format!(
+                    "Reference has more than {} transforms; that is the transform policy limit",
+                    policy.max_transforms_per_reference().unwrap_or_default()
+                )));
+            }
+            if !is_dsig_element(doc, transform, "Transform") {
+                let namespace = doc
+                    .element(transform)
+                    .and_then(|element| element.name.namespace_uri.as_deref())
+                    .unwrap_or("");
+                return Err(CryptoError::VerificationFailed(format!(
+                    "Reference has a Transform element in the namespace {} instead of the \
+                     XML-DSig namespace; the transform policy does not allow it",
+                    quoted_for_error(namespace)
+                )));
+            }
+            let algorithm = algorithm_attribute(doc, transform, "Transform")?;
+            if !policy.allows_transform(algorithm) {
+                return Err(CryptoError::VerificationFailed(format!(
+                    "Reference transform {} is not allowed by the transform policy",
+                    quoted_for_error(algorithm)
+                )));
+            }
+            if algorithm == bergshamra_core::algorithm::ENVELOPED_SIGNATURE {
+                enveloped += 1;
+            } else if TransformPolicy::is_canonicalization_transform(algorithm) {
+                canonicalization += 1;
+            }
+        }
+
+        // The allowlist constrains the transforms that are present. Without this,
+        // a reference that leaves them out is canonicalized by the backend with
+        // inclusive c14n, which is what the allowlist refuses by default.
+        if policy.requires_profile_transforms() {
+            if enveloped != 1 {
+                return Err(CryptoError::VerificationFailed(format!(
+                    "Reference has {enveloped} enveloped-signature transforms; the transform \
+                     policy requires exactly one"
+                )));
+            }
+            if canonicalization != 1 {
+                return Err(CryptoError::VerificationFailed(format!(
+                    "Reference has {canonicalization} canonicalization transforms; the transform \
+                     policy requires exactly one"
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Refuse key retrieval in a signature's `KeyInfo` unless the policy allows it.
+///
+/// bergshamra finds the signature's `KeyInfo` by namespace, then treats a
+/// `RetrievalMethod` child in the XML-DSig namespace or in none as a key to read
+/// from a file, and follows a `dsig11:KeyInfoReference` to *any* element of the
+/// document with that ID as the effective `KeyInfo`. Scan every `KeyInfo`-named
+/// child by local name, and refuse both constructs by local name too, so neither
+/// a namespace-less element nor a reference to a `KeyInfo` placed elsewhere can
+/// hide a `RetrievalMethod`.
+fn validate_signature_key_info(
+    doc: &Document<'_>,
+    signature: NodeId,
+    policy: &TransformPolicy,
+) -> Result<(), CryptoError> {
+    if policy.allows_key_retrieval() {
+        return Ok(());
+    }
+    for key_info in doc.children_iter(signature).filter(|child| {
+        doc.element(*child)
+            .is_some_and(|element| element.name.local_name == "KeyInfo")
+    }) {
+        for child in doc.children_iter(key_info) {
+            let Some(element) = doc.element(child) else {
+                continue;
+            };
+            let local = &*element.name.local_name;
+            if local == "RetrievalMethod" || local == "KeyInfoReference" {
+                return Err(CryptoError::VerificationFailed(format!(
+                    "KeyInfo contains a {local}; the transform policy does not allow key \
+                     retrieval (a signature's key comes from metadata or an embedded certificate)"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Check every selected signature's `Reference` URIs and transforms against the
+/// policy, on the document the verifier is about to process, before it does.
+fn validate_enveloped_transform_policy(
+    doc: &Document<'_>,
+    policy: &TransformPolicy,
+    selection: SignatureSelection,
+) -> Result<(), CryptoError> {
+    if policy.is_permissive() {
+        return Ok(());
+    }
+
+    let Some(root) = doc.document_element() else {
+        return Ok(());
+    };
+
+    for signature in std::iter::once(root)
+        .chain(doc.descendants(root))
+        .filter(|node| is_dsig_element(doc, *node, "Signature"))
+    {
+        validate_signature_transforms(doc, signature, policy)?;
+        validate_signature_key_info(doc, signature, policy)?;
+        if matches!(selection, SignatureSelection::First) {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
 /// SAML-specific signature verifier that wraps bergshamra's XML-DSig verification.
 ///
 /// Provides two verification modes:
@@ -152,6 +359,8 @@ pub struct SamlVerifier {
     keys_manager: KeysManager,
     /// Signature and reference-digest algorithms accepted before crypto dispatch.
     algorithm_policy: AlgorithmPolicy,
+    /// Reference transforms and URIs accepted before the signature is processed.
+    transform_policy: TransformPolicy,
     /// Per E91: reject signatures containing ds:Object elements.
     reject_ds_object: bool,
     /// When true (default), only use keys from the KeysManager, never inline.
@@ -187,6 +396,7 @@ impl SamlVerifier {
         Self {
             keys_manager,
             algorithm_policy: AlgorithmPolicy::default(),
+            transform_policy: TransformPolicy::default(),
             reject_ds_object: true,
             trusted_keys_only: true,
             strict_verification: true,
@@ -203,6 +413,7 @@ impl SamlVerifier {
         Self {
             keys_manager,
             algorithm_policy: AlgorithmPolicy::default(),
+            transform_policy: TransformPolicy::default(),
             reject_ds_object,
             trusted_keys_only: true,
             strict_verification: true,
@@ -227,6 +438,23 @@ impl SamlVerifier {
     /// Set the algorithm policy using builder style.
     pub fn with_algorithm_policy(mut self, policy: AlgorithmPolicy) -> Self {
         self.set_algorithm_policy(policy);
+        self
+    }
+
+    /// Set the policy for signature `Reference` transforms and URIs.
+    ///
+    /// The default is [`TransformPolicy::saml`]: only `enveloped-signature` and
+    /// exclusive canonicalization, same-document reference URIs, and bounded
+    /// reference and transform counts. It is checked before the signature is
+    /// processed, so a refused transform is never executed and a refused URI is
+    /// never read.
+    pub fn set_transform_policy(&mut self, policy: TransformPolicy) {
+        self.transform_policy = policy;
+    }
+
+    /// Set the transform policy using builder style.
+    pub fn with_transform_policy(mut self, policy: TransformPolicy) -> Self {
+        self.set_transform_policy(policy);
         self
     }
 
@@ -347,12 +575,15 @@ impl SamlVerifier {
     ) -> Result<Document<'a>, CryptoError> {
         let check_algorithms =
             !self.algorithm_policy.is_permissive() || self.reject_hmac_signatures;
-        let doc = if self.reject_ds_object || check_algorithms {
+        let check_transforms = !self.transform_policy.is_permissive();
+        let doc = if self.reject_ds_object || check_algorithms || check_transforms {
             crate::xml::parse_secure_metadata(signed_xml).map_err(|error| {
                 let check = if self.reject_ds_object {
                     "E91 ds:Object"
-                } else {
+                } else if check_algorithms {
                     "algorithm policy"
+                } else {
+                    "transform policy"
                 };
                 CryptoError::VerificationFailed(format!(
                     "could not parse XML for {check} check: {error}"
@@ -371,6 +602,7 @@ impl SamlVerifier {
             self.reject_hmac_signatures,
             selection,
         )?;
+        validate_enveloped_transform_policy(&doc, &self.transform_policy, selection)?;
         Ok(doc)
     }
 
@@ -451,11 +683,20 @@ impl SamlVerifier {
     pub fn algorithm_policy(&self) -> &AlgorithmPolicy {
         &self.algorithm_policy
     }
+
+    /// The configured transform policy.
+    pub fn transform_policy(&self) -> &TransformPolicy {
+        &self.transform_policy
+    }
 }
 
 #[cfg(test)]
 #[path = "verifier_document_tests.rs"]
 mod document_tests;
+
+#[cfg(test)]
+#[path = "transform_policy_tests.rs"]
+mod transform_policy_tests;
 
 #[cfg(test)]
 mod tests {
