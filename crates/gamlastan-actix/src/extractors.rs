@@ -164,7 +164,19 @@ fn extract_from_get(req: &ActixHttpRequest<'_>) -> Result<SamlMessage, SamlActix
                 signature: sig,
                 signature_input: input,
             }),
-            _ => None,
+            (None, None, None) => None,
+            // Some signature parameter without the rest (for example `SigAlg`
+            // with no `Signature`). Dropping it would make a malformed signed
+            // request look unsigned, so refuse it here, as the shared
+            // `verify_request_signatures` does for the same shape.
+            _ => {
+                return Err(gamlastan::bindings::BindingError::InvalidSamlParams(
+                    "incomplete Redirect signature parameters (SigAlg and Signature must \
+                     be sent together)"
+                        .to_string(),
+                )
+                .into())
+            }
         };
         return Ok(SamlMessage {
             saml_xml: decoded.saml_xml,
@@ -269,6 +281,47 @@ impl SamlMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Redirect-binding GET for an unsigned `SAMLRequest`, plus `extra` query
+    /// parameters.
+    fn redirect_get(extra: &str) -> actix_web::HttpRequest {
+        let url = gamlastan::bindings::redirect::redirect_encode(
+            &gamlastan::bindings::redirect::RedirectEncodeParams {
+                saml_xml: b"<samlp:AuthnRequest xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" ID=\"_r\" Version=\"2.0\" IssueInstant=\"2026-01-01T00:00:00Z\"/>",
+                is_request: true,
+                destination: "https://idp.example.test/sso",
+                relay_state: None,
+                signer: None,
+            },
+        )
+        .unwrap();
+        let query = url.split_once('?').unwrap().1;
+        actix_web::test::TestRequest::get()
+            .uri(&format!("/sso?{query}{extra}"))
+            .to_http_request()
+    }
+
+    #[test]
+    fn redirect_with_sig_alg_but_no_signature_is_refused() {
+        // Dropping the incomplete signature would make a malformed signed request
+        // look unsigned; the extractor must refuse it instead.
+        let request =
+            redirect_get("&SigAlg=http%3A%2F%2Fwww.w3.org%2F2001%2F04%2Fxmldsig-more%23rsa-sha256");
+        let adapter = ActixHttpRequest::new(&request, &[]);
+        match extract_from_get(&adapter) {
+            Err(SamlActixError::BindingDecode(_)) => {}
+            Err(other) => panic!("wrong error: {other}"),
+            Ok(_) => panic!("an incomplete Redirect signature must be refused"),
+        }
+    }
+
+    #[test]
+    fn unsigned_redirect_is_extracted_without_a_signature() {
+        let request = redirect_get("");
+        let adapter = ActixHttpRequest::new(&request, &[]);
+        let message = extract_from_get(&adapter).unwrap();
+        assert!(message.redirect_signature.is_none());
+    }
 
     #[test]
     fn test_saml_binding_uri() {
