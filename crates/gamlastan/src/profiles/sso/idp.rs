@@ -2157,6 +2157,9 @@ mod request_signature_tests {
         // verifier accepts the document, so the case really reaches our own check.
         let mut relaxed = verifier_for(CERT);
         relaxed.set_require_reference_digests(false);
+        // The default transform policy refuses the `cid:` URI before the digest
+        // question arises, so relax that too.
+        relaxed.set_transform_policy(crate::crypto::TransformPolicy::permissive());
         let results = relaxed.verify_all_enveloped(&xml).unwrap();
         assert!(results.iter().all(|r| r.is_valid()));
         assert!(results.iter().any(|r| r.has_unverified_references()));
