@@ -16,4 +16,11 @@ ignore = [
     # cookie (>=0.18.3) is not reachable: actix-web 4.20 still requires
     # cookie 0.16. Re-evaluate when actix-web moves to a patched cookie.
     "RUSTSEC-2026-0594",
+
+    # RUSTSEC-2026-0543 — chrono is unmaintained (no vulnerability, no patched
+    # version). It is in gamlastan's public API (DateTime<Utc>), in pygamlastan
+    # and tunnelbana, and in tsp-ltv (via bergshamra-keys), so it can only be
+    # replaced in a coordinated, breaking release across those crates. Ignored
+    # until tsp-ltv and the other dependents can move together.
+    "RUSTSEC-2026-0543",
 ]
