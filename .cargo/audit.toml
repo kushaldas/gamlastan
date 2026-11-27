@@ -8,4 +8,12 @@ ignore = [
     # retain HTTP/2 support until Actix can use the patched h2 0.4.16+ line.
     # Re-evaluate this exception when Actix updates its h2 dependency.
     "RUSTSEC-2026-0258",
+
+    # RUSTSEC-2026-0594 — cookie 0.16.2 can repeat private-cookie nonces in a
+    # process that forks. Only applications that fork() and then seal private
+    # (encrypted) cookies are affected. gamlastan sets one plain, host-only
+    # cookie, uses no private or signed jar and never forks. The patched
+    # cookie (>=0.18.3) is not reachable: actix-web 4.20 still requires
+    # cookie 0.16. Re-evaluate when actix-web moves to a patched cookie.
+    "RUSTSEC-2026-0594",
 ]
